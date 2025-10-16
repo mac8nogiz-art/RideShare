@@ -1,0 +1,103 @@
+dispatch-service/
+│
+├── Dockerfile
+├── bun.lockb
+├── package.json
+├── tsconfig.json
+├── .env.example
+├── .env.development
+├── .env.production
+├── README.md
+├── Makefile                        # optional: helper commands for build/test/deploy
+│
+├── src/
+│   ├── index.ts                     # entrypoint - bootstrap service
+│   ├── app.ts                       # Elysia app definition (routes + plugins)
+│   ├── config.ts                    # env vars, dynamic topic prefix, global config
+│   ├── logger.ts                    # centralized structured logger
+│   │
+│   ├── infrastructure/              # external integrations
+│   │   ├── kafka/
+│   │   │   ├── index.ts             # Kafka connection & producer init
+│   │   │   ├── consumer.ts          # base consumer setup (common)
+│   │   │   └── admin.ts             # topic creation & health checks
+│   │   ├── redis/
+│   │   │   ├── index.ts             # ioredis client setup¯¯
+│   │   │   ├── luaLoader.ts         # auto-load .lua scripts from src/lua/
+│   │   │   └── redisHealth.ts       # redis ping, metrics collectoraa
+│   │   ├── metrics/
+│   │   │   ├── prometheus.ts        # metrics registration
+│   │   │   └── health.ts            # /health + /metrics exporter
+│   │   ├── tracer/
+│   │   │   └── opentelemetry.ts     # tracing setup
+│   │   └── index.ts                 # optional: export unified infra init
+│   │
+│   ├── consumers/                   # Kafka consumers (read messages)
+│   │   ├── rideRequested.consumer.ts
+│   │   ├── driverResponse.consumer.ts
+│   │   ├── rideExpired.consumer.ts  # optional - monitor offer timeouts
+│   │   └── index.ts                 # registers all consumers
+│   │
+│   ├── producers/                   # Kafka producers (write messages)
+│   │   ├── dispatch.producer.ts
+│   │   ├── driverOffer.producer.ts
+│   │   └── index.ts
+│   │
+│   ├── services/                    # core business logic (use cases)
+│   │   ├── matcher.service.ts       # finds nearby drivers, generates offers
+│   │   ├── offerManager.service.ts  # manages offer lifecycle (creation, expiry)
+│   │   ├── reassign.service.ts      # handles failed or expired offers
+│   │   ├── assignment.service.ts    # finalizes ride-driver assignment
+│   │   ├── validation.service.ts    # schema validations, request guards
+│   │   └── index.ts
+│   │
+│   ├── lua/                         # atomic Redis scripts
+│   │   ├── set_offer_atomic.lua
+│   │   ├── accept_offer.lua
+│   │   ├── expire_offer.lua
+│   │   └── cancel_offer.lua
+│   │
+│   ├── routes/                      # HTTP routes
+│   │   ├── ride.routes.ts           # /ride/request, /ride/status
+│   │   ├── driver.routes.ts         # /driver/respond
+│   │   ├── offer.routes.ts          # /admin/active-offers
+│   │   ├── health.routes.ts         # /health
+│   │   └── index.ts                 # mounts all routes into Elysia app
+│   │
+│   ├── utils/                       # reusable utilities
+│   │   ├── h3.ts                    # H3 hex indexing helper
+│   │   ├── geo.ts                   # geo distance helpers
+│   │   ├── time.ts                  # TTL, expiry, timestamp utils
+│   │   ├── id.ts                    # rideId, correlationId generator
+│   │   └── error.ts                 # custom error classes, error handling
+│   │
+│   ├── domain/                      # pure business entities / models
+│   │   ├── Ride.ts                  # ride model
+│   │   ├── Driver.ts                # driver model
+│   │   ├── Offer.ts                 # offer model
+│   │   ├── enums.ts                 # enums like RideStatus, OfferStatus
+│   │   └── index.ts
+│   │
+│   ├── tests/                       # all tests
+│   │   ├── unit/
+│   │   │   ├── matcher.service.test.ts
+│   │   │   ├── offerManager.service.test.ts
+│   │   │   └── redisLua.test.ts
+│   │   ├── integration/
+│   │   │   ├── kafkaFlow.test.ts
+│   │   │   └── rideAssignmentFlow.test.ts
+│   │   └── e2e/
+│   │       └── dispatchEndToEnd.test.ts
+│   │
+│   └── bootstrap/
+│       ├── initTopics.ts            # auto-create topics at startup
+│       ├── initRedis.ts             # preload scripts
+│       └── initMetrics.ts
+│
+└── infra/                           # (optional) infra-as-code / docker-compose files
+    ├── docker-compose.dev.yml
+    ├── docker-compose.prod.yml
+    ├── kafka/
+    │   └── create-topics.sh
+    └── redis/
+        └── redis.conf
