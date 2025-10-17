@@ -153,7 +153,7 @@ export class OfferManagementService {
                     break; // Max retries reached
                 }
 
-                // Try to reconnect
+                // Try to   reconnect
                 if (error.message.includes('disconnected')) {
                     logger.info(` Attempting Kafka reconnection before retry...`);
                     await reconnectKafka();
