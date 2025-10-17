@@ -143,19 +143,19 @@ export class OfferManagementService {
         for (let attempt = 1; attempt <= this.MAX_KAFKA_RETRIES; attempt++) {
             try {
                 await this.publishAssignmentEvent(jobId, driverId);
-                logger.debug(`✅ Kafka Assignment Event Published - JobId: ${jobId}, Driver: ${driverId}`);
+                logger.debug(`Kafka Assignment Event Published - JobId: ${jobId}, Driver: ${driverId}`);
                 return; // Success, exit retry loop
             } catch (error: any) {
-                logger.warn(`⚠️ Kafka Assignment Event Failed (Attempt ${attempt}/${this.MAX_KAFKA_RETRIES}) - JobId: ${jobId}, Error: ${error.message}`);
+                logger.warn(` Kafka Assignment Event Failed (Attempt ${attempt}/${this.MAX_KAFKA_RETRIES}) - JobId: ${jobId}, Error: ${error.message}`);
 
                 if (attempt === this.MAX_KAFKA_RETRIES) {
-                    logger.error(`❌ Kafka Assignment Event Failed After ${this.MAX_KAFKA_RETRIES} Attempts - JobId: ${jobId}`);
+                    logger.error(` Kafka Assignment Event Failed After ${this.MAX_KAFKA_RETRIES} Attempts - JobId: ${jobId}`);
                     break; // Max retries reached
                 }
 
-                // Try to reconnect before next attempt
+                // Try to reconnect
                 if (error.message.includes('disconnected')) {
-                    logger.info(`🔄 Attempting Kafka reconnection before retry...`);
+                    logger.info(` Attempting Kafka reconnection before retry...`);
                     await reconnectKafka();
                 }
 
