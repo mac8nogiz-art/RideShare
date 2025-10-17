@@ -5,7 +5,7 @@ export interface Driver {
     lat: number;
     lng: number;
     score: number;
-    isFavorite: boolean;
+    isFavorite?: boolean;
     isBusy: boolean;
     isNew: boolean;
     lastUpdate: number;

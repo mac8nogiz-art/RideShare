@@ -95,6 +95,39 @@ export class JobOrchestratorService {
         }
     }
 
+    // async handleDriverResponse(data: any): Promise<any> {
+    //     const { driverId, jobId, action, reason } = data;
+    //     logger.info(`Driver Response - Driver: ${driverId}, Job: ${jobId}, Action: ${action}, Reason: ${reason}`);
+    //
+    //     try {
+    //         if (action === 'accept') {
+    //             await this.offerManagementService.assignDriverToJob(jobId, driverId);
+    //             this.jobProcessingService.removeJob(jobId);
+    //
+    //             logger.info(`Driver Accepted - Job: ${jobId}, Driver: ${driverId}`);
+    //             return { success: true, message: 'Driver assigned to job' };
+    //         } else if (action === 'reject') {
+    //             await this.offerManagementService.handleDriverRejection(jobId, driverId, reason);
+    //
+    //             // Find alternative drivers
+    //             const alternativeJob = await this.offerManagementService.findAlternativeDrivers(jobId);
+    //             if (alternativeJob) {
+    //                 await this.jobProcessingService.addJob(alternativeJob);
+    //             }
+    //
+    //             logger.info(`Driver Rejected - Job: ${jobId}, Driver: ${driverId}, Reason: ${reason}`);
+    //             return { success: true, message: 'Searching for alternative drivers' };
+    //         } else {
+    //             logger.warn(`Unknown Driver Action - Action: ${action}`);
+    //             return { success: false, error: 'Unknown driver action' };
+    //         }
+    //     } catch (error: any) {
+    //         this.metrics.errors++;
+    //         logger.error(`Driver Response Error - Job: ${jobId}, Driver: ${driverId}, Error: ${error.message}`);
+    //         return { success: false, error: error.message };
+    //     }
+    // }
+
     async handleDriverResponse(data: any): Promise<any> {
         const { driverId, jobId, action, reason } = data;
         logger.info(`Driver Response - Driver: ${driverId}, Job: ${jobId}, Action: ${action}, Reason: ${reason}`);
@@ -109,10 +142,20 @@ export class JobOrchestratorService {
             } else if (action === 'reject') {
                 await this.offerManagementService.handleDriverRejection(jobId, driverId, reason);
 
-                // Find alternative drivers
-                const alternativeJob = await this.offerManagementService.findAlternativeDrivers(jobId);
-                if (alternativeJob) {
-                    await this.jobProcessingService.addJob(alternativeJob);
+                // Get the job to find alternative drivers
+                const job = this.jobProcessingService.getJob(jobId);
+                if (job) {
+                    // Find nearby drivers excluding rejected ones
+                    const nearbyDrivers = await this.driverMatchingService.findBestDrivers(job, job.customerId);
+                    const alternativeDrivers = await this.offerManagementService.findAlternativeDrivers(jobId, nearbyDrivers);
+
+                    if (alternativeDrivers.length > 0) {
+                        // Resend offers to alternative drivers
+                        await this.offerManagementService.sendOffers(job, alternativeDrivers);
+                        logger.info(`Alternative offers sent - Job: ${jobId}, Drivers: ${alternativeDrivers.length}`);
+                    } else {
+                        logger.info(`No alternative drivers found - Job: ${jobId}`);
+                    }
                 }
 
                 logger.info(`Driver Rejected - Job: ${jobId}, Driver: ${driverId}, Reason: ${reason}`);

@@ -85,7 +85,6 @@ export class DriverLocationService {
         }
     }
 
-    // ... rest of the methods remain the same
     private async refreshProfileCache(): Promise<void> {
         const startTime = Date.now();
         try {

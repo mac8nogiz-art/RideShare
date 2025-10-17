@@ -6,6 +6,18 @@ const drivers = [
     { id: "driver_101", lat: 28.6139, lng: 77.2090, score: 85, isNew: true },
     { id: "driver_102", lat: 28.6145, lng: 77.2080, score: 75, isNew: false },
     { id: "driver_103", lat: 28.6150, lng: 77.2070, score: 90, isNew: false },
+    { id: "driver_01", lat: 28.6139, lng: 77.2090, score: 85, isNew: true },
+    { id: "driver_02", lat: 28.6145, lng: 77.2080, score: 75, isNew: false },
+    { id: "driver_03", lat: 28.6150, lng: 77.2070, score: 90, isNew: false },
+    { id: "driver_11", lat: 28.6139, lng: 77.2090, score: 85, isNew: true },
+    { id: "driver_12", lat: 28.6145, lng: 77.2080, score: 75, isNew: false },
+    { id: "driver_13", lat: 28.6150, lng: 77.2070, score: 90, isNew: false },
+    { id: "driver_11", lat: 28.6139, lng: 77.2090, score: 85, isNew: true },
+    { id: "driver_12", lat: 28.6145, lng: 77.2080, score: 75, isNew: false },
+    { id: "driver_3", lat: 28.6150, lng: 77.2070, score: 90, isNew: false },
+    { id: "driver_1", lat: 28.6139, lng: 77.2090, score: 85, isNew: true },
+    { id: "driver_2", lat: 28.6145, lng: 77.2080, score: 75, isNew: false },
+    { id: "driver_10223", lat: 28.6150, lng: 77.2070, score: 90, isNew: false },
 ];
 
 async function updateDriverLocations() {
