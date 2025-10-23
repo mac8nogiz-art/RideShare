@@ -5,6 +5,7 @@ import { DriverLocationService } from './DriverLocation.Service';
 import { JobProcessingService } from './JobProcessingService';
 import { DriverMatchingService } from './DriverMatching.Service';
 import { OfferManagementService } from './OfferManagement.Service';
+import {ZoneService} from "./ZoneService";
 
 export class JobOrchestratorService {
     private processingInterval: NodeJS.Timeout | null = null;
@@ -14,6 +15,7 @@ export class JobOrchestratorService {
     private jobProcessingService: JobProcessingService;
     private driverMatchingService: DriverMatchingService;
     private offerManagementService: OfferManagementService;
+    private zoneService: ZoneService;
 
     private metrics: ProcessingMetrics = {
         rpcRequests: 0,
@@ -32,13 +34,15 @@ export class JobOrchestratorService {
     };
 
     constructor() {
-        // FIX: Initialize services in correct order without circular dependencies
         this.driverLocationService = new DriverLocationService();
-        this.jobProcessingService = new JobProcessingService(); // Remove constructor params
-        this.driverMatchingService = new DriverMatchingService(this.driverLocationService);
+        this.zoneService = new ZoneService();
+        this.jobProcessingService = new JobProcessingService();
+        this.driverMatchingService = new DriverMatchingService(
+            this.driverLocationService,
+            this.zoneService
+        );
         this.offerManagementService = new OfferManagementService();
     }
-
 
 
     async start(): Promise<void> {

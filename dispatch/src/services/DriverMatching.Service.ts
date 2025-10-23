@@ -1,80 +1,121 @@
-// src/services/DriverMatching.Service.ts
-import { redis } from '../infrastructure/redis';
-import { logger } from '../logger';
-import { DriverWithDistance, Job } from '../types';
-import { DriverLocationService } from './DriverLocation.Service';
+import {redis} from '../infrastructure/redis';
+import {logger} from '../logger';
+import {DriverWithDistance, Job} from '../types';
+import {DriverLocationService} from './DriverLocation.Service';
+import {ZoneService} from "./ZoneService";
+import {SpatialService} from "../infrastructure/spatial";
+
 
 export class DriverMatchingService {
     private driverLocationService: DriverLocationService;
+    private zoneService: ZoneService;
+    private spatialService: SpatialService;
 
-    constructor(driverLocationService: DriverLocationService) {
+    private readonly DEFAULT_RADIUS_STEPS = [3, 5, 10, 15];
+    private readonly DEFAULT_STALE_THRESHOLD = 300_000;
+
+    constructor(driverLocationService: DriverLocationService, zoneService: ZoneService) {
         this.driverLocationService = driverLocationService;
+        this.zoneService = zoneService;
+        this.spatialService = new SpatialService();
     }
 
-
-    async findBestDrivers(job: Job, customerId: string): Promise<string[]> {
+    async findBestDrivers(job: Job, customerId: string, maxDrivers: number = 10): Promise<string[]> {
         const start = Date.now();
-        const nearby: DriverWithDistance[] = [];
 
         try {
-
-            const allDrivers = Array.from(this.driverLocationService.getAllDrivers().values());
-
-            const now = Date.now();
-            for (const driver of allDrivers) {
-                // Skip stale drivers
-                if (now - driver.lastUpdate > 300000) continue;
-
-                const distance = this.calculateDistance(job.pickupLat, job.pickupLng, driver.lat, driver.lng);
-                if (distance > 10) continue;
-
-                nearby.push({
-                    driverId: driver.driverId,
-                    lat: driver.lat,
-                    lng: driver.lng,
-                    distance,
-                    score: driver.score,
-                    isBusy: driver.isBusy,
-                    isNew: driver.isNew,
-                    lastUpdate: driver.lastUpdate,
-                    priority: 0,
-                    isFavorite: driver.isFavorite,
-                });
-            }
-
-            if (nearby.length === 0) {
-                logger.warn(` No nearby drivers found for job ${job.id}`);
+            // 1. Determine zone for this job
+            const zone = await this.zoneService.getZoneForJob(job);
+            if (!zone) {
+                logger.warn(`No zone found for job ${job.id} at ${job.pickupLat}, ${job.pickupLng}`);
                 return [];
             }
 
+            logger.info(`Job ${job.id} is in zone: ${zone.name}`);
 
-            const favorites = await this.getCustomerFavorites(customerId);
+            // 2. Get customer favorites
+            const customerFavorites = await this.getCustomerFavorites(customerId);
 
+            // 3. Filter drivers by zone approval and proximity
+            const eligibleDrivers = await this.getEligibleDrivers(job, zone._id);
 
-            const sorted = nearby
-                .map((d) => ({
-                    driverId: d.driverId,
-                    priority: this.calculateDriverPriority(d, favorites.has(d.driverId)),
-                    distance: d.distance,
-                }))
-                .filter((d) => d.priority > 0)
-                .sort((a, b) =>
-                    b.priority !== a.priority ? b.priority - a.priority : a.distance - b.distance
-                )
-                .slice(0, 5)
-                .map((d) => d.driverId);
+            if (eligibleDrivers.length === 0) {
+                logger.warn(`No eligible drivers found in zone ${zone.name} for job ${job.id}`);
+                return [];
+            }
 
-            logger.info(
-                ` Matched ${sorted.length} drivers for job ${job.id} in ${Date.now() - start}ms`
-            );
+            // 4. Prioritize and select top drivers
+            const prioritizedDrivers = this.prioritizeDrivers(eligibleDrivers, customerFavorites);
+            const selectedDrivers = prioritizedDrivers.slice(0, maxDrivers).map(d => d.driverId);
 
-            await redis.set(`job:${job.id}:matched_drivers`, JSON.stringify(sorted));
+            // 5. Cache results
+            await redis.set(`job:${job.id}:matched_drivers`, JSON.stringify(selectedDrivers));
+            await redis.set(`job:${job.id}:zone`, zone._id);
 
-            return sorted;
+            logger.info(`Matched ${selectedDrivers.length} drivers in zone ${zone.name} for job ${job.id} in ${Date.now() - start}ms`);
+            return selectedDrivers;
+
         } catch (err) {
             logger.error(`DriverMatchingService failed for job ${job.id}: ${err}`);
             return [];
         }
+    }
+
+    private async getEligibleDrivers(job: Job, zoneId: string): Promise<DriverWithDistance[]> {
+        const allDrivers = Array.from(this.driverLocationService.getAllDrivers().values());
+        const eligibleDrivers: DriverWithDistance[] = [];
+
+        for (const driver of allDrivers) {
+            // Skip stale or busy drivers
+            if (Date.now() - driver.lastUpdate > this.DEFAULT_STALE_THRESHOLD) continue;
+            if (driver.isBusy) continue;
+
+            // Check if driver is approved for this zone
+            const isApproved = await this.zoneService.isDriverApprovedForZone(driver.driverId, zoneId);
+            if (!isApproved) continue;
+
+            // Calculate distance
+            const distance = this.spatialService.calculateDistance(
+                job.pickupLat, job.pickupLng, driver.lat, driver.lng
+            );
+
+            // Check if within maximum radius
+            if (distance <= 15) { // 15km max radius
+                eligibleDrivers.push({
+                    ...driver,
+                    distance,
+                    priority: 0
+                });
+            }
+        }
+
+        return eligibleDrivers;
+    }
+
+    private prioritizeDrivers(drivers: DriverWithDistance[], customerFavorites: Set<string>): DriverWithDistance[] {
+        return drivers
+            .map(driver => ({
+                ...driver,
+                priority: this.calculateDriverPriority(driver, customerFavorites.has(driver.driverId))
+            }))
+            .sort((a, b) => b.priority - a.priority || a.distance - b.distance);
+    }
+
+    private calculateDriverPriority(driver: DriverWithDistance, isFavorite: boolean): number {
+        let priority = 0;
+
+        // Base priority based on distance
+        if (isFavorite && driver.distance <= 3) priority = 1000 + driver.score;
+        else if (driver.distance <= 3) priority = 900 + driver.score;
+        else if (driver.distance <= 5) priority = 700 + driver.score;
+        else if (driver.distance <= 10) priority = 500 - driver.distance;
+        else priority = 400 - driver.distance;
+
+        // Bonuses
+        if (driver.isNew) priority += 50;
+        if (isFavorite) priority += 100;
+
+        return priority;
     }
 
     private async getCustomerFavorites(customerId: string): Promise<Set<string>> {
@@ -85,31 +126,5 @@ export class DriverMatchingService {
             logger.warn(`Failed to fetch favorites for customer ${customerId}: ${err}`);
             return new Set();
         }
-    }
-
-    private calculateDriverPriority(driver: DriverWithDistance, isFavorite: boolean): number {
-        let priority = 0;
-
-        if (isFavorite && driver.distance <= 3) priority = 1000 + driver.score;
-        else if (!driver.isBusy && driver.distance <= 3) priority = 900 + driver.score;
-        else if (!driver.isBusy && driver.distance <= 5) priority = 700 + driver.score;
-        else if (driver.distance <= 10) priority = 400 - driver.distance;
-
-        if (driver.isNew) priority += 10;
-
-        return priority;
-    }
-
-    private calculateDistance(lat1: number, lng1: number, lat2: number, lng2: number): number {
-        const R = 6371;
-        const dLat = ((lat2 - lat1) * Math.PI) / 180;
-        const dLng = ((lng2 - lng1) * Math.PI) / 180;
-        const a =
-            Math.sin(dLat / 2) ** 2 +
-            Math.cos((lat1 * Math.PI) / 180) *
-            Math.cos((lat2 * Math.PI) / 180) *
-            Math.sin(dLng / 2) ** 2;
-
-        return R * (2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)));
     }
 }

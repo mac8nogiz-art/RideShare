@@ -1,5 +1,17 @@
-// src/types.ts
-
+export interface Zone {
+    _id: string;
+    name: string;
+    country: string;
+    location: {
+        type: 'Polygon';
+        coordinates: number[][][];
+    };
+    geoPoint: {
+        type: 'Point';
+        coordinates: number[];
+    };
+    status: boolean;
+}
 export interface Driver {
     driverId: string;
     lat: number;
@@ -9,6 +21,7 @@ export interface Driver {
     isBusy: boolean;
     isNew: boolean;
     lastUpdate: number;
+    approvedZones: string[];
 }
 
 export interface DriverWithDistance extends Driver {
@@ -24,7 +37,8 @@ export interface Job {
     fare: number;
     vehicleType?: string;
     timestamp: number;
-    excludeDrivers?: string[]; // Drivers to exclude from matching (e.g., rejected drivers)
+    excludeDrivers?: string[];
+    zoneId?: string;
 }
 
 export interface ProcessingMetrics {
