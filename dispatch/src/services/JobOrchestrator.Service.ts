@@ -47,6 +47,7 @@ export class JobOrchestratorService {
 
     async start(): Promise<void> {
         await this.driverLocationService.startDriverCacheRefresh();
+        await this.zoneService.startZoneCacheRefresh();
         this.startJobProcessing();
 
         logger.info(`Job Orchestrator started successfully - ProcessingInterval: ${this.PROCESSING_INTERVAL}ms`);
