@@ -48,6 +48,8 @@ export class OfferManagementService {
         }
     }
 
+
+
     async assignDriverToJob(jobId: string, driverId: string): Promise<void> {
         logger.info(`Assigning Driver - JobId: ${jobId}, Driver: ${driverId}`);
 
@@ -179,7 +181,7 @@ export class OfferManagementService {
         }
 
         const event = {
-            type: 'driver.assigned',
+            type: 'new_job.assigned',
             jobId,
             driverId,
             timestamp: new Date().toISOString(),

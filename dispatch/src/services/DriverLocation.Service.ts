@@ -9,8 +9,6 @@ export class DriverLocationService {
 
     async startDriverCacheRefresh(): Promise<void> {
         logger.info('Starting Driver Cache Refresh - Interval: 2s');
-
-
         await this.refreshDriverCache();
 
         this.isInitialized = true;

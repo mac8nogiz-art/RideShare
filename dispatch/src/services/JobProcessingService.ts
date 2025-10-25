@@ -5,7 +5,6 @@ export class JobProcessingService {
     private activeJobs = new Map<string, Job>();
     private readonly MAX_CONCURRENT_JOBS = 1000;
 
-
     async addJob(job: Job): Promise<void> {
         if (this.activeJobs.size >= this.MAX_CONCURRENT_JOBS) {
             logger.error(`Max concurrent jobs reached - cannot add job: ${job.id}`);
@@ -17,7 +16,6 @@ export class JobProcessingService {
             `Job Added - JobId: ${job.id}, Customer: ${job.customerId}, ActiveJobs: ${this.activeJobs.size}`
         );
     }
-
 
     async addJobs(jobs: Job[]): Promise<{ added: string[]; skipped: string[] }> {
         const addedJobs: string[] = [];
@@ -52,16 +50,13 @@ export class JobProcessingService {
         return removed;
     }
 
-
     getJob(jobId: string): Job | null {
         return this.activeJobs.get(jobId) || null;
     }
 
-
     getActiveJobsCount(): number {
         return this.activeJobs.size;
     }
-
 
     hasJob(jobId: string): boolean {
         return this.activeJobs.has(jobId);
@@ -71,3 +66,5 @@ export class JobProcessingService {
         logger.info(`Active Jobs (${this.activeJobs.size}): ${Array.from(this.activeJobs.keys()).join(', ')}`);
     }
 }
+
+export const jobProcessingService = new JobProcessingService();

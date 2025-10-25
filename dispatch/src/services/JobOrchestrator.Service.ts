@@ -5,12 +5,9 @@ import { DriverLocationService } from './DriverLocation.Service';
 import { JobProcessingService } from './JobProcessingService';
 import { DriverMatchingService } from './DriverMatching.Service';
 import { OfferManagementService } from './OfferManagement.Service';
-import {ZoneService} from "./ZoneService";
+import { ZoneService } from './ZoneService';
 
 export class JobOrchestratorService {
-    private processingInterval: NodeJS.Timeout | null = null;
-    private readonly PROCESSING_INTERVAL = 100;
-
     private driverLocationService: DriverLocationService;
     private jobProcessingService: JobProcessingService;
     private driverMatchingService: DriverMatchingService;
@@ -44,23 +41,18 @@ export class JobOrchestratorService {
         this.offerManagementService = new OfferManagementService();
     }
 
-
     async start(): Promise<void> {
         await this.driverLocationService.startDriverCacheRefresh();
         await this.zoneService.startZoneCacheRefresh();
-        this.startJobProcessing();
-
-        logger.info(`Job Orchestrator started successfully - ProcessingInterval: ${this.PROCESSING_INTERVAL}ms`);
+        logger.info(`Job Orchestrator started successfully`);
     }
 
     stop(): void {
-        if (this.processingInterval) {
-            clearInterval(this.processingInterval);
-        }
         logger.info('Job Orchestrator stopped');
     }
 
-    // RPC Handler methods (minimal changes from original)
+    // ----------------- RPC Event Handlers -----------------
+
     async handleRPCRequest(data: any): Promise<any> {
         const requestId = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
         logger.info(`RPC Request Received - Type: ${data.type}, RequestId: ${requestId}`);
@@ -70,9 +62,9 @@ export class JobOrchestratorService {
         try {
             let result;
             switch (data.type) {
-                case 'payment.completed':
+                case 'new_job.request':
                     this.metrics.apiCalls.handlePaymentCompleted++;
-                    result = await this.handlePaymentCompleted(data);
+                    result = await this.handleNewJobEvent(data);
                     break;
                 case 'driver.response':
                     this.metrics.apiCalls.handleDriverResponse++;
@@ -100,38 +92,62 @@ export class JobOrchestratorService {
         }
     }
 
-    // async handleDriverResponse(data: any): Promise<any> {
-    //     const { driverId, jobId, action, reason } = data;
-    //     logger.info(`Driver Response - Driver: ${driverId}, Job: ${jobId}, Action: ${action}, Reason: ${reason}`);
-    //
-    //     try {
-    //         if (action === 'accept') {
-    //             await this.offerManagementService.assignDriverToJob(jobId, driverId);
-    //             this.jobProcessingService.removeJob(jobId);
-    //
-    //             logger.info(`Driver Accepted - Job: ${jobId}, Driver: ${driverId}`);
-    //             return { success: true, message: 'Driver assigned to job' };
-    //         } else if (action === 'reject') {
-    //             await this.offerManagementService.handleDriverRejection(jobId, driverId, reason);
-    //
-    //             // Find alternative drivers
-    //             const alternativeJob = await this.offerManagementService.findAlternativeDrivers(jobId);
-    //             if (alternativeJob) {
-    //                 await this.jobProcessingService.addJob(alternativeJob);
-    //             }
-    //
-    //             logger.info(`Driver Rejected - Job: ${jobId}, Driver: ${driverId}, Reason: ${reason}`);
-    //             return { success: true, message: 'Searching for alternative drivers' };
-    //         } else {
-    //             logger.warn(`Unknown Driver Action - Action: ${action}`);
-    //             return { success: false, error: 'Unknown driver action' };
-    //         }
-    //     } catch (error: any) {
-    //         this.metrics.errors++;
-    //         logger.error(`Driver Response Error - Job: ${jobId}, Driver: ${driverId}, Error: ${error.message}`);
-    //         return { success: false, error: error.message };
-    //     }
-    // }
+    // ----------------- Job Event Handlers -----------------
+
+    private async handleNewJobEvent(data: any): Promise<any> {
+        const job: Job = {
+            id: data.jobId,
+            customerId: data.customerId,
+            pickupLat: data.pickupLat,
+            pickupLng: data.pickupLng,
+            fare: data.fare,
+            vehicleType: data.vehicleType,
+            timestamp: Date.now()
+        };
+
+        logger.info(`Payment Completed - JobId: ${job.id}, Customer: ${job.customerId}, Fare: ${job.fare}`);
+        await this.addJob(job);
+
+        logger.info(`Driver Search Initiated - JobId: ${job.id}`);
+        return { success: true, message: 'Driver search initiated', jobId: job.id, timestamp: job.timestamp };
+    }
+
+    async addJob(job: Job): Promise<void> {
+        this.metrics.apiCalls.addJob++;
+        this.metrics.jobsProcessed++;
+        await this.jobProcessingService.addJob(job);
+        await this.processJob(job);
+    }
+
+    async addJobs(jobs: Job[]): Promise<void> {
+        this.metrics.apiCalls.addJobs++;
+        const result = await this.jobProcessingService.addJobs(jobs);
+        this.metrics.jobsProcessed += result.added.length;
+        for (const jobId of result.added) {
+            const job = this.jobProcessingService.getJob(jobId);
+            if (job) await this.processJob(job);
+        }
+    }
+
+    private async processJob(job: Job): Promise<void> {
+        try {
+            const matchedDrivers = await this.driverMatchingService.findBestDrivers(job, job.customerId);
+
+            if (matchedDrivers.length > 0) {
+                const result = await this.offerManagementService.sendOffers(job, matchedDrivers);
+                this.metrics.offersSent += result.successful;
+                this.metrics.driversMatched += matchedDrivers.length;
+                logger.info(`Job Matched - JobId: ${job.id}, Drivers: ${matchedDrivers.length}`);
+            } else {
+                logger.warn(`No Drivers Found - JobId: ${job.id}`);
+            }
+        } catch (error: any) {
+            this.metrics.errors++;
+            logger.error(`Job Processing Error - JobId: ${job.id}, Error: ${error.message}`);
+        }
+    }
+
+    // ----------------- Driver Response -----------------
 
     async handleDriverResponse(data: any): Promise<any> {
         const { driverId, jobId, action, reason } = data;
@@ -141,21 +157,16 @@ export class JobOrchestratorService {
             if (action === 'accept') {
                 await this.offerManagementService.assignDriverToJob(jobId, driverId);
                 this.jobProcessingService.removeJob(jobId);
-
                 logger.info(`Driver Accepted - Job: ${jobId}, Driver: ${driverId}`);
                 return { success: true, message: 'Driver assigned to job' };
             } else if (action === 'reject') {
                 await this.offerManagementService.handleDriverRejection(jobId, driverId, reason);
 
-                // Get the job to find alternative drivers
                 const job = this.jobProcessingService.getJob(jobId);
                 if (job) {
-                    // Find nearby drivers excluding rejected ones
                     const nearbyDrivers = await this.driverMatchingService.findBestDrivers(job, job.customerId);
                     const alternativeDrivers = await this.offerManagementService.findAlternativeDrivers(jobId, nearbyDrivers);
-
                     if (alternativeDrivers.length > 0) {
-                        // Resend offers to alternative drivers
                         await this.offerManagementService.sendOffers(job, alternativeDrivers);
                         logger.info(`Alternative offers sent - Job: ${jobId}, Drivers: ${alternativeDrivers.length}`);
                     } else {
@@ -176,46 +187,11 @@ export class JobOrchestratorService {
         }
     }
 
-    async addJob(job: Job): Promise<void> {
-        this.metrics.apiCalls.addJob++;
-        this.metrics.jobsProcessed++;
-        await this.jobProcessingService.addJob(job);
-    }
-
-    async addJobs(jobs: Job[]): Promise<void> {
-        this.metrics.apiCalls.addJobs++;
-        const result = await this.jobProcessingService.addJobs(jobs);
-        this.metrics.jobsProcessed += result.added.length;
-    }
-
-    // Private methods
-    private async handlePaymentCompleted(data: any): Promise<any> {
-        const job: Job = {
-            id: data.jobId,
-            customerId: data.customerId,
-            pickupLat: data.pickupLat,
-            pickupLng: data.pickupLng,
-            fare: data.fare,
-            vehicleType: data.vehicleType,
-            timestamp: Date.now()
-        };
-
-        logger.info(`Payment Completed - JobId: ${job.id}, Customer: ${job.customerId}, Fare: ${job.fare}`);
-        await this.addJob(job);
-
-        logger.info(`Driver Search Initiated - JobId: ${job.id}`);
-        return {
-            success: true,
-            message: 'Driver search initiated',
-            jobId: job.id,
-            timestamp: job.timestamp
-        };
-    }
+    // ----------------- Stats & Health -----------------
 
     private async handleGetStats(data: any): Promise<any> {
         logger.info(`Stats Request - Client: ${data.clientId || 'unknown'}`);
-        const stats = this.getStats();
-        return { success: true, stats };
+        return { success: true, stats: this.getStats() };
     }
 
     private async handleHealthCheck(data: any): Promise<any> {
@@ -226,87 +202,17 @@ export class JobOrchestratorService {
             await redis.ping();
             const redisLatency = Date.now() - redisStart;
 
-            const stats = this.getStats();
-
             return {
                 success: true,
                 status: 'healthy',
                 redis: 'connected',
                 redisLatency: `${redisLatency}ms`,
-                ...stats
+                ...this.getStats()
             };
         } catch (error: any) {
             this.metrics.errors++;
             logger.error(`Health Check Failed - Redis: disconnected, Error: ${error.message}`);
-            return {
-                success: false,
-                status: 'unhealthy',
-                redis: 'disconnected',
-                error: error.message
-            };
-        }
-    }
-
-    private startJobProcessing(): void {
-        logger.info(`Starting Job Processing Interval - Interval: ${this.PROCESSING_INTERVAL}ms`);
-
-        this.processingInterval = setInterval(async () => {
-            await this.processAllJobs();
-        }, this.PROCESSING_INTERVAL);
-    }
-
-    private async processAllJobs(): Promise<void> {
-        if (this.jobProcessingService.getActiveJobsCount() === 0) {
-            return;
-        }
-
-        const startTime = Date.now();
-        const jobs = this.jobProcessingService.getAllJobs();
-
-        const processingPromises = jobs.map(job => this.processSingleJob(job));
-        const results = await Promise.allSettled(processingPromises);
-
-        const completedJobs: string[] = [];
-        const failedJobs: string[] = [];
-
-        results.forEach((result, index) => {
-            const job = jobs[index];
-            if (result.status === 'fulfilled' && result.value.completed) {
-                completedJobs.push(job.id);
-                this.jobProcessingService.removeJob(job.id);
-            } else if (result.status === 'rejected') {
-                failedJobs.push(job.id);
-                this.jobProcessingService.removeJob(job.id);
-                logger.error(`Job Processing Failed - JobId: ${job.id}, Error: ${result.reason}`);
-            }
-        });
-
-        const processingTime = Date.now() - startTime;
-        if (completedJobs.length > 0 || failedJobs.length > 0) {
-            logger.info(`Job Processing Completed - Total: ${jobs.length}, Completed: ${completedJobs.length}, Failed: ${failedJobs.length}, Time: ${processingTime}ms`);
-        }
-    }
-
-    // In JobOrchestratorService.ts - update the processSingleJob method
-    private async processSingleJob(job: Job): Promise<{ completed: boolean }> {
-        try {
-            const matchedDrivers = await this.driverMatchingService.findBestDrivers(job, job.customerId);
-
-            if (matchedDrivers.length > 0) {
-                const result = await this.offerManagementService.sendOffers(job, matchedDrivers);
-                this.metrics.offersSent += result.successful;
-                this.metrics.driversMatched += matchedDrivers.length;
-
-                logger.debug(`Job Matched - JobId: ${job.id}, Customer: ${job.customerId}, Drivers: ${matchedDrivers.length}`);
-                return { completed: true };
-            } else {
-                logger.debug(`No Drivers Found - JobId: ${job.id}, Customer: ${job.customerId}`);
-                return { completed: false };
-            }
-        } catch (error) {
-            this.metrics.errors++;
-            logger.error(`Job Processing Error - JobId: ${job.id}, Error: ${error}`);
-            return { completed: true };
+            return { success: false, status: 'unhealthy', redis: 'disconnected', error: error.message };
         }
     }
 

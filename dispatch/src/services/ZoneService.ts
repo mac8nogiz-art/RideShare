@@ -5,16 +5,7 @@ import logger from "../logger";
 import { Db } from "mongodb";
 import { getMongoDB, connectMongo } from "../infrastructure/mongo";
 
-/**
- * ZoneService - Manages geographic zones for ride matching
- *
- * Flow:
- * 1. Customer requests ride → Get zone based on pickup location
- * 2. Find nearby drivers in that location
- * 3. Check if driver is approved for that zone
- *    - Empty approved_zones[] = driver approved for ALL zones
- *    - Has zones in array = driver only approved for those specific zones
- */
+
 export class ZoneService {
     private spatialService: SpatialService;
     private zoneCache = new Map<string, Zone>();
