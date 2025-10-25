@@ -1,4 +1,3 @@
-// src/services/JobProcessingService.ts
 import { logger } from '../logger';
 import { Job } from '../types';
 

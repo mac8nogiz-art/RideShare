@@ -1,5 +1,5 @@
-import { Elysia } from 'elysia';
-import { Kafka, Producer, Consumer, Admin } from 'kafkajs';
+import {Elysia} from 'elysia';
+import {Kafka, Producer, Consumer, Admin} from 'kafkajs';
 
 export interface KafkaRPCOptions {
     serviceName: string;
@@ -29,7 +29,7 @@ export const kafkaRPC = (options: KafkaRPCOptions) => {
         subscribeToTopics = [],
     } = options;
 
-    const kafka = new Kafka({ clientId: serviceName, brokers });
+    const kafka = new Kafka({clientId: serviceName, brokers});
     let producer: Producer;
     let consumer: Consumer;
     let admin: Admin;
@@ -38,16 +38,11 @@ export const kafkaRPC = (options: KafkaRPCOptions) => {
     let topicDiscoveryIntervalId: NodeJS.Timeout | null = null;
 
     const pendingRequests = new Map<string, {
-        resolve: (data: any) => void;
-        reject: (err: any) => void;
-        timeout: NodeJS.Timeout;
+        resolve: (data: any) => void; reject: (err: any) => void; timeout: NodeJS.Timeout;
     }>();
 
     let queue: Array<{
-        data: any;
-        correlationId: string;
-        requestTopic: string;
-        responseTopic: string;
+        data: any; correlationId: string; requestTopic: string; responseTopic: string;
     }> = [];
     let sending = false;
 
@@ -68,11 +63,11 @@ export const kafkaRPC = (options: KafkaRPCOptions) => {
 
         const requestsByTopic = new Map<string, Array<{ data: any; correlationId: string }>>();
 
-        queue.forEach(({ data, correlationId, requestTopic }) => {
+        queue.forEach(({data, correlationId, requestTopic}) => {
             if (!requestsByTopic.has(requestTopic)) {
                 requestsByTopic.set(requestTopic, []);
             }
-            requestsByTopic.get(requestTopic)!.push({ data, correlationId });
+            requestsByTopic.get(requestTopic)!.push({data, correlationId});
         });
 
         queue = [];
@@ -81,12 +76,9 @@ export const kafkaRPC = (options: KafkaRPCOptions) => {
             console.log(`[${serviceName}] Sending ${batch.length} requests to topic: ${topic}`);
 
             await producer.send({
-                topic: topic,
-                messages: batch.map(({ data, correlationId }) => ({
+                topic: topic, messages: batch.map(({data, correlationId}) => ({
                     value: JSON.stringify({
-                        ...data,
-                        correlationId,
-                        __responseTopic: resolveTopic(responseTopic, data, 'rpc-responses')
+                        ...data, correlationId, __responseTopic: resolveTopic(responseTopic, data, 'rpc-responses')
                     }),
                 })),
             });
@@ -112,51 +104,41 @@ export const kafkaRPC = (options: KafkaRPCOptions) => {
 
         try {
             const topics = await admin.listTopics();
-            console.log(`[${serviceName}] 📋 Available topics in Kafka:`, topics);
+            console.log(`[${serviceName}] Available topics in Kafka:`, topics);
 
             // More flexible pattern matching
-            const responseTopicPatterns = [
-                (t: string) => t.endsWith('.response'),
-                (t: string) => t.endsWith('.res'),
-                (t: string) => t.startsWith('rpc-responses'),
-                (t: string) => t.includes('driver.location'), // Changed from regex
-                (t: string) => t.includes(serviceName),
-                (t: string) => t.endsWith('.request'),
-                (t: string) => t.endsWith('.event'),
-                (t: string) => t.endsWith('.events'), // Added for payment.events
-                (t: string) => t.endsWith('.notification'),
-            ];
+            const responseTopicPatterns = [(t: string) => t.endsWith('.response'), (t: string) => t.endsWith('.res'), (t: string) => t.startsWith('rpc-responses'), (t: string) => t.includes('driver.location'), // Changed from regex
+                (t: string) => t.includes(serviceName), (t: string) => t.endsWith('.request'), (t: string) => t.endsWith('.event'), (t: string) => t.endsWith('.events'), // Added for payment.events
+                (t: string) => t.endsWith('.notification'),];
 
-            const relevantTopics = topics.filter(topic =>
-                responseTopicPatterns.some(pattern => pattern(topic))
-            );
+            const relevantTopics = topics.filter(topic => responseTopicPatterns.some(pattern => pattern(topic)));
 
-            console.log(`[${serviceName}] 🎯 Relevant topics matched:`, relevantTopics);
+            console.log(`[${serviceName}] Relevant topics matched:`, relevantTopics);
 
             let newTopicsSubscribed = 0;
 
             for (const topic of relevantTopics) {
                 if (!discoveredResponseTopics.has(topic)) {
                     try {
-                        await consumer.subscribe({ topic, fromBeginning: false });
+                        await consumer.subscribe({topic, fromBeginning: false});
                         discoveredResponseTopics.add(topic);
                         newTopicsSubscribed++;
-                        console.log(`[${serviceName}] ✅ Subscribed to: ${topic}`);
+                        console.log(`[${serviceName}]  Subscribed to: ${topic}`);
                     } catch (error: any) {
-                        console.log(`[${serviceName}] ⚠️ Failed to subscribe: ${topic} - ${error.message}`);
+                        console.log(`[${serviceName}]  Failed to subscribe: ${topic} - ${error.message}`);
                     }
                 }
             }
 
             if (newTopicsSubscribed > 0) {
-                console.log(`[${serviceName}] 🎉 Subscribed to ${newTopicsSubscribed} new topics`);
+                console.log(`[${serviceName}]  Subscribed to ${newTopicsSubscribed} new topics`);
             }
 
-            console.log(`[${serviceName}] 📊 Total subscribed topics: ${discoveredResponseTopics.size}`);
-            console.log(`[${serviceName}] 📝 Subscribed topics list:`, Array.from(discoveredResponseTopics));
+            console.log(`[${serviceName}] Total subscribed topics: ${discoveredResponseTopics.size}`);
+            console.log(`[${serviceName}] Subscribed topics list:`, Array.from(discoveredResponseTopics));
 
         } catch (error: any) {
-            console.error(`[${serviceName}] ❌ Error discovering topics:`, error.message);
+            console.error(`[${serviceName}] Error discovering topics:`, error.message);
         }
     };
 
@@ -176,14 +158,14 @@ export const kafkaRPC = (options: KafkaRPCOptions) => {
             }
         }, topicDiscoveryInterval);
 
-        console.log(`[${serviceName}] 🔄 Started topic discovery every ${topicDiscoveryInterval}ms`);
+        console.log(`[${serviceName}] Started topic discovery every ${topicDiscoveryInterval}ms`);
     };
 
     const stopTopicDiscovery = () => {
         if (topicDiscoveryIntervalId) {
             clearInterval(topicDiscoveryIntervalId);
             topicDiscoveryIntervalId = null;
-            console.log(`[${serviceName}] ⏸️ Stopped topic discovery`);
+            console.log(`[${serviceName}] Stopped topic discovery`);
         }
     };
 
@@ -193,11 +175,11 @@ export const kafkaRPC = (options: KafkaRPCOptions) => {
         }
 
         try {
-            await consumer.subscribe({ topic: responseTopic, fromBeginning: false });
+            await consumer.subscribe({topic: responseTopic, fromBeginning: false});
             discoveredResponseTopics.add(responseTopic);
-            console.log(`[${serviceName}] ✅ Subscribed to: ${responseTopic}`);
+            console.log(`[${serviceName}] Subscribed to: ${responseTopic}`);
         } catch (error: any) {
-            console.log(`[${serviceName}] ⚠️ Failed to subscribe: ${responseTopic} - ${error.message}`);
+            console.log(`[${serviceName}] Failed to subscribe: ${responseTopic} - ${error.message}`);
         }
     };
 
@@ -205,39 +187,37 @@ export const kafkaRPC = (options: KafkaRPCOptions) => {
         if (consumerInitialized) return;
 
         consumer = kafka.consumer({
-            groupId: `${serviceName}-consumer`,
-            sessionTimeout: 30000,
-            heartbeatInterval: 3000,
+            groupId: `${serviceName}-consumer`, sessionTimeout: 30000, heartbeatInterval: 3000,
         });
 
         await consumer.connect();
-        console.log(`[${serviceName}] 🔌 Consumer connected`);
+        console.log(`[${serviceName}]  Consumer connected`);
 
-        // Subscribe to explicit topics first
+
         if (subscribeToTopics.length > 0) {
-            console.log(`[${serviceName}] 📌 Subscribing to explicit topics:`, subscribeToTopics);
+            console.log(`[${serviceName}]  Subscribing to explicit topics:`, subscribeToTopics);
             for (const topic of subscribeToTopics) {
                 try {
-                    await consumer.subscribe({ topic, fromBeginning: false });
+                    await consumer.subscribe({topic, fromBeginning: false});
                     discoveredResponseTopics.add(topic);
-                    console.log(`[${serviceName}] ✅ Subscribed to explicit topic: ${topic}`);
+                    console.log(`[${serviceName}]  Subscribed to explicit topic: ${topic}`);
                 } catch (error: any) {
-                    console.log(`[${serviceName}] ⚠️ Failed to subscribe to ${topic}: ${error.message}`);
+                    console.log(`[${serviceName}]  Failed to subscribe to ${topic}: ${error.message}`);
                 }
             }
         }
 
-        // Perform initial topic discovery (non-blocking)
-        console.log(`[${serviceName}] 🔍 Starting initial topic discovery...`);
+
+        console.log(`[${serviceName}]  Starting initial topic discovery...`);
         await discoverAndSubscribeToTopics();
 
-        // Start periodic topic discovery
+
         startTopicDiscovery();
 
         await consumer.run({
-            eachBatch: async ({ batch }) => {
+            eachBatch: async ({batch}) => {
                 const topic = batch.topic;
-                console.log(`\n[${serviceName}] 📨 Received ${batch.messages.length} messages from: ${topic}`);
+                console.log(`\n[${serviceName}]  Received ${batch.messages.length} messages from: ${topic}`);
 
                 for (const msg of batch.messages) {
                     if (!msg?.value) continue;
@@ -246,11 +226,8 @@ export const kafkaRPC = (options: KafkaRPCOptions) => {
                         const payload = JSON.parse(msg.value.toString());
                         const correlationId = payload.correlationId || msg.headers?.correlationId?.toString();
 
-                        console.log(`[${serviceName}] 📦 Message details:`, {
-                            topic,
-                            correlationId,
-                            hasPayload: !!payload,
-                            payloadKeys: Object.keys(payload)
+                        console.log(`[${serviceName}]  Message details:`, {
+                            topic, correlationId, hasPayload: !!payload, payloadKeys: Object.keys(payload)
                         });
 
                         // Check if this is an RPC response
@@ -259,14 +236,13 @@ export const kafkaRPC = (options: KafkaRPCOptions) => {
                         if (pending) {
                             // This is a response to our request
                             clearTimeout(pending.timeout);
-                            const { __responseTopic, ...data } = payload;
+                            const {__responseTopic, ...data} = payload;
                             pending.resolve(data);
                             pendingRequests.delete(correlationId);
-                            console.log(`[${serviceName}] ✅ RPC Response matched: ${correlationId}`);
-                        }
-                        else if (onMessage) {
-                            console.log(`[${serviceName}] 🔄 Processing event from: ${topic}`);
-                            console.log(`[${serviceName}] 📄 Event data:`, JSON.stringify(payload, null, 2));
+                            console.log(`[${serviceName}]  RPC Response matched: ${correlationId}`);
+                        } else if (onMessage) {
+                            console.log(`[${serviceName}]  Processing event from: ${topic}`);
+                            console.log(`[${serviceName}] Event data:`, JSON.stringify(payload, null, 2));
 
                             try {
                                 // Call the event handler
@@ -277,8 +253,7 @@ export const kafkaRPC = (options: KafkaRPCOptions) => {
 
                                 if (replyTo && response) {
                                     await producer.send({
-                                        topic: replyTo,
-                                        messages: [{
+                                        topic: replyTo, messages: [{
                                             key: payload.jobId || msg.key?.toString(),
                                             value: JSON.stringify(response),
                                             headers: {
@@ -287,24 +262,24 @@ export const kafkaRPC = (options: KafkaRPCOptions) => {
                                             }
                                         }]
                                     });
-                                    console.log(`[${serviceName}] ✅ Event response sent to: ${replyTo}`);
+                                    console.log(`[${serviceName}] Event response sent to: ${replyTo}`);
                                 }
                             } catch (handlerError: any) {
-                                console.error(`[${serviceName}] ❌ Event handler error:`, handlerError.message);
+                                console.error(`[${serviceName}] Event handler error:`, handlerError.message);
                             }
                         } else {
-                            console.log(`[${serviceName}] ⚠️ No handler for message: ${correlationId || 'no-id'} from topic: ${topic}`);
+                            console.log(`[${serviceName}]  No handler for message: ${correlationId || 'no-id'} from topic: ${topic}`);
                         }
 
                     } catch (error: any) {
-                        console.error(`[${serviceName}] ❌ Error processing message:`, error.message);
+                        console.error(`[${serviceName}]  Error processing message:`, error.message);
                     }
                 }
             },
         });
 
         consumerInitialized = true;
-        console.log(`[${serviceName}] ✅ Consumer ready with event handling`);
+        console.log(`[${serviceName}] Consumer ready with event handling`);
     };
 
     const request = <T = any>(data: any, requestId?: string): Promise<T> => {
@@ -319,15 +294,15 @@ export const kafkaRPC = (options: KafkaRPCOptions) => {
 
         return new Promise((resolve, reject) => {
             const timeoutHandle = setTimeout(() => {
-                console.log(`[${serviceName}] ⏱️ Timeout: ${correlationId}`);
+                console.log(`[${serviceName}] Timeout: ${correlationId}`);
                 pendingRequests.delete(correlationId);
                 reject(new Error(`Timeout: ${correlationId}`));
             }, timeout);
 
-            pendingRequests.set(correlationId, { resolve, reject, timeout: timeoutHandle });
+            pendingRequests.set(correlationId, {resolve, reject, timeout: timeoutHandle});
 
             queue.push({
-                data: { ...data, __responseTopic: resolvedResponseTopic },
+                data: {...data, __responseTopic: resolvedResponseTopic},
                 correlationId,
                 requestTopic: resolvedRequestTopic,
                 responseTopic: resolvedResponseTopic
@@ -362,11 +337,11 @@ export const kafkaRPC = (options: KafkaRPCOptions) => {
     });
 
     const manualTopicDiscovery = async () => {
-        console.log(`[${serviceName}] 🔍 Manual topic discovery triggered`);
+        console.log(`[${serviceName}]  Manual topic discovery triggered`);
         await discoverAndSubscribeToTopics();
     };
 
-    return new Elysia({ name: 'kafka-rpc' })
+    return new Elysia({name: 'kafka-rpc'})
         .decorate('kafkaRPC', {
             request,
             getPendingCount: () => pendingRequests.size,
@@ -382,7 +357,7 @@ export const kafkaRPC = (options: KafkaRPCOptions) => {
         .onStart(async () => {
             producer = kafka.producer();
             await producer.connect();
-            console.log(`[${serviceName}] 🔌 Producer connected`);
+            console.log(`[${serviceName}]  Producer connected`);
             await initializeConsumer();
         })
         .onStop(async () => {
@@ -391,6 +366,6 @@ export const kafkaRPC = (options: KafkaRPCOptions) => {
             await producer?.disconnect();
             await consumer?.disconnect();
             await admin?.disconnect();
-            console.log(`[${serviceName}] 🔌 Kafka disconnected`);
+            console.log(`[${serviceName}] Kafka disconnected`);
         });
 };

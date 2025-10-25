@@ -1,0 +1,43 @@
+{
+  "_id": "68fcc6f8c435a58ea5894137",
+  "fcmToken": "dE7W94fDP0VRvBaa_iAVEe:APA91bEsGKyPxQKIN8GwJg3h0000000001",
+  "vehicleInfo": {
+    "isApproved": true,
+    "vehicleType": "Premium",
+    "vehicleNumber": "ABC0001",
+    "vehicleModel": "Ford Fusion",
+    "vehicleYear": 2020,
+    "color": "Blue"
+  },
+  "iAmOnline": true,
+  "location": {
+    "type": "Point",
+    "coordinates": [
+      -52.695269172461046,
+      47.63205116197759
+    ]
+  },
+  "missedBookingCount": 2,
+  "heading": 31,
+  "missedBookingAt": null,
+  "stopFutureRide": false,
+  "iAmBusy": true,
+  "socket_id": "68fcc6f8c435a58ea5894137",
+  "isDriverUnderPool": false,
+  "fullName": "Driver 1",
+  "avatar": "https://s3.ca-central-1.wasabisys.com/webin10/websites/65f352b0d0b96c21405031be/drivers/68fcc6f8c435a58ea5894137/avatar_1.webp",
+  "phone": "9200000001",
+  "email": "driver1@example.com",
+  "approved_zones": [],
+  "rating": 4,
+  "totalTrips": 220,
+  "completionRate": 98.2,
+  "acceptanceRate": 92.8,
+  "lastActiveAt": "2025-10-25T11:57:49.093Z",
+  "createdAt": "2024-11-18T15:08:26.537Z",
+  "earnings": {
+    "today": 6.95,
+    "thisWeek": 152.73,
+    "thisMonth": 1590.38
+  }
+}

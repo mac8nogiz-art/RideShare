@@ -1,0 +1,43 @@
+{
+  "_id": "68fcc6f8b4e749e301e1898a",
+  "fcmToken": "dE7W94fDP0VRvBaa_iAVEe:APA91bEsGKyPxQKIN8GwJg3h0000000003",
+  "vehicleInfo": {
+    "isApproved": true,
+    "vehicleType": "Comfort Plus",
+    "vehicleNumber": "ABC0003",
+    "vehicleModel": "Honda Civic",
+    "vehicleYear": 2021,
+    "color": "Blue"
+  },
+  "iAmOnline": true,
+  "location": {
+    "type": "Point",
+    "coordinates": [
+      -52.67536679319074,
+      47.511879585706254
+    ]
+  },
+  "missedBookingCount": 0,
+  "heading": 268,
+  "missedBookingAt": null,
+  "stopFutureRide": false,
+  "iAmBusy": true,
+  "socket_id": "68fcc6f8b4e749e301e1898a",
+  "isDriverUnderPool": false,
+  "fullName": "Driver 3",
+  "avatar": "https://s3.ca-central-1.wasabisys.com/webin10/websites/65f352b0d0b96c21405031be/drivers/68fcc6f8b4e749e301e1898a/avatar_3.webp",
+  "phone": "9200000003",
+  "email": "driver3@example.com",
+  "approved_zones": [],
+  "rating": 4.9,
+  "totalTrips": 105,
+  "completionRate": 88.4,
+  "acceptanceRate": 90.5,
+  "lastActiveAt": "2025-10-25T11:50:03.535Z",
+  "createdAt": "2025-06-24T07:04:07.961Z",
+  "earnings": {
+    "today": 145.97,
+    "thisWeek": 698.63,
+    "thisMonth": 1111.83
+  }
+}

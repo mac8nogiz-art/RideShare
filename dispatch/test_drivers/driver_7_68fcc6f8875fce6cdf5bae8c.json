@@ -1,0 +1,47 @@
+{
+  "_id": "68fcc6f8875fce6cdf5bae8c",
+  "fcmToken": "dE7W94fDP0VRvBaa_iAVEe:APA91bEsGKyPxQKIN8GwJg3h0000000007",
+  "vehicleInfo": {
+    "isApproved": true,
+    "vehicleType": "Premium",
+    "vehicleNumber": "ABC0007",
+    "vehicleModel": "Honda Civic",
+    "vehicleYear": 2020,
+    "color": "Gray"
+  },
+  "iAmOnline": true,
+  "location": {
+    "type": "Point",
+    "coordinates": [
+      -52.734669777449746,
+      47.59874983493412
+    ]
+  },
+  "missedBookingCount": 0,
+  "heading": 223,
+  "missedBookingAt": null,
+  "stopFutureRide": false,
+  "iAmBusy": false,
+  "socket_id": "68fcc6f8875fce6cdf5bae8c",
+  "isDriverUnderPool": false,
+  "fullName": "Driver 7",
+  "avatar": "https://s3.ca-central-1.wasabisys.com/webin10/websites/65f352b0d0b96c21405031be/drivers/68fcc6f8875fce6cdf5bae8c/avatar_7.webp",
+  "phone": "9200000007",
+  "email": "driver7@example.com",
+  "approved_zones": [
+    "507f1f77bcf86cd799439013",
+    "507f1f77bcf86cd799439011",
+    "507f1f77bcf86cd799439015"
+  ],
+  "rating": 4.7,
+  "totalTrips": 518,
+  "completionRate": 92.9,
+  "acceptanceRate": 84.5,
+  "lastActiveAt": "2025-10-25T12:10:54.111Z",
+  "createdAt": "2025-04-08T21:12:04.606Z",
+  "earnings": {
+    "today": 132.4,
+    "thisWeek": 935.63,
+    "thisMonth": 895.17
+  }
+}

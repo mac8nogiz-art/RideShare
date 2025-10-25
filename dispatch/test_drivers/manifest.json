@@ -1,0 +1,129 @@
+{
+  "generated_at": "2025-10-25T13:08:20.209Z",
+  "total_drivers": 8,
+  "zone_id": "68062fe1d17296e5867ddae1",
+  "zone_name": "St. John's International Airport",
+  "statistics": {
+    "online": 6,
+    "busy": 1,
+    "available": 5,
+    "with_zones": 5,
+    "without_zones": 3
+  },
+  "drivers": [
+    {
+      "id": "68fccbc3761a3d721a8be195",
+      "name": "Driver 1",
+      "phone": "9200000001",
+      "status": "offline",
+      "approved": true,
+      "zones": [],
+      "location": [
+        -52.708532716245905,
+        47.59204727828663
+      ],
+      "filename": "driver_1_68fccbc3761a3d721a8be195.json"
+    },
+    {
+      "id": "68fccbc3201ebd16c848626e",
+      "name": "Driver 2",
+      "phone": "9200000002",
+      "status": "available",
+      "approved": true,
+      "zones": [],
+      "location": [
+        -52.757982941496095,
+        47.614226318443514
+      ],
+      "filename": "driver_2_68fccbc3201ebd16c848626e.json"
+    },
+    {
+      "id": "68fccbc321d31c81caedad98",
+      "name": "Driver 3",
+      "phone": "9200000003",
+      "status": "available",
+      "approved": true,
+      "zones": [],
+      "location": [
+        -52.75055719464295,
+        47.654628685920045
+      ],
+      "filename": "driver_3_68fccbc321d31c81caedad98.json"
+    },
+    {
+      "id": "68fccbc3d423e4197c738725",
+      "name": "Driver 4",
+      "phone": "9200000004",
+      "status": "busy",
+      "approved": true,
+      "zones": [
+        "68062fe1d17296e5867ddae1"
+      ],
+      "location": [
+        -52.762102811538504,
+        47.59309409554172
+      ],
+      "filename": "driver_4_68fccbc3d423e4197c738725.json"
+    },
+    {
+      "id": "68fccbc35260c235c09fd0fb",
+      "name": "Driver 5",
+      "phone": "9200000005",
+      "status": "offline",
+      "approved": true,
+      "zones": [
+        "68062fe1d17296e5867ddae1"
+      ],
+      "location": [
+        -52.78277724480639,
+        47.59662833220887
+      ],
+      "filename": "driver_5_68fccbc35260c235c09fd0fb.json"
+    },
+    {
+      "id": "68fccbc3a1541c00e0c2bbf8",
+      "name": "Driver 6",
+      "phone": "9200000006",
+      "status": "available",
+      "approved": true,
+      "zones": [
+        "68062fe1d17296e5867ddae1"
+      ],
+      "location": [
+        -52.76409381792582,
+        47.64857796453697
+      ],
+      "filename": "driver_6_68fccbc3a1541c00e0c2bbf8.json"
+    },
+    {
+      "id": "68fccbc38f044e7cdc5997c2",
+      "name": "Driver 7",
+      "phone": "9200000007",
+      "status": "available",
+      "approved": true,
+      "zones": [
+        "68062fe1d17296e5867ddae1"
+      ],
+      "location": [
+        -52.71449629942622,
+        47.63413557409399
+      ],
+      "filename": "driver_7_68fccbc38f044e7cdc5997c2.json"
+    },
+    {
+      "id": "68fccbc31eafbfb1fe71cd3b",
+      "name": "Driver 8",
+      "phone": "9200000008",
+      "status": "available",
+      "approved": true,
+      "zones": [
+        "68062fe1d17296e5867ddae1"
+      ],
+      "location": [
+        -52.75610327166942,
+        47.64967834997061
+      ],
+      "filename": "driver_8_68fccbc31eafbfb1fe71cd3b.json"
+    }
+  ]
+}

@@ -1,0 +1,26 @@
+{
+  "_id": "68fccd706401fe6e0506845e",
+  "fcmToken": "dE7W94fDP0VRvBaa_iAVEe:APA91bEsGKyPxQKIN8GwJg3h0000000003",
+  "vehicleInfo": {
+    "isApproved": true
+  },
+  "iAmOnline": false,
+  "location": {
+    "type": "Point",
+    "coordinates": [
+      -52.78125275439894,
+      47.60526022282955
+    ]
+  },
+  "missedBookingCount": 1,
+  "heading": 31,
+  "missedBookingAt": null,
+  "stopFutureRide": false,
+  "iAmBusy": false,
+  "socket_id": "68fccd706401fe6e0506845e",
+  "isDriverUnderPool": false,
+  "fullName": "Driver 3",
+  "avatar": "https://s3.ca-central-1.wasabisys.com/webin10/websites/65f352b0d0b96c21405031be/drivers/68fccd706401fe6e0506845e/h5z4pyca-rn_image_picker_lib_temp_68fccd706401fe6e0506845e.webp",
+  "phone": "9200000003",
+  "approved_zones": []
+}

@@ -1,0 +1,43 @@
+{
+  "_id": "68fcc6f80a2ad8a4d995a2d7",
+  "fcmToken": "dE7W94fDP0VRvBaa_iAVEe:APA91bEsGKyPxQKIN8GwJg3h0000000002",
+  "vehicleInfo": {
+    "isApproved": false,
+    "vehicleType": "Premium",
+    "vehicleNumber": "ABC0002",
+    "vehicleModel": "Toyota Camry",
+    "vehicleYear": 2022,
+    "color": "White"
+  },
+  "iAmOnline": true,
+  "location": {
+    "type": "Point",
+    "coordinates": [
+      -52.660598841616206,
+      47.66266495846038
+    ]
+  },
+  "missedBookingCount": 1,
+  "heading": 336,
+  "missedBookingAt": null,
+  "stopFutureRide": false,
+  "iAmBusy": true,
+  "socket_id": "68fcc6f80a2ad8a4d995a2d7",
+  "isDriverUnderPool": false,
+  "fullName": "Driver 2",
+  "avatar": "https://s3.ca-central-1.wasabisys.com/webin10/websites/65f352b0d0b96c21405031be/drivers/68fcc6f80a2ad8a4d995a2d7/avatar_2.webp",
+  "phone": "9200000002",
+  "email": "driver2@example.com",
+  "approved_zones": [],
+  "rating": 4.4,
+  "totalTrips": 407,
+  "completionRate": 87.9,
+  "acceptanceRate": 80.9,
+  "lastActiveAt": "2025-10-25T11:52:45.696Z",
+  "createdAt": "2025-03-27T04:26:32.943Z",
+  "earnings": {
+    "today": 76.55,
+    "thisWeek": 987.22,
+    "thisMonth": 1576.72
+  }
+}

@@ -1,0 +1,47 @@
+{
+  "_id": "68fcc6f885cad354c2e70b57",
+  "fcmToken": "dE7W94fDP0VRvBaa_iAVEe:APA91bEsGKyPxQKIN8GwJg3h0000000005",
+  "vehicleInfo": {
+    "isApproved": true,
+    "vehicleType": "Swift Ride",
+    "vehicleNumber": "ABC0005",
+    "vehicleModel": "Honda Civic",
+    "vehicleYear": 2022,
+    "color": "Black"
+  },
+  "iAmOnline": true,
+  "location": {
+    "type": "Point",
+    "coordinates": [
+      -52.62117326708057,
+      47.61563453454005
+    ]
+  },
+  "missedBookingCount": 0,
+  "heading": 143,
+  "missedBookingAt": null,
+  "stopFutureRide": false,
+  "iAmBusy": false,
+  "socket_id": "68fcc6f885cad354c2e70b57",
+  "isDriverUnderPool": false,
+  "fullName": "Driver 5",
+  "avatar": "https://s3.ca-central-1.wasabisys.com/webin10/websites/65f352b0d0b96c21405031be/drivers/68fcc6f885cad354c2e70b57/avatar_5.webp",
+  "phone": "9200000005",
+  "email": "driver5@example.com",
+  "approved_zones": [
+    "507f1f77bcf86cd799439013",
+    "507f1f77bcf86cd799439011",
+    "507f1f77bcf86cd799439014"
+  ],
+  "rating": 4.3,
+  "totalTrips": 137,
+  "completionRate": 92.2,
+  "acceptanceRate": 83.9,
+  "lastActiveAt": "2025-10-25T12:02:16.825Z",
+  "createdAt": "2025-01-22T21:10:24.726Z",
+  "earnings": {
+    "today": 162.22,
+    "thisWeek": 227.03,
+    "thisMonth": 3803.22
+  }
+}

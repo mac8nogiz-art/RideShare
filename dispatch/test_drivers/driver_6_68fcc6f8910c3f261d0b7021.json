@@ -1,0 +1,46 @@
+{
+  "_id": "68fcc6f8910c3f261d0b7021",
+  "fcmToken": "dE7W94fDP0VRvBaa_iAVEe:APA91bEsGKyPxQKIN8GwJg3h0000000006",
+  "vehicleInfo": {
+    "isApproved": false,
+    "vehicleType": "Swift Ride",
+    "vehicleNumber": "ABC0006",
+    "vehicleModel": "Toyota Camry",
+    "vehicleYear": 2020,
+    "color": "Silver"
+  },
+  "iAmOnline": true,
+  "location": {
+    "type": "Point",
+    "coordinates": [
+      -52.771463568891114,
+      47.57258749736106
+    ]
+  },
+  "missedBookingCount": 0,
+  "heading": 101,
+  "missedBookingAt": null,
+  "stopFutureRide": false,
+  "iAmBusy": false,
+  "socket_id": "68fcc6f8910c3f261d0b7021",
+  "isDriverUnderPool": false,
+  "fullName": "Driver 6",
+  "avatar": "https://s3.ca-central-1.wasabisys.com/webin10/websites/65f352b0d0b96c21405031be/drivers/68fcc6f8910c3f261d0b7021/avatar_6.webp",
+  "phone": "9200000006",
+  "email": "driver6@example.com",
+  "approved_zones": [
+    "507f1f77bcf86cd799439012",
+    "507f1f77bcf86cd799439014"
+  ],
+  "rating": 4.1,
+  "totalTrips": 142,
+  "completionRate": 95,
+  "acceptanceRate": 91.6,
+  "lastActiveAt": "2025-10-25T12:31:19.206Z",
+  "createdAt": "2025-07-28T04:11:09.898Z",
+  "earnings": {
+    "today": 161.25,
+    "thisWeek": 787.52,
+    "thisMonth": 1527.19
+  }
+}

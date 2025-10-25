@@ -1,0 +1,45 @@
+{
+  "_id": "68fcc6f8c2e18bbf1d802ae6",
+  "fcmToken": "dE7W94fDP0VRvBaa_iAVEe:APA91bEsGKyPxQKIN8GwJg3h0000000004",
+  "vehicleInfo": {
+    "isApproved": true,
+    "vehicleType": "Comfort Plus",
+    "vehicleNumber": "ABC0004",
+    "vehicleModel": "Nissan Altima",
+    "vehicleYear": 2023,
+    "color": "Gray"
+  },
+  "iAmOnline": true,
+  "location": {
+    "type": "Point",
+    "coordinates": [
+      -52.61243369860272,
+      47.61211717440573
+    ]
+  },
+  "missedBookingCount": 0,
+  "heading": 322,
+  "missedBookingAt": null,
+  "stopFutureRide": false,
+  "iAmBusy": true,
+  "socket_id": "68fcc6f8c2e18bbf1d802ae6",
+  "isDriverUnderPool": false,
+  "fullName": "Driver 4",
+  "avatar": "https://s3.ca-central-1.wasabisys.com/webin10/websites/65f352b0d0b96c21405031be/drivers/68fcc6f8c2e18bbf1d802ae6/avatar_4.webp",
+  "phone": "9200000004",
+  "email": "driver4@example.com",
+  "approved_zones": [
+    "507f1f77bcf86cd799439014"
+  ],
+  "rating": 4.1,
+  "totalTrips": 270,
+  "completionRate": 93.2,
+  "acceptanceRate": 80.7,
+  "lastActiveAt": "2025-10-25T12:03:20.883Z",
+  "createdAt": "2024-12-09T16:44:37.052Z",
+  "earnings": {
+    "today": 155.19,
+    "thisWeek": 59.64,
+    "thisMonth": 2758.85
+  }
+}

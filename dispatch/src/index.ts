@@ -2,81 +2,114 @@ import { Elysia } from 'elysia';
 import { kafkaRPC } from './commonkafkaintegration/kafkarpc';
 import { redis } from "./infrastructure/redis";
 import { logger } from "./logger";
-import { jobOrchestratorService } from "./services/JobOrchestrator.Service";
+import { jobOrchestratorService } from "./services/JobOrchestrator.Service"; // Updated import
 import { processKafkaMessage } from "./handlers/mesage-processor";
 
-// ============================================
-// KAFKA CONFIGURATION
-// ============================================
+
 const app = new Elysia()
-    // ADD THIS: Initialize Kafka RPC
+
     .use(
         kafkaRPC({
-            serviceName: 'Dispatch-service',
-            brokers: [process.env.KAFKA_BROKER || '172.105.61.99:9093'],
-            requestTopic: 'dispatch.request',
-            responseTopic: 'dispatch.response',
-            timeout: 10000,
+            serviceName: 'dispatch-service',
+            brokers: [process.env.KAFKA_BROKER || 'localhost:9092'],
+            requestTopic: (data) => `${data.targetService || 'dispatch-service'}.request`,
+            responseTopic: (data) => `${data.targetService || 'dispatch-service'}.response`,
+            timeout: 5000,
             batchSize: 100,
-            batchTimeout: 100,
-            topicDiscoveryInterval: 30000,
-            // Subscribe to topics you want to listen to
-            subscribeToTopics: [
-                'payment.events',
-                'driver.location',
-                'ride.request',
-                'user.request',
-                'user.response'
-            ],
-            // THIS IS CRITICAL: Handle incoming messages
+
             onMessage: async (message: any, topic: string) => {
-                console.log(`\n🎯 Received event from topic: ${topic}`);
-                console.log(`📦 Message:`, JSON.stringify(message, null, 2));
-
-                // Handle different topics
-                switch (topic) {
-                    case 'payment.events':
-                        console.log(`💰 Payment Event: ${message.paymentId} - $${message.amount}`);
-                        // Your payment processing logic
-                        break;
-
-                    case 'driver.location':
-                        console.log(`🚗 Driver Location: ${message.driverId} at (${message.lat}, ${message.lng})`);
-                        // Your driver tracking logic
-                        break;
-
-                    case 'ride.request':
-                        console.log(`🚕 Ride Request: ${message.requestId} from ${message.userId}`);
-                        // Your ride matching logic
-                        break;
-
-                    case 'user.request':
-                        console.log(`👤 User Request: ${message.requestId} - ${message.action}`);
-                        // Your user request handling
-                        break;
-
-                    case 'user.response':
-                        console.log(`✅ User Response: ${message.requestId}`);
-                        // Your response handling
-                        break;
-
-                    default:
-                        console.log(`⚠️ Unhandled topic: ${topic}`);
+                    console.log(`Received event from topic: ${topic}`);
+                    console.log(`Message:`, JSON.stringify(message, null, 2));
+                    return {
+                        status: 'processed',
+                        timestamp: Date.now()
+                    };
                 }
+            })
+        )
 
-                // Return response if needed
-                return {
-                    status: 'processed',
-                    timestamp: Date.now()
-                };
+        .get('/', () => 'Dispatch Service Running')
+        .get('/health', () => ({ status: 'ok' }))
+        .listen(process.env.PORT || 4005)
+
+
+
+    .get("/stats", async ({kafkaRPC}) => {
+        const stats = jobOrchestratorService.getStats(); // Updated service reference
+        const kafkaStats = kafkaRPC.getCacheStats();
+        return {...stats, kafka: kafkaStats};
+    });
+
+async function start() {
+    try {
+        logger.info(' Starting Dispatch Service...');
+        logger.info('═'.repeat(50));
+
+
+        logger.info('Testing Redis connection...');
+        await redis.ping();
+        logger.info(' Redis connected');
+
+
+        logger.info('Starting job orchestrator...');
+        await jobOrchestratorService.start();
+        logger.info('Orchestrator started');
+
+
+        const preferredPort = Number(process.env.PORT) || 4005;
+        let port = preferredPort;
+        let serverStarted = false;
+
+        for (let attempt = 0; attempt < 5 && !serverStarted; attempt++) {
+            try {
+                logger.info(`starting HTTP server on port ${port}...`);
+                await app.listen({port, hostname: "0.0.0.0"});
+                serverStarted = true;
+            } catch (error: any) {
+                if (error.message.includes('in use')) {
+                    logger.warn(`  Port ${port} in use, trying ${port + 1}`);
+                    port++;
+                } else {
+                    throw error;
+                }
             }
-        })
-    )
-    // Your other routes
-    .get('/', () => 'Dispatch Service Running')
-    .get('/health', () => ({ status: 'ok' }))
-    .listen(process.env.PORT || 4005);
+        }
 
-console.log(`🚀 Dispatch service running on port ${app.server?.port}`);
+        if (!serverStarted) {
+            throw new Error(`No available port starting from ${preferredPort}`);
+        }
+
+        logger.info(` HTTP Server: http://localhost:${port}`);
+        logger.info(` Stats: http://localhost:${port}/stats`);
+        logger.info(`Health: http://localhost:${port}/health`);
+        logger.info('');
+
+    } catch (error: any) {
+        logger.error({error: error.message}, 'Startup failed');
+        jobOrchestratorService.stop();
+        process.exit(1);
+    }
+}
+
+
+process.on('SIGTERM', async () => {
+    logger.info('SIGTERM - shutting down...');
+    jobOrchestratorService.stop();
+    await redis.quit();
+    process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+    logger.info('  SIGINT - shutting down...');
+    jobOrchestratorService.stop();
+    await redis.quit();
+    process.exit(0);
+});
+
+start();
 
 export default app;
+
+
+
+
