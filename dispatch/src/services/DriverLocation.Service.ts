@@ -1,177 +1,24 @@
-import { redis } from '../infrastructure/redis';
-import { logger } from '../logger';
-import { Driver } from '../types';
+import {redis} from '../infrastructure/redis';
+import {logger} from '../logger';
+import {Driver} from '../types';
 
 export class DriverLocationService {
     private driverCache = new Map<string, Driver>();
-    private profileCache = new Map<string, any>();
     private locationRefreshInterval: NodeJS.Timeout | null = null;
-    private profileRefreshInterval: NodeJS.Timeout | null = null;
     private isInitialized = false;
 
     async startDriverCacheRefresh(): Promise<void> {
-        logger.info('Starting Driver Cache Refresh - Location: 2s, Profile: 30s');
+        logger.info('Starting Driver Cache Refresh - Interval: 2s');
 
-        // Initial load - wait for completion
-        await this.refreshProfileCache();
+
         await this.refreshDriverCache();
 
         this.isInitialized = true;
-        logger.info(`✅ Driver cache initialized with ${this.driverCache.size} drivers`);
+        logger.info(`Driver cache initialized with ${this.driverCache.size} drivers`);
 
-        // Start periodic refresh
         this.locationRefreshInterval = setInterval(async () => {
             await this.refreshDriverCache();
         }, 2000);
-
-        this.profileRefreshInterval = setInterval(async () => {
-            await this.refreshProfileCache();
-        }, 30000);
-    }
-
-    private async refreshDriverCache(): Promise<void> {
-        const startTime = Date.now();
-
-        try {
-            const keys = await redis.keys('driver:*:location');
-            if (keys.length === 0) {
-                logger.warn('No driver location keys found in Redis');
-                return;
-            }
-
-            const pipeline = redis.pipeline();
-            keys.forEach(key => pipeline.hgetall(key));
-            const results = await pipeline.exec();
-
-            const newCache = new Map<string, Driver>();
-            const geoUpdates: Array<{driverId: string, lat: number, lng: number}> = [];
-
-            results?.forEach((result, index) => {
-                if (result[0]) return;
-
-                const location = result[1] as any;
-                const driverId = keys[index].split(':')[1];
-
-                if (location?.lat && location?.lng) {
-                    const profile = this.profileCache.get(driverId) || {};
-
-                    const approvedZones = this.parseApprovedZones(profile?.approvedZones);
-
-                    const lat = parseFloat(location.lat);
-                    const lng = parseFloat(location.lng);
-
-                    const driver: Driver = {
-                        driverId,
-                        lat,
-                        lng,
-                        score: parseFloat(profile?.score || "0"),
-                        isFavorite: profile?.isFavorite === "true",
-                        isBusy: profile?.isBusy === "true",
-                        isNew: this.isNewDriver(profile?.approvedDate || ""),
-                        lastUpdate: parseInt(location.lastUpdate || location.ts || "0"),
-                        approvedZones: approvedZones
-                    };
-
-                    newCache.set(driverId, driver);
-
-                    // Collect geo updates to batch them
-                    if (!isNaN(lat) && !isNaN(lng)) {
-                        geoUpdates.push({ driverId, lat, lng });
-                    }
-                }
-            });
-
-            // Batch update geospatial index
-            if (geoUpdates.length > 0) {
-                await this.batchUpdateGeolocation(geoUpdates);
-            }
-
-            this.driverCache = newCache;
-            logger.debug(`Driver Cache Refreshed - Drivers: ${newCache.size}, Geo updates: ${geoUpdates.length}, Time: ${Date.now() - startTime}ms`);
-        } catch (error) {
-            logger.error(`Cache Refresh Error: ${error}`);
-        }
-    }
-
-    private parseApprovedZones(approvedZonesData: any): string[] {
-        if (!approvedZonesData) return [];
-
-        try {
-            if (typeof approvedZonesData === 'string') {
-                if (approvedZonesData.startsWith('[') || approvedZonesData.startsWith('{')) {
-                    const parsed = JSON.parse(approvedZonesData);
-                    return Array.isArray(parsed) ? parsed : [];
-                } else {
-                    return approvedZonesData.split(',').map((zone: string) => zone.trim()).filter(Boolean);
-                }
-            } else if (Array.isArray(approvedZonesData)) {
-                return approvedZonesData;
-            }
-        } catch (error) {
-            logger.warn(`Failed to parse approvedZones: ${approvedZonesData}`);
-        }
-
-        return [];
-    }
-
-    /**
-     * FIXED: Batch update geolocation to ensure all drivers are in the geo index
-     */
-    private async batchUpdateGeolocation(updates: Array<{driverId: string, lat: number, lng: number}>): Promise<void> {
-        try {
-            // GEOADD accepts: key, lng1, lat1, member1, lng2, lat2, member2, ...
-            const args: (string | number)[] = ['drivers:locations'];
-
-            updates.forEach(({ driverId, lat, lng }) => {
-                args.push(lng, lat, driverId);
-            });
-
-            // Use a single GEOADD command to add all drivers
-            await redis.geoadd(args[0] as string, ...args.slice(1) as any[]);
-
-            logger.debug(`✓ Updated ${updates.length} drivers in geospatial index`);
-        } catch (error) {
-            logger.error(`❌ Batch geospatial update failed: ${error}`);
-
-            // Fallback: Update one by one
-            logger.warn('Falling back to individual GEOADD commands...');
-            for (const { driverId, lat, lng } of updates) {
-                try {
-                    await redis.geoadd('drivers:locations', lng, lat, driverId);
-                } catch (err) {
-                    logger.error(`Failed to update geolocation for ${driverId}: ${err}`);
-                }
-            }
-        }
-    }
-
-    private async refreshProfileCache(): Promise<void> {
-        const startTime = Date.now();
-        try {
-            const keys = await redis.keys('driver:*:profile');
-            if (keys.length === 0) {
-                logger.warn('No driver profile keys found in Redis');
-                return;
-            }
-
-            const pipeline = redis.pipeline();
-            keys.forEach(key => pipeline.hgetall(key));
-            const results = await pipeline.exec();
-
-            const newProfileCache = new Map<string, any>();
-
-            results?.forEach((result, index) => {
-                if (result[0]) return;
-                const profile = result[1];
-                const driverId = keys[index].split(':')[1];
-                newProfileCache.set(driverId, profile);
-            });
-
-            this.profileCache = newProfileCache;
-            logger.debug(`Profile Cache Refreshed - Profiles: ${newProfileCache.size}, Time: ${Date.now() - startTime}ms`);
-        } catch (error) {
-            logger.error(`Profile Cache Refresh Error: ${error}`);
-        }
     }
 
     getAllDrivers(): Map<string, Driver> {
@@ -190,20 +37,126 @@ export class DriverLocationService {
         return this.isInitialized;
     }
 
-    private isNewDriver(approvedDate: string): boolean {
-        if (!approvedDate) return false;
-        const approved = new Date(approvedDate);
-        return (Date.now() - approved.getTime()) <= (30 * 24 * 60 * 60 * 1000); // 30 days
-    }
-
     stop(): void {
         if (this.locationRefreshInterval) {
             clearInterval(this.locationRefreshInterval);
             this.locationRefreshInterval = null;
         }
-        if (this.profileRefreshInterval) {
-            clearInterval(this.profileRefreshInterval);
-            this.profileRefreshInterval = null;
+    }
+
+    private async refreshDriverCache(): Promise<void> {
+        const startTime = Date.now();
+
+        try {
+
+            const keys = await redis.keys('driver:*');
+
+
+            const driverKeys = keys.filter(key => {
+                const parts = key.split(':');
+                return parts.length === 2 && parts[0] === 'driver';
+            });
+
+            if (driverKeys.length === 0) {
+                logger.warn('No driver JSON documents found in Redis');
+                return;
+            }
+
+            logger.debug(`Found ${driverKeys.length} driver documents`);
+
+            const pipeline = redis.pipeline();
+            driverKeys.forEach(key => {
+                pipeline.call('JSON.GET', key);
+            });
+            const results = await pipeline.exec();
+
+            const newCache = new Map<string, Driver>();
+            const geoUpdates: Array<{ driverId: string, lat: number, lng: number }> = [];
+
+            results?.forEach((result, index) => {
+                if (result[0]) {
+                    logger.error(`Error fetching ${driverKeys[index]}: ${result[0]}`);
+                    return;
+                }
+
+                try {
+                    const driverData = typeof result[1] === 'string' ? JSON.parse(result[1]) : result[1];
+
+                    const driverId = driverKeys[index].split(':')[1];
+
+                    if (!driverData.iAmOnline) {
+                        logger.debug(`Driver ${driverId} is offline, skipping`);
+                        return;
+                    }
+
+                    if (!driverData.location || !driverData.location.coordinates) {
+                        logger.debug(`Driver ${driverId} has no location data`);
+                        return;
+                    }
+
+                    const [lng, lat] = driverData.location.coordinates;
+
+                    if (isNaN(lat) || isNaN(lng) || lat === 0 || lng === 0) {
+                        logger.debug(`Driver ${driverId} has invalid coordinates: [${lat}, ${lng}]`);
+                        return;
+                    }
+                    const approvedZones = Array.isArray(driverData.approved_zones) ? driverData.approved_zones : [];
+
+                    const driver: Driver = {
+                        driverId,
+                        lat,
+                        lng,
+                        score: driverData.score || 50,
+                        isBusy: driverData.iAmBusy || false,
+                        isNew: false,
+                        lastUpdate: Date.now(),
+                        approvedZones: approvedZones
+                    };
+
+                    newCache.set(driverId, driver);
+                    geoUpdates.push({driverId, lat, lng});
+
+                    logger.debug(`✓ Loaded driver ${driverId}: ${driverData.fullName} at [${lat}, ${lng}]`);
+
+                } catch (error) {
+                    logger.error(`Failed to parse driver data for ${driverKeys[index]}: ${error}`);
+                }
+            });
+            if (geoUpdates.length > 0) {
+                await this.batchUpdateGeolocation(geoUpdates);
+            }
+
+            this.driverCache = newCache;
+            logger.info(`Driver Cache Refreshed - Drivers: ${newCache.size}, Geo updates: ${geoUpdates.length}, Time: ${Date.now() - startTime}ms`);
+
+        } catch (error) {
+            logger.error(`Cache Refresh Error: ${error}`);
+        }
+    }
+
+    private async batchUpdateGeolocation(updates: Array<{
+        driverId: string,
+        lat: number,
+        lng: number
+    }>): Promise<void> {
+        try {
+            const args: (string | number)[] = ['drivers:locations'];
+            updates.forEach(({driverId, lat, lng}) => {
+                args.push(lng, lat, driverId);
+            });
+            await redis.geoadd(args[0] as string, ...args.slice(1) as any[]);
+            logger.debug(`✓ Updated ${updates.length} drivers in geospatial index 'drivers:locations'`);
+
+        } catch (error) {
+            logger.error(`Batch geospatial update failed: ${error}`);
+            logger.warn('Falling back to individual GEOADD commands...');
+            for (const {driverId, lat, lng} of updates) {
+                try {
+                    await redis.geoadd('drivers:locations', lng, lat, driverId);
+                } catch (err) {
+                    logger.error(`Failed to update geolocation for ${driverId}: ${err}`);
+                }
+            }
         }
     }
 }

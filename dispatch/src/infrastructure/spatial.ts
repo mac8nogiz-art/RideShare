@@ -20,6 +20,9 @@ export class SpatialService {
         }
         return inside;
     }
+    isPointInsideZone(lat: number, lng: number, zone: Zone): boolean {
+        return this.isPointInPolygon([lng, lat], zone.location.coordinates);
+    }
 
     // Calculate distance between two points (Haversine)
     calculateDistance(lat1: number, lng1: number, lat2: number, lng2: number): number {

@@ -1,64 +1,195 @@
-version: '3.8'
-
-services:
-  redis:
-    image: redis:7-alpine
-    container_name: redis
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis_data:/data
-    networks:
-      - app-network
-
-  dispatch-zookeeper:
-    image: confluentinc/cp-zookeeper:7.6.1
-    container_name: dispatch-zookeeper
-    environment:
-      ZOOKEEPER_CLIENT_PORT: 2181
-      ZOOKEEPER_TICK_TIME: 2000
-    ports:
-      - "2181:2181"
-    networks:
-      - app-network
-
-  dispatch-kafka:
-    image: confluentinc/cp-kafka:7.6.1
-    container_name: dispatch-kafka
-    depends_on:
-      - dispatch-zookeeper  # Simple dependency without healthcheck condition
-    ports:
-      - "9093:9092"
-    environment:
-      KAFKA_BROKER_ID: 1
-      KAFKA_ZOOKEEPER_CONNECT: dispatch-zookeeper:2181
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: true
-    networks:
-      - app-network
-
-  dispatch-service:
-    build: .
-    container_name: dispatch-service
-    depends_on:
-      - redis
-      - dispatch-kafka
-    ports:
-      - "4005:4005"
-    environment:
-      REDIS_HOST: localhost
-      REDIS_PORT: 6379
-      KAFKA_BROKER: localhost:9092
-      PORT: 4005  # ADD THIS
-    volumes:
-      - .:/app
-    networks:
-      - app-network
-
-networks:
-  app-network:
-    driver: bridge
-
-volumes:
-  redis_data:
+#version: '3.8'
+#
+#services:
+#  dispatch-zookeeper:
+#    image: confluentinc/cp-zookeeper:7.6.1
+#    container_name: dispatch-zookeeper
+#    environment:
+#      ZOOKEEPER_CLIENT_PORT: 2181
+#      ZOOKEEPER_TICK_TIME: 2000
+#    ports:
+#      - "2181:2181"
+#    networks:
+#      - app-network
+#    healthcheck:
+#      test: [ "CMD", "nc", "-z", "localhost", "2181" ]
+#      interval: 10s
+#      timeout: 5s
+#      retries: 5
+#  #
+#  #  dispatch-kafka:
+#  #    image: confluentinc/cp-kafka:7.6.1
+#  #    container_name: dispatch-kafka
+#  #    depends_on:
+#  #      dispatch-zookeeper:
+#  #        condition: service_healthy
+#  #    ports:
+#  #      - "9093:9092"
+#  #      - "9094:9094"
+#  #    environment:
+#  #      KAFKA_BROKER_ID: 1
+#  #      KAFKA_ZOOKEEPER_CONNECT: dispatch-zookeeper:2181
+#  #      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+#  #      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://dispatch-kafka:9092,EXTERNAL://172.105.61.99:9094
+#  #      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,EXTERNAL://0.0.0.0:9094
+#  #      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+#  #      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+#  #      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+#  #      KAFKA_LOG_RETENTION_HOURS: 168
+#  #      KAFKA_LOG_SEGMENT_BYTES: 1073741824
+#  #    networks:
+#  #      - app-network
+#  #    healthcheck:
+#  #      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+#  #      interval: 10s
+#  #      timeout: 10s
+#  #      retries: 5
+#  #    volumes:
+#  #      - kafka_data:/var/lib/kafka/data
+#
+#
+#
+#  dispatch-kafka:
+#    image: confluentinc/cp-kafka:7.6.1
+#    container_name: dispatch-kafka
+#    depends_on:
+#      - dispatch-zookeeper
+#    ports:
+#      - "9092:9092"
+#    environment:
+#      KAFKA_BROKER_ID: 1
+#      KAFKA_ZOOKEEPER_CONNECT: dispatch-zookeeper:2181
+#      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+#      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
+#      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+#      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+#    networks:
+#      - app-network
+#    healthcheck:
+#        test: [ "CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092" ]
+#        interval: 10s
+#        timeout: 10s
+#        retries: 5
+#    volumes:
+#        - kafka_data:/var/lib/kafka/data
+#
+#    restart: always
+#
+#
+#
+#
+#  dispatch-service:
+#    build: .
+#    container_name: dispatch-service
+#    depends_on:
+#      dispatch-kafka:
+#        condition: service_healthy
+#    ports:
+#      - "4005:4005"
+#      - "5000:5000"
+#    environment: # Redis Cloud Configuration
+#      REDIS_HOST: redis-13830.fcrce180.us-east-1-1.ec2-redns.redis-cloud.com
+#      REDIS_PORT: 13830
+#      REDIS_USERNAME: default
+#      REDIS_PASSWORD: bWrQDBwpRAaOPrtPYvgjfrFbo1rdFOB0
+#
+#      # Kafka Configuration
+#      KAFKA_BROKER: dispatch-kafka:9092
+#      DRIVER_LOCATION_TOPIC: driver.location
+#      RIDE_REQUEST_TOPIC: ride.request
+#      USER_REQUEST_TOPIC: user.request
+#      USER_RESPONSE_TOPIC: user.response
+#
+#      # Service Configuration
+#      PORT: 4005
+#      WS_PORT: 5000
+#      SERVICE_NAME: Dispatch-service
+#      NODE_ENV: development
+#      LOG_LEVEL: info
+#
+#      # MongoDB Configuration
+#      MONGO_URI: mongodb://nogizindia:nogizindia778866@194.195.112.118:27017/ridesharing_test?authSource=admin
+#    networks:
+#      - app-network
+#    restart: unless-stopped
+#    healthcheck:
+#      test: [ "CMD", "curl", "-f", "http://localhost:4005/health" ]
+#      interval: 30s
+#      timeout: 10s
+#      retries: 3
+#      start_period: 40s
+#
+#networks:
+#  app-network:
+#    driver: bridge
+#
+#volumes:
+#  kafka_data:
+#
+#
+##
+##
+##version: '3.8'
+##
+##services:
+##  redis:
+##    image: redis:7-alpine
+##    container_name: redis
+##    ports:
+##      - "6379:6379"
+##    volumes:
+##      - redis_data:/data
+##    networks:
+##      - app-network
+##
+##  dispatch-zookeeper:
+##    image: confluentinc/cp-zookeeper:7.6.1
+##    container_name: dispatch-zookeeper
+##    environment:
+##      ZOOKEEPER_CLIENT_PORT: 2181
+##      ZOOKEEPER_TICK_TIME: 2000
+##    ports:
+##      - "2181:2181"
+##    networks:
+##      - app-network
+##
+##  dispatch-kafka:
+##    image: confluentinc/cp-kafka:7.6.1
+##    container_name: dispatch-kafka
+##    depends_on:
+##      - dispatch-zookeeper  # Simple dependency without healthcheck condition
+##    ports:
+##      - "9093:9092"
+##    environment:
+##      KAFKA_BROKER_ID: 1
+##      KAFKA_ZOOKEEPER_CONNECT: dispatch-zookeeper:2181
+##      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+##      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+##      KAFKA_AUTO_CREATE_TOPICS_ENABLE: true
+##    networks:
+##      - app-network
+##
+##  dispatch-service:
+##    build: .
+##    container_name: dispatch-service
+##    depends_on:
+##      - redis
+##      - dispatch-kafka
+##    ports:
+##      - "4005:4005"
+##    environment:
+##      REDIS_HOST: localhost
+##      REDIS_PORT: 6379
+##      KAFKA_BROKER: localhost:9092
+##      PORT: 4005  # ADD THIS
+##    volumes:
+##      - .:/app
+##    networks:
+##      - app-network
+##
+##networks:
+##  app-network:
+##    driver: bridge
+##
+##volumes:
+##  redis_data:
