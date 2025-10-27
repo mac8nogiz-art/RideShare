@@ -33,6 +33,7 @@ export class DriverMatchingService {
             logger.info(`Job ${job.id} at [${job.pickupLat}, ${job.pickupLng}] assigned to zone: ${zone.name} (${zone._id})`);
 
             const favoriteDriverIds = await this.getCustomerFavorites(customerId);
+            //todo sort it optimized
 
             logger.info(` Searching for drivers within 3km...`);
             let nearbyDrivers = await this.getNearbyDriversInZone(job.pickupLat, job.pickupLng, zone._id, 3);
@@ -92,7 +93,7 @@ export class DriverMatchingService {
         try {
             const allDrivers = Array.from(this.driverLocationService.getAllDrivers().keys());
             const driversInZone: string[] = [];
-             // Batch check zone approvals
+            // Batch check zone approvals
             const pipeline = redis.pipeline();
             allDrivers.forEach(driverId => {
                 pipeline.smembers(`driver:${driverId}:approved_zones`);

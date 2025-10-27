@@ -5,17 +5,20 @@ import { logger } from "./logger";
 import { jobOrchestratorService } from "./services/JobOrchestrator.Service"; // Updated import
 import { processKafkaMessage } from "./handlers/mesage-processor";
 
-
 const app = new Elysia()
 
     .use(
         kafkaRPC({
             serviceName: 'dispatch-service',
             brokers: [process.env.KAFKA_BROKER || 'localhost:9092'],
-            requestTopic: (data) => `${data.targetService || 'dispatch-service'}.request`,
-            responseTopic: (data) => `${data.targetService || 'dispatch-service'}.response`,
+            requestTopic: (data) =>
+                `rpc.requests.${data.jobId || 'global'}.${'dispatch-service'}`,
+
+            responseTopic: (data) =>
+                `rpc.responses.${data.jobId || 'global'}.${'dispatch-service'}`,
             timeout: 5000,
             batchSize: 100,
+            topicDiscoveryInterval: 30000,
 
             onMessage: async (message: any, topic: string) => {
                     console.log(`Received event from topic: ${topic}`);
@@ -27,10 +30,9 @@ const app = new Elysia()
                 }
             })
         )
-
         .get('/', () => 'Dispatch Service Running')
         .get('/health', () => ({ status: 'ok' }))
-        .listen(process.env.PORT || 4005)
+        .listen( 4005)
 
 
 
@@ -56,7 +58,7 @@ async function start() {
         logger.info('Orchestrator started');
 
 
-        const preferredPort = Number(process.env.PORT) || 4005;
+        const preferredPort = Number(process.env.PORT) ;
         let port = preferredPort;
         let serverStarted = false;
 

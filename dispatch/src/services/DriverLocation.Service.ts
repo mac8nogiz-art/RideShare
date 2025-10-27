@@ -7,17 +7,17 @@ export class DriverLocationService {
     private locationRefreshInterval: NodeJS.Timeout | null = null;
     private isInitialized = false;
 
-    async startDriverCacheRefresh(): Promise<void> {
-        logger.info('Starting Driver Cache Refresh - Interval: 2s');
-        await this.refreshDriverCache();
-
-        this.isInitialized = true;
-        logger.info(`Driver cache initialized with ${this.driverCache.size} drivers`);
-
-        this.locationRefreshInterval = setInterval(async () => {
-            await this.refreshDriverCache();
-        }, 2000);
-    }
+    // async startDriverCacheRefresh(): Promise<void> {
+    //     logger.info('Starting Driver Cache Refresh - Interval: 2s');
+    //     await this.refreshDriverCache();
+    //
+    //     this.isInitialized = true;
+    //     logger.info(`Driver cache initialized with ${this.driverCache.size} drivers`);
+    //
+    //     this.locationRefreshInterval = setInterval(async () => {
+    //         await this.refreshDriverCache();
+    //     }, 2000);
+    // }
 
     getAllDrivers(): Map<string, Driver> {
         return this.driverCache;
@@ -42,7 +42,7 @@ export class DriverLocationService {
         }
     }
 
-    private async refreshDriverCache(): Promise<void> {
+    public async refreshDriverCache(): Promise<void> {
         const startTime = Date.now();
 
         try {
@@ -114,7 +114,7 @@ export class DriverLocationService {
                     newCache.set(driverId, driver);
                     geoUpdates.push({driverId, lat, lng});
 
-                    logger.debug(`✓ Loaded driver ${driverId}: ${driverData.fullName} at [${lat}, ${lng}]`);
+                    logger.debug(` Loaded driver ${driverId}: ${driverData.fullName} at [${lat}, ${lng}]`);
 
                 } catch (error) {
                     logger.error(`Failed to parse driver data for ${driverKeys[index]}: ${error}`);

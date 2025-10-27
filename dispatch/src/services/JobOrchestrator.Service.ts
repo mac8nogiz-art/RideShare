@@ -1,11 +1,11 @@
-import { redis } from '../infrastructure/redis';
-import { logger } from '../logger';
-import { Job, ProcessingMetrics } from '../types';
-import { DriverLocationService } from './DriverLocation.Service';
-import { JobProcessingService } from './JobProcessingService';
-import { DriverMatchingService } from './DriverMatching.Service';
-import { OfferManagementService } from './OfferManagement.Service';
-import { ZoneService } from './ZoneService';
+import {redis} from '../infrastructure/redis';
+import {logger} from '../logger';
+import {Job, ProcessingMetrics} from '../types';
+import {DriverLocationService} from './DriverLocation.Service';
+import {JobProcessingService} from './JobProcessingService';
+import {DriverMatchingService} from './DriverMatching.Service';
+import {OfferManagementService} from './OfferManagement.Service';
+import {ZoneService} from './ZoneService';
 
 export class JobOrchestratorService {
     private driverLocationService: DriverLocationService;
@@ -42,8 +42,13 @@ export class JobOrchestratorService {
     }
 
     async start(): Promise<void> {
-        await this.driverLocationService.startDriverCacheRefresh();
-        await this.zoneService.startZoneCacheRefresh();
+        await this.driverLocationService.refreshDriverCache();
+        await this.zoneService.init();
+
+        setInterval(async () => {
+            await this.driverLocationService.refreshDriverCache();
+        }, 5000);
+
         logger.info(`Job Orchestrator started successfully`);
     }
 
@@ -80,7 +85,7 @@ export class JobOrchestratorService {
                     break;
                 default:
                     logger.warn(`Unknown RPC request type: ${data.type}`);
-                    return { success: false, error: 'Unknown request type' };
+                    return {success: false, error: 'Unknown request type'};
             }
 
             logger.info(`RPC Request Completed - Type: ${data.type}, RequestId: ${requestId}, Success: ${result.success}`);
@@ -88,29 +93,11 @@ export class JobOrchestratorService {
         } catch (error: any) {
             this.metrics.errors++;
             logger.error(`RPC Request Failed - Type: ${data.type}, RequestId: ${requestId}, Error: ${error.message}`);
-            return { success: false, error: error.message };
+            return {success: false, error: error.message};
         }
     }
 
     // ----------------- Job Event Handlers -----------------
-
-    private async handleNewJobEvent(data: any): Promise<any> {
-        const job: Job = {
-            id: data.jobId,
-            customerId: data.customerId,
-            pickupLat: data.pickupLat,
-            pickupLng: data.pickupLng,
-            fare: data.fare,
-            vehicleType: data.vehicleType,
-            timestamp: Date.now()
-        };
-
-        logger.info(`Payment Completed - JobId: ${job.id}, Customer: ${job.customerId}, Fare: ${job.fare}`);
-        await this.addJob(job);
-
-        logger.info(`Driver Search Initiated - JobId: ${job.id}`);
-        return { success: true, message: 'Driver search initiated', jobId: job.id, timestamp: job.timestamp };
-    }
 
     async addJob(job: Job): Promise<void> {
         this.metrics.apiCalls.addJob++;
@@ -128,6 +115,77 @@ export class JobOrchestratorService {
             if (job) await this.processJob(job);
         }
     }
+
+    async handleDriverResponse(data: any): Promise<any> {
+        const {driverId, jobId, action, reason} = data;
+        logger.info(`Driver Response - Driver: ${driverId}, Job: ${jobId}, Action: ${action}, Reason: ${reason}`);
+
+        try {
+            if (action === 'accept') {
+                await this.offerManagementService.assignDriverToJob(jobId, driverId);
+                this.jobProcessingService.removeJob(jobId);
+                logger.info(`Driver Accepted - Job: ${jobId}, Driver: ${driverId}`);
+                return {success: true, message: 'Driver assigned to job'};
+            } else if (action === 'reject') {
+                await this.offerManagementService.handleDriverRejection(jobId, driverId, reason);
+
+                const job = this.jobProcessingService.getJob(jobId);
+                if (job) {
+                    const nearbyDrivers = await this.driverMatchingService.findBestDrivers(job, job.customerId);
+                    const alternativeDrivers = await this.offerManagementService.findAlternativeDrivers(jobId, nearbyDrivers);
+                    if (alternativeDrivers.length > 0) {
+                        await this.offerManagementService.sendOffers(job, alternativeDrivers);
+                        logger.info(`Alternative offers sent - Job: ${jobId}, Drivers: ${alternativeDrivers.length}`);
+                    } else {
+                        logger.info(`No alternative drivers found - Job: ${jobId}`);
+                    }
+                }
+
+                logger.info(`Driver Rejected - Job: ${jobId}, Driver: ${driverId}, Reason: ${reason}`);
+                return {success: true, message: 'Searching for alternative drivers'};
+            } else {
+                logger.warn(`Unknown Driver Action - Action: ${action}`);
+                return {success: false, error: 'Unknown driver action'};
+            }
+        } catch (error: any) {
+            this.metrics.errors++;
+            logger.error(`Driver Response Error - Job: ${jobId}, Driver: ${driverId}, Error: ${error.message}`);
+            return {success: false, error: error.message};
+        }
+    }
+
+    getStats() {
+        return {
+            activeJobs: this.jobProcessingService.getActiveJobsCount(),
+            cachedDrivers: this.driverLocationService.getDriverCacheSize(),
+            processingRate: Math.round(this.jobProcessingService.getActiveJobsCount() * 10),
+            cacheHitRate: this.driverLocationService.getDriverCacheSize() > 0 ? 0.95 : 0,
+            metrics: this.metrics,
+            timestamp: new Date().toISOString()
+        };
+    }
+
+    // ----------------- Driver Response -----------------
+
+    private async handleNewJobEvent(data: any): Promise<any> {
+        const job: Job = {
+            id: data.jobId,
+            customerId: data.customerId,
+            pickupLat: data.pickupLat,
+            pickupLng: data.pickupLng,
+            fare: data.fare,
+            vehicleType: data.vehicleType,
+            timestamp: Date.now()
+        };
+
+        logger.info(`Payment Completed - JobId: ${job.id}, Customer: ${job.customerId}, Fare: ${job.fare}`);
+        await this.addJob(job);
+
+        logger.info(`Driver Search Initiated - JobId: ${job.id}`);
+        return {success: true, message: 'Driver search initiated', jobId: job.id, timestamp: job.timestamp};
+    }
+
+    // ----------------- Stats & Health -----------------
 
     private async processJob(job: Job): Promise<void> {
         try {
@@ -147,51 +205,9 @@ export class JobOrchestratorService {
         }
     }
 
-    // ----------------- Driver Response -----------------
-
-    async handleDriverResponse(data: any): Promise<any> {
-        const { driverId, jobId, action, reason } = data;
-        logger.info(`Driver Response - Driver: ${driverId}, Job: ${jobId}, Action: ${action}, Reason: ${reason}`);
-
-        try {
-            if (action === 'accept') {
-                await this.offerManagementService.assignDriverToJob(jobId, driverId);
-                this.jobProcessingService.removeJob(jobId);
-                logger.info(`Driver Accepted - Job: ${jobId}, Driver: ${driverId}`);
-                return { success: true, message: 'Driver assigned to job' };
-            } else if (action === 'reject') {
-                await this.offerManagementService.handleDriverRejection(jobId, driverId, reason);
-
-                const job = this.jobProcessingService.getJob(jobId);
-                if (job) {
-                    const nearbyDrivers = await this.driverMatchingService.findBestDrivers(job, job.customerId);
-                    const alternativeDrivers = await this.offerManagementService.findAlternativeDrivers(jobId, nearbyDrivers);
-                    if (alternativeDrivers.length > 0) {
-                        await this.offerManagementService.sendOffers(job, alternativeDrivers);
-                        logger.info(`Alternative offers sent - Job: ${jobId}, Drivers: ${alternativeDrivers.length}`);
-                    } else {
-                        logger.info(`No alternative drivers found - Job: ${jobId}`);
-                    }
-                }
-
-                logger.info(`Driver Rejected - Job: ${jobId}, Driver: ${driverId}, Reason: ${reason}`);
-                return { success: true, message: 'Searching for alternative drivers' };
-            } else {
-                logger.warn(`Unknown Driver Action - Action: ${action}`);
-                return { success: false, error: 'Unknown driver action' };
-            }
-        } catch (error: any) {
-            this.metrics.errors++;
-            logger.error(`Driver Response Error - Job: ${jobId}, Driver: ${driverId}, Error: ${error.message}`);
-            return { success: false, error: error.message };
-        }
-    }
-
-    // ----------------- Stats & Health -----------------
-
     private async handleGetStats(data: any): Promise<any> {
         logger.info(`Stats Request - Client: ${data.clientId || 'unknown'}`);
-        return { success: true, stats: this.getStats() };
+        return {success: true, stats: this.getStats()};
     }
 
     private async handleHealthCheck(data: any): Promise<any> {
@@ -212,19 +228,8 @@ export class JobOrchestratorService {
         } catch (error: any) {
             this.metrics.errors++;
             logger.error(`Health Check Failed - Redis: disconnected, Error: ${error.message}`);
-            return { success: false, status: 'unhealthy', redis: 'disconnected', error: error.message };
+            return {success: false, status: 'unhealthy', redis: 'disconnected', error: error.message};
         }
-    }
-
-    getStats() {
-        return {
-            activeJobs: this.jobProcessingService.getActiveJobsCount(),
-            cachedDrivers: this.driverLocationService.getDriverCacheSize(),
-            processingRate: Math.round(this.jobProcessingService.getActiveJobsCount() * 10),
-            cacheHitRate: this.driverLocationService.getDriverCacheSize() > 0 ? 0.95 : 0,
-            metrics: this.metrics,
-            timestamp: new Date().toISOString()
-        };
     }
 }
 

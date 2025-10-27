@@ -1,33 +1,18 @@
-import { SpatialService } from "../infrastructure/spatial";
-import { Job, Zone } from "../types";
-import { redis } from "../infrastructure/redis";
+import {Job, Zone} from "../types";
+import {redis} from "../infrastructure/redis";
 import logger from "../logger";
-import { Db } from "mongodb";
-import { getMongoDB, connectMongo } from "../infrastructure/mongo";
+import {Db} from "mongodb";
+import {connectMongo, getMongoDB} from "../infrastructure/mongo";
 
 
 export class ZoneService {
-    private spatialService: SpatialService;
-    private zoneCache = new Map<string, Zone>();
     private db!: Db;
-
-    constructor() {
-        this.spatialService = new SpatialService();
-    }
 
     public async init(): Promise<void> {
         try {
             await connectMongo();
             this.db = getMongoDB();
-
-            await this.loadZonesFromMongoToRedis();
-
-
-            await this.refreshZoneCache();
-
-
-            this.startZoneCacheRefresh();
-
+            await this.ensureGeospatialIndex();
             logger.info("ZoneService initialized successfully");
         } catch (error: any) {
             logger.error("ZoneService initialization failed:", error);
@@ -36,67 +21,50 @@ export class ZoneService {
     }
 
     /**
-     * Load zones from MongoDB and cache in Redis
-     * This ensures Redis always has the latest zones on startup
-     */
-    private async loadZonesFromMongoToRedis(): Promise<void> {
-        try {
-            const zones = await this.mongoFetchActiveZones();
-
-            if (zones && zones.length > 0) {
-                await redis.set('zones:active', JSON.stringify(zones));
-                logger.info(`Loaded ${zones.length} zones from MongoDB to Redis`);
-            } else {
-                logger.warn("No zones found in MongoDB - system will operate without zone restrictions");
-            }
-        } catch (error: any) {
-            logger.error("Error loading zones to Redis:", error);
-        }
-    }
-
-    public startZoneCacheRefresh(): void {
-        setInterval(async () => {
-            await this.loadZonesFromMongoToRedis();
-            await this.refreshZoneCache();
-        }, 5 * 60 * 1000); // Every 5 minutes
-    }
-
-    /**
      * STEP 1: Get zone for customer's pickup location
-     * This is called when a customer requests a ride
+     * Uses MongoDB geospatial query for efficient polygon matching
      *
      * @param job - The job/booking request with pickup coordinates
      * @returns Zone object or null if no zones configured
      */
 
-
     public async getZoneForJob(job: Job): Promise<Zone | null> {
-        logger.info(` Finding zone for pickup location: [${job.pickupLat}, ${job.pickupLng}]`);
+        logger.info(`Finding zone for pickup location: [${job.pickupLat}, ${job.pickupLng}]`);
 
-        const cachedZones = await redis.get('zones:active');
+        try {
+            // MongoDB $geoIntersects ---> spatial services query ---->to find zone containing the point
+            const zone = await this.db
+                .collection<Zone>('drivergeoareas')
+                .findOne({
+                    status: true,
+                    location: {
+                        $geoIntersects: {
+                            $geometry: {
+                                type: "Point",
+                                coordinates: [job.pickupLng, job.pickupLat]
+                            }
+                        }
+                    }
+                });
+            //todo find one to find
 
-        if (!cachedZones) {
-            logger.warn("No zones configured in system - all drivers can accept all rides");
-            return null;
+            if (zone) {
+                logger.info(`Pickup location is in zone: "${zone.name}" (${zone._id})`);
+                return zone;
+            } else {
+                logger.warn(`Pickup location [${job.pickupLat}, ${job.pickupLng}] not in any configured zone`);
+                return null;
+            }
+
+        } catch (error: any) {
+            logger.error(`Error finding zone for job ${job.id}:`, error);
+            return null
+
         }
-
-        const zones: Zone[] = JSON.parse(cachedZones);
-        logger.info(`Checking against ${zones.length} active zones`);
-
-
-        const zone = this.findZoneByCoordinates(job.pickupLat, job.pickupLng, zones);
-
-        if (zone) {
-            logger.info(`Pickup location is in zone: "${zone.name}" (${zone._id})`);
-        } else {
-            logger.warn(`Pickup location not in any configured zone - may not find drivers`);
-        }
-
-        return zone;
     }
 
     /**
-     * STEP 3: Check if driver is approved for the zone
+     * STEP 2: Check if driver is approved for the zone
      * Called after finding nearby drivers to filter by zone approval
      *
      * Logic:
@@ -111,26 +79,24 @@ export class ZoneService {
 
     public async isDriverApprovedForZone(driverId: string, zoneId: string | null): Promise<boolean> {
         try {
-
             if (!zoneId) {
-                logger.info(` No zone restrictions - Driver ${driverId} approved`);
+                logger.info(`No zone restrictions - Driver ${driverId} approved`);
                 return true;
             }
 
             const approvedZones = await redis.smembers(`driver:${driverId}:approved_zones`);
 
             if (approvedZones.length === 0) {
-                logger.info(` Driver ${driverId} has empty approved_zones - approved for ALL zones including ${zoneId}`);
+                logger.info(`Driver ${driverId} has empty approved_zones - approved for ALL zones including ${zoneId}`);
                 return true;
             }
-
 
             const isApproved = approvedZones.includes(zoneId);
 
             if (isApproved) {
-                logger.info(` Driver ${driverId} is approved for zone ${zoneId}`);
+                logger.info(`✓ Driver ${driverId} is approved for zone ${zoneId}`);
             } else {
-                logger.warn(` Driver ${driverId} is NOT approved for zone ${zoneId} (approved for: ${approvedZones.join(', ')})`);
+                logger.warn(`✗ Driver ${driverId} is NOT approved for zone ${zoneId} (approved for: ${approvedZones.join(', ')})`);
             }
 
             return isApproved;
@@ -146,7 +112,7 @@ export class ZoneService {
      */
     public async approveDriverForZone(driverId: string, zoneId: string): Promise<void> {
         await redis.sadd(`driver:${driverId}:approved_zones`, zoneId);
-        logger.info(` Driver ${driverId} approved for zone ${zoneId}`);
+        logger.info(`✓ Driver ${driverId} approved for zone ${zoneId}`);
     }
 
     /**
@@ -154,14 +120,13 @@ export class ZoneService {
      */
     public async removeDriverZoneApproval(driverId: string, zoneId: string): Promise<void> {
         await redis.srem(`driver:${driverId}:approved_zones`, zoneId);
-        logger.info(`Driver ${driverId} removed from zone ${zoneId}`);
+        logger.info(`✓ Driver ${driverId} removed from zone ${zoneId}`);
     }
 
     /**
      * Get all zones a driver is approved for
      * Empty array means approved for ALL zones
      */
-
     public async getDriverApprovedZones(driverId: string): Promise<string[]> {
         const zones = await redis.smembers(`driver:${driverId}:approved_zones`);
 
@@ -175,74 +140,77 @@ export class ZoneService {
     }
 
     /**
-     * Refresh in-memory cache from Redis
+     * Get zone by ID from MongoDB
      */
-    private async refreshZoneCache(): Promise<void> {
+    public async getZoneById(zoneId: string): Promise<Zone | null> {
         try {
-            const zonesData = await redis.get('zones:active');
+            const zone = await this.db
+                .collection<Zone>('drivergeoareas')
+                .findOne({_id: zoneId, status: true});
 
-            if (zonesData) {
-                const zones: Zone[] = JSON.parse(zonesData);
-                this.zoneCache.clear();
-                zones.forEach(zone => this.zoneCache.set(zone._id, zone));
-                logger.info(` Zone cache refreshed: ${zones.length} zones in memory`);
-            } else {
-                this.zoneCache.clear();
-                logger.warn(' No zones in Redis - cache cleared');
-            }
+            return zone;
         } catch (error: any) {
-            logger.error('Zone cache refresh error:', error);
+            logger.error(`Error fetching zone ${zoneId}:`, error);
+            return null;
         }
     }
 
     /**
-     * Fetch active zones from MongoDB
+     * Get all active zones from MongoDB
      */
-
-    private async mongoFetchActiveZones(): Promise<Zone[]> {
-        if (!this.db) {
-            throw new Error("MongoDB not connected yet");
-        }
-
+    public async getAllZones(): Promise<Zone[]> {
         try {
             const zones = await this.db
-                .collection<Zone>('zones')
-                .find({ active: true })
+                .collection<Zone>('drivergeoareas')
+                .find({status: true})
                 .toArray();
 
-            logger.info(`Fetched ${zones.length} active zones from MongoDB`);
             return zones;
         } catch (error: any) {
-            logger.error(' Error fetching zones from MongoDB:', error);
+            logger.error('Error fetching all zones:', error);
             return [];
         }
     }
 
     /**
-     * Find which zone contains the given coordinates
-     * Uses spatial polygon checking
+     * Find zones within a radius of a point (useful for nearby zone searches)
+     */
+    public async findZonesNearPoint(lat: number, lng: number, radiusInKm: number): Promise<Zone[]> {
+        try {
+            const zones = await this.db
+                .collection<Zone>('drivergeoareas')
+                .find({
+                    status: true,
+                    location: {
+                        $near: {
+                            $geometry: {
+                                type: "Point",
+                                coordinates: [lng, lat]
+                            },
+                            $maxDistance: radiusInKm * 1000 // Convert km to meters
+                        }
+                    }
+                })
+                .toArray();
+
+            logger.info(`Found ${zones.length} zones within ${radiusInKm}km of [${lat}, ${lng}]`);
+            return zones;
+        } catch (error: any) {
+            logger.error('Error finding zones near point:', error);
+            return [];
+        }
+    }
+
+    /**
+     * Ensure 2dsphere index exists for geospatial queries
      */
 
-    private findZoneByCoordinates(lat: number, lng: number, zones: Zone[]): Zone | null {
-        for (const zone of zones) {
-            try {
-
-                if (this.spatialService.isPointInPolygon([lng, lat], zone.location.coordinates)) {
-                    return zone;
-                }
-            } catch (error: any) {
-                logger.error(`Error checking zone ${zone._id}:`, error);
-            }
+    private async ensureGeospatialIndex(): Promise<void> {
+        try {
+            await this.db.collection('drivergeoareas').createIndex({location: "2dsphere"});
+            logger.info("✓ Geospatial index verified on drivergeoareas.location");
+        } catch (error: any) {
+            logger.warn(`Geospatial index creation skipped (may already exist): ${error.message}`);
         }
-        return null;
-    }
-
-
-    public getZoneById(zoneId: string): Zone | null {
-        return this.zoneCache.get(zoneId) || null;
-    }
-
-    public getAllZones(): Zone[] {
-        return Array.from(this.zoneCache.values());
     }
 }
