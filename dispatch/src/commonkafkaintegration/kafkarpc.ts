@@ -13,6 +13,8 @@ export interface KafkaRPCOptions {
     topicDiscoveryInterval?: number;
     // NEW: Explicit topics to subscribe to
     subscribeToTopics?: string[];
+
+
 }
 
 export const kafkaRPC = (options: KafkaRPCOptions) => {
@@ -107,9 +109,19 @@ export const kafkaRPC = (options: KafkaRPCOptions) => {
             console.log(`[${serviceName}] Available topics in Kafka:`, topics);
 
             // More flexible pattern matching
-            const responseTopicPatterns = [(t: string) => t.endsWith('.response'), (t: string) => t.endsWith('.res'), (t: string) => t.startsWith('rpc-responses'), (t: string) => t.includes('driver.location'), // Changed from regex
-                (t: string) => t.includes(serviceName), (t: string) => t.endsWith('.request'), (t: string) => t.endsWith('.event'), (t: string) => t.endsWith('.events'), // Added for payment.events
-                (t: string) => t.endsWith('.notification'),];
+            const responseTopicPatterns = [
+                (t: string) => t.endsWith('.response'),
+                (t: string) => t.endsWith('.res'),
+                (t: string) => t.startsWith('rpc-responses'),
+                (t: string) => t.includes('driver'),
+                (t: string) => t.startsWith('drivers-'),
+                (t: string) => t.includes('no-drivers'),
+                (t: string) => t.includes(serviceName),
+                (t: string) => t.endsWith('.request'),
+                (t: string) => t.endsWith('.event'),
+                (t: string) => t.endsWith('.events'),
+                (t: string) => t.endsWith('.notification'),
+            ];
 
             const relevantTopics = topics.filter(topic => responseTopicPatterns.some(pattern => pattern(topic)));
 

@@ -39,29 +39,28 @@ export const consumer: Consumer = kafka.consumer({
 
 export const admin: Admin = kafka.admin();
 
-// Enhanced connection state management
 let isConnected = false;
 let connectionPromise: Promise<boolean> | null = null;
 let lastConnectionAttempt = 0;
 const CONNECTION_COOLDOWN = 5000; // 5 seconds
 
 export const connectKafka = async (): Promise<boolean> => {
-    // Prevent multiple simultaneous connection attempts
+
     if (connectionPromise) {
         return connectionPromise;
     }
 
-    // Rate limiting for connection attempts
+
     const now = Date.now();
     if (now - lastConnectionAttempt < CONNECTION_COOLDOWN) {
-        logger.warn('⚠️ Connection attempts too frequent, waiting...');
+        logger.warn('Connection attempts too frequent, waiting...');
         await new Promise(resolve => setTimeout(resolve, CONNECTION_COOLDOWN));
     }
 
     connectionPromise = (async (): Promise<boolean> => {
         try {
             lastConnectionAttempt = Date.now();
-            logger.info('🔌 Connecting to Kafka...');
+            logger.info('Connecting to Kafka...');
 
             await Promise.all([
                 producer.connect(),
@@ -70,11 +69,11 @@ export const connectKafka = async (): Promise<boolean> => {
             ]);
 
             isConnected = true;
-            logger.info('✅ Kafka connected successfully');
+            logger.info('Kafka connected successfully');
             return true;
         } catch (error: any) {
             isConnected = false;
-            logger.error(`❌ Kafka connection failed: ${error.message}`);
+            logger.error(`Kafka connection failed: ${error.message}`);
             return false;
         } finally {
             connectionPromise = null;
@@ -84,18 +83,18 @@ export const connectKafka = async (): Promise<boolean> => {
     return connectionPromise;
 };
 
-// Enhanced health check with connection recovery
+
 export const ensureKafkaConnection = async (): Promise<boolean> => {
     if (isConnected) {
         try {
-            // Quick health check
+
             await producer.send({
                 topic: 'health-check',
                 messages: [{ value: JSON.stringify({ check: Date.now() }) }]
             });
             return true;
         } catch (error) {
-            logger.warn('⚠️ Producer health check failed, reconnecting...');
+            logger.warn('Producer health check failed, reconnecting...');
             isConnected = false;
         }
     }
@@ -103,13 +102,12 @@ export const ensureKafkaConnection = async (): Promise<boolean> => {
     return await connectKafka();
 };
 
-// Enhanced message sending with guaranteed delivery
 export const sendKafkaMessage = async (topic: string, key: string, value: any): Promise<boolean> => {
     const maxRetries = 3;
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
-            // Ensure connection before sending
+
             const connected = await ensureKafkaConnection();
             if (!connected) {
                 throw new Error('Kafka not connected');
@@ -127,14 +125,14 @@ export const sendKafkaMessage = async (topic: string, key: string, value: any): 
                 }]
             });
 
-            logger.debug(`✅ Kafka message sent - Topic: ${topic}, Key: ${key}, Attempt: ${attempt}`);
+            logger.debug(`Kafka message sent - Topic: ${topic}, Key: ${key}, Attempt: ${attempt}`);
             return true;
 
         } catch (error: any) {
-            logger.warn(`⚠️ Kafka send failed (Attempt ${attempt}/${maxRetries}) - Topic: ${topic}, Error: ${error.message}`);
+            logger.warn(`Kafka send failed (Attempt ${attempt}/${maxRetries}) - Topic: ${topic}, Error: ${error.message}`);
 
             if (attempt === maxRetries) {
-                logger.error(`❌ Failed to send Kafka message after ${maxRetries} attempts: ${error.message}`);
+                logger.error(`Failed to send Kafka message after ${maxRetries} attempts: ${error.message}`);
                 return false;
             }
 
@@ -155,9 +153,9 @@ export const disconnectKafka = async (): Promise<void> => {
             admin.disconnect()
         ]);
         isConnected = false;
-        logger.info('✅ Kafka disconnected');
+        logger.info('Kafka disconnected');
     } catch (error: any) {
-        logger.error(`❌ Kafka disconnection error: ${error.message}`);
+        logger.error(`Kafka disconnection error: ${error.message}`);
     }
 };
 

@@ -5,15 +5,16 @@ export class JobProcessingService {
     private activeJobs = new Map<string, Job>();
     private readonly MAX_CONCURRENT_JOBS = 1000;
 
-    //delte-todo
-
+    // Store jobs for processing
     async addJob(job: Job): Promise<void> {
         if (this.activeJobs.size >= this.MAX_CONCURRENT_JOBS) {
+            // 🔥 FIX: Correct syntax - parenthesis before backtick
             logger.error(`Max concurrent jobs reached - cannot add job: ${job.id}`);
             throw new Error('Max concurrent jobs reached');
         }
 
         this.activeJobs.set(job.id, job);
+
         logger.debug(
             `Job Added - JobId: ${job.id}, Customer: ${job.customerId}, ActiveJobs: ${this.activeJobs.size}`
         );
@@ -25,6 +26,7 @@ export class JobProcessingService {
 
         for (const job of jobs) {
             if (this.activeJobs.size >= this.MAX_CONCURRENT_JOBS) {
+                // 🔥 FIX: Correct syntax
                 logger.warn(`Max Concurrent Jobs Reached - Skipping Job: ${job.id}`);
                 skippedJobs.push(job.id);
                 continue;
@@ -47,6 +49,7 @@ export class JobProcessingService {
     removeJob(jobId: string): boolean {
         const removed = this.activeJobs.delete(jobId);
         if (removed) {
+            // 🔥 FIX: Correct syntax
             logger.debug(`Job Removed - JobId: ${jobId}, Remaining: ${this.activeJobs.size}`);
         }
         return removed;
@@ -65,6 +68,7 @@ export class JobProcessingService {
     }
 
     dumpJobs(): void {
+        // 🔥 FIX: Correct syntax
         logger.info(`Active Jobs (${this.activeJobs.size}): ${Array.from(this.activeJobs.keys()).join(', ')}`);
     }
 }

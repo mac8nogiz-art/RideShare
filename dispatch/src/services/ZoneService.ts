@@ -4,19 +4,38 @@ import logger from "../logger";
 import {Db} from "mongodb";
 import {connectMongo, getMongoDB} from "../infrastructure/mongo";
 
-
 export class ZoneService {
-    private db!: Db;
+    private db: Db | null = null;
+    private isInitialized: boolean = false;
 
     public async init(): Promise<void> {
         try {
+            logger.info("🔌 Connecting to MongoDB for ZoneService...");
+
             await connectMongo();
             this.db = getMongoDB();
+
+            if (!this.db) {
+                throw new Error("MongoDB connection failed - db is null");
+            }
+
             await this.ensureGeospatialIndex();
-            logger.info("ZoneService initialized successfully");
+
+            this.isInitialized = true;
+            logger.info("✅ ZoneService initialized successfully");
         } catch (error: any) {
-            logger.error("ZoneService initialization failed:", error);
+            logger.error(`❌ ZoneService initialization failed: ${error.message}`);
+            logger.error(`Stack: ${error.stack}`);
             throw error;
+        }
+    }
+
+    /**
+     * Check if ZoneService is ready to use
+     */
+    private ensureInitialized(): void {
+        if (!this.isInitialized || !this.db) {
+            throw new Error("ZoneService not initialized - call init() first");
         }
     }
 
@@ -27,14 +46,15 @@ export class ZoneService {
      * @param job - The job/booking request with pickup coordinates
      * @returns Zone object or null if no zones configured
      */
-
     public async getZoneForJob(job: Job): Promise<Zone | null> {
         logger.info(`Finding zone for pickup location: [${job.pickupLat}, ${job.pickupLng}]`);
 
         try {
-            // MongoDB $geoIntersects ---> spatial services query ---->to find zone containing the point
-            const zone = await this.db
-                .collection<Zone>('drivergeoareas')
+            this.ensureInitialized();
+
+            // MongoDB $geoIntersects spatial query to find zone containing the point
+            const zone = await this.db!
+                .collection<Zone>('geoareas')
                 .findOne({
                     status: true,
                     location: {
@@ -46,20 +66,24 @@ export class ZoneService {
                         }
                     }
                 });
-            //todo find one to find
 
             if (zone) {
-                logger.info(`Pickup location is in zone: "${zone.name}" (${zone._id})`);
+                logger.info(`✅ Pickup location is in zone: "${zone.name}" (${zone._id})`);
                 return zone;
             } else {
-                logger.warn(`Pickup location [${job.pickupLat}, ${job.pickupLng}] not in any configured zone`);
+                logger.warn(`⚠️ No zone found for job ${job.id} at ${job.pickupLat}, ${job.pickupLng}`);
                 return null;
             }
 
         } catch (error: any) {
-            logger.error(`Error finding zone for job ${job.id}:`, error);
-            return null
+            logger.error(`❌ Error finding zone for job ${job.id}:`, error);
 
+            // Check if it's an initialization error
+            if (error.message.includes('not initialized')) {
+                logger.error('⚠️ ZoneService was called before initialization!');
+            }
+
+            return null;
         }
     }
 
@@ -76,7 +100,6 @@ export class ZoneService {
      * @param zoneId - The zone ID (or null if no zones configured)
      * @returns true if driver can accept rides in this zone
      */
-
     public async isDriverApprovedForZone(driverId: string, zoneId: string | null): Promise<boolean> {
         try {
             if (!zoneId) {
@@ -94,14 +117,14 @@ export class ZoneService {
             const isApproved = approvedZones.includes(zoneId);
 
             if (isApproved) {
-                logger.info(`✓ Driver ${driverId} is approved for zone ${zoneId}`);
+                logger.info(`✅ Driver ${driverId} is approved for zone ${zoneId}`);
             } else {
-                logger.warn(`✗ Driver ${driverId} is NOT approved for zone ${zoneId} (approved for: ${approvedZones.join(', ')})`);
+                logger.warn(`⚠️ Driver ${driverId} is NOT approved for zone ${zoneId} (approved for: ${approvedZones.join(', ')})`);
             }
 
             return isApproved;
         } catch (error: any) {
-            logger.error(`Error checking driver ${driverId} approval for zone ${zoneId}:`, error);
+            logger.error(`❌ Error checking driver ${driverId} approval for zone ${zoneId}: ${error.message}`);
             return false;
         }
     }
@@ -111,16 +134,26 @@ export class ZoneService {
      * Admin function to add zone to driver's approved list
      */
     public async approveDriverForZone(driverId: string, zoneId: string): Promise<void> {
-        await redis.sadd(`driver:${driverId}:approved_zones`, zoneId);
-        logger.info(`✓ Driver ${driverId} approved for zone ${zoneId}`);
+        try {
+            await redis.sadd(`driver:${driverId}:approved_zones`, zoneId);
+            logger.info(`✅ Driver ${driverId} approved for zone ${zoneId}`);
+        } catch (error: any) {
+            logger.error(`❌ Failed to approve driver ${driverId} for zone ${zoneId}: ${error.message}`);
+            throw error;
+        }
     }
 
     /**
      * Remove driver's approval for a specific zone
      */
     public async removeDriverZoneApproval(driverId: string, zoneId: string): Promise<void> {
-        await redis.srem(`driver:${driverId}:approved_zones`, zoneId);
-        logger.info(`✓ Driver ${driverId} removed from zone ${zoneId}`);
+        try {
+            await redis.srem(`driver:${driverId}:approved_zones`, zoneId);
+            logger.info(`✅ Driver ${driverId} removed from zone ${zoneId}`);
+        } catch (error: any) {
+            logger.error(`❌ Failed to remove driver ${driverId} from zone ${zoneId}: ${error.message}`);
+            throw error;
+        }
     }
 
     /**
@@ -128,15 +161,20 @@ export class ZoneService {
      * Empty array means approved for ALL zones
      */
     public async getDriverApprovedZones(driverId: string): Promise<string[]> {
-        const zones = await redis.smembers(`driver:${driverId}:approved_zones`);
+        try {
+            const zones = await redis.smembers(`driver:${driverId}:approved_zones`);
 
-        if (zones.length === 0) {
-            logger.info(`Driver ${driverId} approved for ALL zones (empty list)`);
-        } else {
-            logger.info(`Driver ${driverId} approved for zones: ${zones.join(', ')}`);
+            if (zones.length === 0) {
+                logger.info(`Driver ${driverId} approved for ALL zones (empty list)`);
+            } else {
+                logger.info(`Driver ${driverId} approved for zones: ${zones.join(', ')}`);
+            }
+
+            return zones;
+        } catch (error: any) {
+            logger.error(`❌ Error fetching approved zones for driver ${driverId}: ${error.message}`);
+            return [];
         }
-
-        return zones;
     }
 
     /**
@@ -144,13 +182,15 @@ export class ZoneService {
      */
     public async getZoneById(zoneId: string): Promise<Zone | null> {
         try {
-            const zone = await this.db
-                .collection<Zone>('drivergeoareas')
+            this.ensureInitialized();
+
+            const zone = await this.db!
+                .collection<Zone>('geoareas')
                 .findOne({_id: zoneId, status: true});
 
             return zone;
         } catch (error: any) {
-            logger.error(`Error fetching zone ${zoneId}:`, error);
+            logger.error(`❌ Error fetching zone ${zoneId}: ${error.message}`);
             return null;
         }
     }
@@ -160,14 +200,17 @@ export class ZoneService {
      */
     public async getAllZones(): Promise<Zone[]> {
         try {
-            const zones = await this.db
-                .collection<Zone>('drivergeoareas')
+            this.ensureInitialized();
+
+            const zones = await this.db!
+                .collection<Zone>('geoareas')
                 .find({status: true})
                 .toArray();
 
+            logger.info(`📍 Found ${zones.length} active zones`);
             return zones;
         } catch (error: any) {
-            logger.error('Error fetching all zones:', error);
+            logger.error(`❌ Error fetching all zones: ${error.message}`);
             return [];
         }
     }
@@ -177,8 +220,10 @@ export class ZoneService {
      */
     public async findZonesNearPoint(lat: number, lng: number, radiusInKm: number): Promise<Zone[]> {
         try {
-            const zones = await this.db
-                .collection<Zone>('drivergeoareas')
+            this.ensureInitialized();
+
+            const zones = await this.db!
+                .collection<Zone>('geoareas')
                 .find({
                     status: true,
                     location: {
@@ -193,24 +238,41 @@ export class ZoneService {
                 })
                 .toArray();
 
-            logger.info(`Found ${zones.length} zones within ${radiusInKm}km of [${lat}, ${lng}]`);
+            logger.info(`📍 Found ${zones.length} zones within ${radiusInKm}km of [${lat}, ${lng}]`);
             return zones;
         } catch (error: any) {
-            logger.error('Error finding zones near point:', error);
+            logger.error(`❌ Error finding zones near point: ${error.message}`);
             return [];
         }
     }
 
     /**
      * Ensure 2dsphere index exists for geospatial queries
+     * FIXED: Now creates index on the correct 'geoareas' collection
      */
-
     private async ensureGeospatialIndex(): Promise<void> {
         try {
-            await this.db.collection('drivergeoareas').createIndex({location: "2dsphere"});
-            logger.info("✓ Geospatial index verified on drivergeoareas.location");
+            if (!this.db) {
+                throw new Error("Cannot create index - db is null");
+            }
+
+            // Create index on 'geoareas' collection (not 'drivergeoareas')
+            await this.db.collection('geoareas').createIndex({location: "2dsphere"});
+            logger.info("✅ Geospatial index verified on geoareas.location");
         } catch (error: any) {
-            logger.warn(`Geospatial index creation skipped (may already exist): ${error.message}`);
+            // Index might already exist - this is not a critical error
+            if (error.code === 85 || error.message.includes('already exists')) {
+                logger.info("ℹ️ Geospatial index already exists on geoareas.location");
+            } else {
+                logger.warn(`⚠️ Geospatial index creation warning: ${error.message}`);
+            }
         }
+    }
+
+    /**
+     * Get initialization status
+     */
+    public isReady(): boolean {
+        return this.isInitialized && this.db !== null;
     }
 }

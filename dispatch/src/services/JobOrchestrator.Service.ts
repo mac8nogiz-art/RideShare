@@ -49,39 +49,75 @@ export class JobOrchestratorService {
     }
 
     async start(): Promise<void> {
+        if (this.isInitialized) {
+            logger.info('Job Orchestrator already running — skipping re-initialization');
+            return;
+        }
+
+        if ((this as any)._starting) {
+            logger.info('⏳ Job Orchestrator is currently starting — please wait');
+            return;
+        }
+
+        (this as any)._starting = true;
+
         try {
             logger.info('🚀 Starting Job Orchestrator...');
 
-            // CRITICAL: Initialize ZoneService first (connects to MongoDB)
-            logger.info('📍 Initializing ZoneService...');
-            await this.zoneService.init();
-            logger.info('✅ ZoneService initialized');
 
-            // Then refresh driver cache
-            logger.info('👥 Refreshing driver cache...');
-            await this.driverLocationService.refreshDriverCache();
-            logger.info('✅ Driver cache refreshed');
+            if (!this.zoneService.isReady || !(await this.zoneService.isReady())) {
+                logger.info('🧭 Initializing ZoneService...');
+                await this.zoneService.init();
+                logger.info('ZoneService initialized');
+            } else {
+                logger.info('ZoneService already ready');
+            }
 
-            // Set up periodic driver cache refresh
-            setInterval(async () => {
-                try {
-                    await this.driverLocationService.refreshDriverCache();
-                } catch (error: any) {
-                    logger.error(`❌ Driver cache refresh failed: ${error.message}`);
-                }
-            }, 5000);
+            //  Refresh driver cache with timeout guard
+            logger.info('🔄 Refreshing driver cache...');
+            const refreshPromise = this.driverLocationService.refreshDriverCache();
+            const timeoutPromise = new Promise((_, reject) =>
+                setTimeout(() => reject(new Error('Driver cache refresh timed out after 10s')), 10_000)
+            );
+
+            await Promise.race([refreshPromise, timeoutPromise]);
+            logger.info('Driver cache refreshed');
+
+
+            if (!(this as any)._cacheIntervalSet) {
+                const refreshInterval = 30_000;
+                setInterval(async () => {
+                    try {
+                        logger.info('Periodic driver cache refresh triggered');
+                        await this.driverLocationService.refreshDriverCache();
+                        logger.info('Periodic driver cache refresh done');
+                    } catch (error: any) {
+                        logger.error(`Driver cache refresh failed: ${error.message}`);
+                    }
+                }, refreshInterval);
+
+                (this as any)._cacheIntervalSet = true;
+            }
 
             this.isInitialized = true;
-            logger.info('✅ Job Orchestrator started successfully');
+            logger.info('Job Orchestrator started successfully');
         } catch (error: any) {
-            logger.error(`❌ Job Orchestrator startup failed: ${error.message}`);
+            logger.error(`Job Orchestrator startup failed: ${error.message}`);
+            this.isInitialized = false;
             throw error;
+        } finally {
+            (this as any)._starting = false;
         }
     }
 
+
     stop(): void {
         this.isInitialized = false;
-        logger.info('🛑 Job Orchestrator stopped');
+        logger.info(' Job Orchestrator stopped');
+    }
+
+    isReady(): boolean {
+        return this.isInitialized;
     }
 
     // ----------------- Event Type Parser -----------------
@@ -196,24 +232,7 @@ export class JobOrchestratorService {
         }
     }
 
-    // ----------------- Job Event Handlers -----------------
-
-    async addJob(job: Job): Promise<void> {
-        this.metrics.apiCalls.addJob++;
-        this.metrics.jobsProcessed++;
-        await this.jobProcessingService.addJob(job);
-        await this.processJob(job);
-    }
-
-    async addJobs(jobs: Job[]): Promise<void> {
-        this.metrics.apiCalls.addJobs++;
-        const result = await this.jobProcessingService.addJobs(jobs);
-        this.metrics.jobsProcessed += result.added.length;
-        for (const jobId of result.added) {
-            const job = this.jobProcessingService.getJob(jobId);
-            if (job) await this.processJob(job);
-        }
-    }
+    // ----------------- Driver Response Handler -----------------
 
     async handleDriverResponse(data: any): Promise<any> {
         const {driverId, jobId, action, reason} = data;
@@ -283,19 +302,7 @@ export class JobOrchestratorService {
         }
     }
 
-    getStats() {
-        return {
-            activeJobs: this.jobProcessingService.getActiveJobsCount(),
-            cachedDrivers: this.driverLocationService.getDriverCacheSize(),
-            processingRate: Math.round(this.jobProcessingService.getActiveJobsCount() * 10),
-            cacheHitRate: this.driverLocationService.getDriverCacheSize() > 0 ? 0.95 : 0,
-            metrics: this.metrics,
-            isInitialized: this.isInitialized,
-            timestamp: new Date().toISOString()
-        };
-    }
-
-    // ----------------- New Job Event Handler with Dynamic Type Support -----------------
+    // ----------------- New Job Event Handler -----------------
 
     private async handleNewJobEvent(data: any, bookingId: string | null): Promise<any> {
         const startTime = Date.now();
@@ -395,6 +402,7 @@ export class JobOrchestratorService {
                     jobId: job.id,
                     orderNo: payload.orderNo,
                     driversFound: matchedDrivers.length,
+                    driverIds: matchedDrivers,
                     offersSent: offerResult.successful,
                     offersFailed: offerResult.failed,
                     searchTimeMs: searchTime,
@@ -409,6 +417,7 @@ export class JobOrchestratorService {
                     jobId: job.id,
                     orderNo: payload.orderNo,
                     driversFound: 0,
+                    driverIds: [],
                     searchTimeMs: searchTime,
                     timestamp: new Date().toISOString()
                 };
@@ -426,6 +435,8 @@ export class JobOrchestratorService {
                 error: error.message,
                 jobId: job.id,
                 orderNo: payload.orderNo,
+                driversFound: 0,
+                driverIds: [],
                 searchTimeMs: searchTime,
                 timestamp: new Date().toISOString()
             };
@@ -434,22 +445,16 @@ export class JobOrchestratorService {
 
     // ----------------- Stats & Health -----------------
 
-    private async processJob(job: Job): Promise<void> {
-        try {
-            const matchedDrivers = await this.driverMatchingService.findBestDrivers(job, job.customerId);
-
-            if (matchedDrivers.length > 0) {
-                const result = await this.offerManagementService.sendOffers(job, matchedDrivers);
-                this.metrics.offersSent += result.successful;
-                this.metrics.driversMatched += matchedDrivers.length;
-                logger.info(`✅ Job Matched - JobId: ${job.id}, Drivers: ${matchedDrivers.length}`);
-            } else {
-                logger.warn(`⚠️ No Drivers Found - JobId: ${job.id}`);
-            }
-        } catch (error: any) {
-            this.metrics.errors++;
-            logger.error(`❌ Job Processing Error - JobId: ${job.id}, Error: ${error.message}`);
-        }
+    getStats() {
+        return {
+            activeJobs: this.jobProcessingService.getActiveJobsCount(),
+            cachedDrivers: this.driverLocationService.getDriverCacheSize(),
+            processingRate: Math.round(this.jobProcessingService.getActiveJobsCount() * 10),
+            cacheHitRate: this.driverLocationService.getDriverCacheSize() > 0 ? 0.95 : 0,
+            metrics: this.metrics,
+            isInitialized: this.isInitialized,
+            timestamp: new Date().toISOString()
+        };
     }
 
     private async handleGetStats(data: any): Promise<any> {
@@ -473,7 +478,8 @@ export class JobOrchestratorService {
                 status: 'healthy',
                 redis: 'connected',
                 redisLatencyMs: redisLatency,
-                zoneService: this.isInitialized ? 'ready' : 'not_initialized',
+                zoneService: this.zoneService.isReady() ? 'ready' : 'not_initialized',
+                orchestratorInitialized: this.isInitialized,
                 ...this.getStats()
             };
 
