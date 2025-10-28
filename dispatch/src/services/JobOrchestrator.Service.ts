@@ -7,12 +7,19 @@ import {DriverMatchingService} from './DriverMatching.Service';
 import {OfferManagementService} from './OfferManagement.Service';
 import {ZoneService} from './ZoneService';
 
+interface ParsedEventType {
+    eventName: string;
+    bookingId: string | null;
+    isBookingEvent: boolean;
+}
+
 export class JobOrchestratorService {
     private driverLocationService: DriverLocationService;
     private jobProcessingService: JobProcessingService;
     private driverMatchingService: DriverMatchingService;
     private offerManagementService: OfferManagementService;
     private zoneService: ZoneService;
+    private isInitialized: boolean = false;
 
     private metrics: ProcessingMetrics = {
         rpcRequests: 0,
@@ -42,58 +49,150 @@ export class JobOrchestratorService {
     }
 
     async start(): Promise<void> {
-        await this.driverLocationService.refreshDriverCache();
-        await this.zoneService.init();
+        try {
+            logger.info('🚀 Starting Job Orchestrator...');
 
-        setInterval(async () => {
+            // CRITICAL: Initialize ZoneService first (connects to MongoDB)
+            logger.info('📍 Initializing ZoneService...');
+            await this.zoneService.init();
+            logger.info('✅ ZoneService initialized');
+
+            // Then refresh driver cache
+            logger.info('👥 Refreshing driver cache...');
             await this.driverLocationService.refreshDriverCache();
-        }, 5000);
+            logger.info('✅ Driver cache refreshed');
 
-        logger.info(`Job Orchestrator started successfully`);
+            // Set up periodic driver cache refresh
+            setInterval(async () => {
+                try {
+                    await this.driverLocationService.refreshDriverCache();
+                } catch (error: any) {
+                    logger.error(`❌ Driver cache refresh failed: ${error.message}`);
+                }
+            }, 5000);
+
+            this.isInitialized = true;
+            logger.info('✅ Job Orchestrator started successfully');
+        } catch (error: any) {
+            logger.error(`❌ Job Orchestrator startup failed: ${error.message}`);
+            throw error;
+        }
     }
 
     stop(): void {
-        logger.info('Job Orchestrator stopped');
+        this.isInitialized = false;
+        logger.info('🛑 Job Orchestrator stopped');
+    }
+
+    // ----------------- Event Type Parser -----------------
+
+    private parseEventType(type: string): ParsedEventType {
+        // Handle dynamic event types like "newBookingPlaced-6900561da9ea6f1305d29aba"
+        const bookingEventPatterns = [
+            'newBookingPlaced',
+            'newJob.request',
+            'booking.created',
+            'ride.requested'
+        ];
+
+        // Check if this is a booking event
+        const isBookingEvent = bookingEventPatterns.some(pattern => type.startsWith(pattern));
+
+        if (isBookingEvent) {
+            const parts = type.split('-');
+
+            if (parts.length > 1) {
+                // Extract booking ID from type like "newBookingPlaced-6900561da9ea6f1305d29aba"
+                return {
+                    eventName: parts[0],
+                    bookingId: parts.slice(1).join('-'), // Handle multiple dashes
+                    isBookingEvent: true
+                };
+            } else {
+                // Legacy format without booking ID in type
+                return {
+                    eventName: type,
+                    bookingId: null,
+                    isBookingEvent: true
+                };
+            }
+        }
+
+        // Handle other event types like "driver.response", "get.stats", etc.
+        return {
+            eventName: type,
+            bookingId: null,
+            isBookingEvent: false
+        };
     }
 
     // ----------------- RPC Event Handlers -----------------
 
     async handleRPCRequest(data: any): Promise<any> {
+        // Check if service is initialized
+        if (!this.isInitialized) {
+            logger.error('❌ Job Orchestrator not initialized - rejecting request');
+            return {
+                success: false,
+                error: 'Service not initialized',
+                status: 'SERVICE_NOT_READY'
+            };
+        }
+
         const requestId = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-        logger.info(`RPC Request Received - Type: ${data.type}, RequestId: ${requestId}`);
+
+        // Parse the event type dynamically
+        const parsed = this.parseEventType(data.type);
+
+        logger.info(`RPC Request Received - OriginalType: ${data.type}, EventName: ${parsed.eventName}, BookingId: ${parsed.bookingId || 'N/A'}, IsBookingEvent: ${parsed.isBookingEvent}, RequestId: ${requestId}`);
 
         this.metrics.rpcRequests++;
 
         try {
             let result;
-            switch (data.type) {
-                case 'new_job.request':
-                    this.metrics.apiCalls.handlePaymentCompleted++;
-                    result = await this.handleNewJobEvent(data);
-                    break;
-                case 'driver.response':
-                    this.metrics.apiCalls.handleDriverResponse++;
-                    result = await this.handleDriverResponse(data);
-                    break;
-                case 'get.stats':
-                    this.metrics.apiCalls.handleGetStats++;
-                    result = await this.handleGetStats(data);
-                    break;
-                case 'health.check':
-                    this.metrics.apiCalls.handleHealthCheck++;
-                    result = await this.handleHealthCheck(data);
-                    break;
-                default:
-                    logger.warn(`Unknown RPC request type: ${data.type}`);
-                    return {success: false, error: 'Unknown request type'};
+
+            // Route based on event type
+            if (parsed.isBookingEvent) {
+                // Handle all booking-related events
+                this.metrics.apiCalls.handlePaymentCompleted++;
+                result = await this.handleNewJobEvent(data, parsed.bookingId);
+            } else {
+                // Handle other event types
+                switch (parsed.eventName) {
+                    case 'driver.response':
+                        this.metrics.apiCalls.handleDriverResponse++;
+                        result = await this.handleDriverResponse(data);
+                        break;
+                    case 'get.stats':
+                        this.metrics.apiCalls.handleGetStats++;
+                        result = await this.handleGetStats(data);
+                        break;
+                    case 'health.check':
+                        this.metrics.apiCalls.handleHealthCheck++;
+                        result = await this.handleHealthCheck(data);
+                        break;
+                    default:
+                        logger.warn(`Unknown RPC request type: ${data.type} (parsed as: ${parsed.eventName})`);
+                        return {
+                            success: false,
+                            error: 'Unknown request type',
+                            receivedType: data.type,
+                            parsedEventName: parsed.eventName
+                        };
+                }
             }
 
             logger.info(`RPC Request Completed - Type: ${data.type}, RequestId: ${requestId}, Success: ${result.success}`);
             return result;
         } catch (error: any) {
             this.metrics.errors++;
-            logger.error(`RPC Request Failed - Type: ${data.type}, RequestId: ${requestId}, Error: ${error.message}`);
-            return {success: false, error: error.message};
+            logger.error(`RPC Request Failed - Type: ${data.type}, RequestId: ${requestId}, Error: ${error.message}, Stack: ${error.stack}`);
+            return {
+                success: false,
+                error: error.message,
+                type: data.type,
+                requestId
+            };
         }
     }
 
@@ -118,14 +217,19 @@ export class JobOrchestratorService {
 
     async handleDriverResponse(data: any): Promise<any> {
         const {driverId, jobId, action, reason} = data;
-        logger.info(`Driver Response - Driver: ${driverId}, Job: ${jobId}, Action: ${action}, Reason: ${reason}`);
+        logger.info(`Driver Response - Driver: ${driverId}, Job: ${jobId}, Action: ${action}, Reason: ${reason || 'N/A'}`);
 
         try {
             if (action === 'accept') {
                 await this.offerManagementService.assignDriverToJob(jobId, driverId);
                 this.jobProcessingService.removeJob(jobId);
-                logger.info(`Driver Accepted - Job: ${jobId}, Driver: ${driverId}`);
-                return {success: true, message: 'Driver assigned to job'};
+                logger.info(`✅ Driver Accepted - Job: ${jobId}, Driver: ${driverId}`);
+                return {
+                    success: true,
+                    message: 'Driver assigned to job',
+                    jobId,
+                    driverId
+                };
             } else if (action === 'reject') {
                 await this.offerManagementService.handleDriverRejection(jobId, driverId, reason);
 
@@ -133,24 +237,49 @@ export class JobOrchestratorService {
                 if (job) {
                     const nearbyDrivers = await this.driverMatchingService.findBestDrivers(job, job.customerId);
                     const alternativeDrivers = await this.offerManagementService.findAlternativeDrivers(jobId, nearbyDrivers);
+
                     if (alternativeDrivers.length > 0) {
                         await this.offerManagementService.sendOffers(job, alternativeDrivers);
-                        logger.info(`Alternative offers sent - Job: ${jobId}, Drivers: ${alternativeDrivers.length}`);
+                        logger.info(`🔄 Alternative offers sent - Job: ${jobId}, Drivers: ${alternativeDrivers.length}`);
+                        return {
+                            success: true,
+                            message: 'Searching for alternative drivers',
+                            jobId,
+                            alternativeDriversFound: alternativeDrivers.length
+                        };
                     } else {
-                        logger.info(`No alternative drivers found - Job: ${jobId}`);
+                        logger.warn(`⚠️ No alternative drivers found - Job: ${jobId}`);
+                        return {
+                            success: false,
+                            message: 'No alternative drivers available',
+                            jobId
+                        };
                     }
+                } else {
+                    logger.warn(`⚠️ Job not found - Job: ${jobId}`);
+                    return {
+                        success: false,
+                        message: 'Job not found',
+                        jobId
+                    };
                 }
-
-                logger.info(`Driver Rejected - Job: ${jobId}, Driver: ${driverId}, Reason: ${reason}`);
-                return {success: true, message: 'Searching for alternative drivers'};
             } else {
-                logger.warn(`Unknown Driver Action - Action: ${action}`);
-                return {success: false, error: 'Unknown driver action'};
+                logger.warn(`❌ Unknown Driver Action - Action: ${action}`);
+                return {
+                    success: false,
+                    error: 'Unknown driver action',
+                    action
+                };
             }
         } catch (error: any) {
             this.metrics.errors++;
-            logger.error(`Driver Response Error - Job: ${jobId}, Driver: ${driverId}, Error: ${error.message}`);
-            return {success: false, error: error.message};
+            logger.error(`❌ Driver Response Error - Job: ${jobId}, Driver: ${driverId}, Error: ${error.message}`);
+            return {
+                success: false,
+                error: error.message,
+                jobId,
+                driverId
+            };
         }
     }
 
@@ -161,28 +290,146 @@ export class JobOrchestratorService {
             processingRate: Math.round(this.jobProcessingService.getActiveJobsCount() * 10),
             cacheHitRate: this.driverLocationService.getDriverCacheSize() > 0 ? 0.95 : 0,
             metrics: this.metrics,
+            isInitialized: this.isInitialized,
             timestamp: new Date().toISOString()
         };
     }
 
-    // ----------------- Driver Response -----------------
+    // ----------------- New Job Event Handler with Dynamic Type Support -----------------
 
-    private async handleNewJobEvent(data: any): Promise<any> {
+    private async handleNewJobEvent(data: any, bookingId: string | null): Promise<any> {
+        const startTime = Date.now();
+
+        // Validate payload exists
+        if (!data.payload) {
+            logger.error('❌ No payload in booking event');
+            return {
+                success: false,
+                error: 'No payload in booking event',
+                receivedData: data
+            };
+        }
+
+        const payload = data.payload;
+
+        // Extract booking ID (from event type or payload)
+        const jobId = bookingId || payload._id;
+
+        if (!jobId) {
+            logger.error('❌ No booking ID found in event type or payload');
+            return {
+                success: false,
+                error: 'Missing booking ID',
+                eventType: data.type
+            };
+        }
+
+        // Validate pickup location
+        const pickup = payload.firstTripAddressGeoLocation?.coordinates;
+        if (!pickup || !Array.isArray(pickup) || pickup.length !== 2) {
+            logger.error(`❌ Invalid pickup location - BookingId: ${jobId}, Pickup: ${JSON.stringify(pickup)}`);
+            return {
+                success: false,
+                error: 'Invalid pickup location',
+                jobId,
+                pickup
+            };
+        }
+
+        // Validate customer data
+        if (!payload.customer || !payload.customer._id) {
+            logger.error(`❌ Invalid customer data - BookingId: ${jobId}`);
+            return {
+                success: false,
+                error: 'Invalid customer data',
+                jobId
+            };
+        }
+
+        // Create job object
         const job: Job = {
-            id: data.jobId,
-            customerId: data.customerId,
-            pickupLat: data.pickupLat,
-            pickupLng: data.pickupLng,
-            fare: data.fare,
-            vehicleType: data.vehicleType,
-            timestamp: Date.now()
+            id: jobId,
+            customerId: payload.customer._id,
+            pickupLat: pickup[1],
+            pickupLng: pickup[0],
+            fare: payload.grandTotal || 0,
+            vehicleType: payload.selectedVehicle?.name || 'Unknown',
+            timestamp: payload.createdAt ? new Date(payload.createdAt).getTime() : Date.now()
         };
 
-        logger.info(`Payment Completed - JobId: ${job.id}, Customer: ${job.customerId}, Fare: ${job.fare}`);
-        await this.addJob(job);
+        logger.info(`🚗 New Booking - OrderNo: ${payload.orderNo}, BookingId: ${jobId}, Customer: ${payload.customer.fullName || payload.customer._id}, Fare: $${job.fare}, Vehicle: ${job.vehicleType}`);
 
-        logger.info(`Driver Search Initiated - JobId: ${job.id}`);
-        return {success: true, message: 'Driver search initiated', jobId: job.id, timestamp: job.timestamp};
+        // Add job to active jobs
+        try {
+            await this.jobProcessingService.addJob(job);
+            logger.info(`✅ Job added to processing queue - JobId: ${job.id}`);
+        } catch (error: any) {
+            logger.error(`❌ Failed to add job to queue - JobId: ${job.id}, Error: ${error.message}`);
+            return {
+                success: false,
+                error: 'Failed to add job to queue',
+                jobId: job.id,
+                errorDetails: error.message
+            };
+        }
+
+        logger.info(`🔍 Driver Search Initiated - JobId: ${job.id}`);
+
+        try {
+            // Wait for driver matching to complete
+            const matchedDrivers = await this.driverMatchingService.findBestDrivers(job, job.customerId);
+            const searchTime = Date.now() - startTime;
+
+            if (matchedDrivers.length > 0) {
+                // Send offers to matched drivers
+                const offerResult = await this.offerManagementService.sendOffers(job, matchedDrivers);
+
+                this.metrics.driversMatched += matchedDrivers.length;
+                this.metrics.offersSent += offerResult.successful;
+
+                logger.info(`✅ Job Matched - JobId: ${job.id}, Drivers: ${matchedDrivers.length}, Offers Sent: ${offerResult.successful}, Search Time: ${searchTime}ms`);
+
+                return {
+                    success: true,
+                    message: 'Drivers found and offers sent',
+                    jobId: job.id,
+                    orderNo: payload.orderNo,
+                    driversFound: matchedDrivers.length,
+                    offersSent: offerResult.successful,
+                    offersFailed: offerResult.failed,
+                    searchTimeMs: searchTime,
+                    timestamp: new Date().toISOString()
+                };
+            } else {
+                logger.warn(`⚠️ No Drivers Found - JobId: ${job.id}, Search Time: ${searchTime}ms`);
+
+                return {
+                    success: false,
+                    message: 'No drivers available',
+                    jobId: job.id,
+                    orderNo: payload.orderNo,
+                    driversFound: 0,
+                    searchTimeMs: searchTime,
+                    timestamp: new Date().toISOString()
+                };
+            }
+
+        } catch (error: any) {
+            this.metrics.errors++;
+            const searchTime = Date.now() - startTime;
+
+            logger.error(`❌ Driver Search Failed - JobId: ${job.id}, Error: ${error.message}, Search Time: ${searchTime}ms, Stack: ${error.stack}`);
+
+            return {
+                success: false,
+                message: 'Driver search failed',
+                error: error.message,
+                jobId: job.id,
+                orderNo: payload.orderNo,
+                searchTimeMs: searchTime,
+                timestamp: new Date().toISOString()
+            };
+        }
     }
 
     // ----------------- Stats & Health -----------------
@@ -195,40 +442,52 @@ export class JobOrchestratorService {
                 const result = await this.offerManagementService.sendOffers(job, matchedDrivers);
                 this.metrics.offersSent += result.successful;
                 this.metrics.driversMatched += matchedDrivers.length;
-                logger.info(`Job Matched - JobId: ${job.id}, Drivers: ${matchedDrivers.length}`);
+                logger.info(`✅ Job Matched - JobId: ${job.id}, Drivers: ${matchedDrivers.length}`);
             } else {
-                logger.warn(`No Drivers Found - JobId: ${job.id}`);
+                logger.warn(`⚠️ No Drivers Found - JobId: ${job.id}`);
             }
         } catch (error: any) {
             this.metrics.errors++;
-            logger.error(`Job Processing Error - JobId: ${job.id}, Error: ${error.message}`);
+            logger.error(`❌ Job Processing Error - JobId: ${job.id}, Error: ${error.message}`);
         }
     }
 
     private async handleGetStats(data: any): Promise<any> {
-        logger.info(`Stats Request - Client: ${data.clientId || 'unknown'}`);
-        return {success: true, stats: this.getStats()};
+        logger.info(`📊 Stats Request - Client: ${data.clientId || 'unknown'}`);
+        return {
+            success: true,
+            stats: this.getStats()
+        };
     }
 
     private async handleHealthCheck(data: any): Promise<any> {
-        logger.info('Health Check Request');
+        logger.info('🏥 Health Check Request');
 
         try {
             const redisStart = Date.now();
             await redis.ping();
             const redisLatency = Date.now() - redisStart;
 
-            return {
+            const healthData = {
                 success: true,
                 status: 'healthy',
                 redis: 'connected',
-                redisLatency: `${redisLatency}ms`,
+                redisLatencyMs: redisLatency,
+                zoneService: this.isInitialized ? 'ready' : 'not_initialized',
                 ...this.getStats()
             };
+
+            logger.info(`✅ Health Check Passed - Redis Latency: ${redisLatency}ms`);
+            return healthData;
         } catch (error: any) {
             this.metrics.errors++;
-            logger.error(`Health Check Failed - Redis: disconnected, Error: ${error.message}`);
-            return {success: false, status: 'unhealthy', redis: 'disconnected', error: error.message};
+            logger.error(`❌ Health Check Failed - Redis: disconnected, Error: ${error.message}`);
+            return {
+                success: false,
+                status: 'unhealthy',
+                redis: 'disconnected',
+                error: error.message
+            };
         }
     }
 }
