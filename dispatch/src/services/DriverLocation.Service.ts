@@ -98,6 +98,7 @@ export class DriverLocationService {
                         logger.debug(`Driver ${driverId} has invalid coordinates: [${lat}, ${lng}]`);
                         return;
                     }
+
                     const approvedZones = Array.isArray(driverData.approved_zones) ? driverData.approved_zones : [];
 
                     const driver: Driver = {

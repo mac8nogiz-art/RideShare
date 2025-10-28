@@ -10,7 +10,7 @@ export class ZoneService {
 
     public async init(): Promise<void> {
         try {
-            logger.info("🔌 Connecting to MongoDB for ZoneService...");
+            logger.info(" Connecting to MongoDB for ZoneService...");
 
             await connectMongo();
             this.db = getMongoDB();
@@ -190,7 +190,7 @@ export class ZoneService {
 
             return zone;
         } catch (error: any) {
-            logger.error(`❌ Error fetching zone ${zoneId}: ${error.message}`);
+            logger.error(`Error fetching zone ${zoneId}: ${error.message}`);
             return null;
         }
     }
