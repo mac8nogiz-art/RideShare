@@ -22,11 +22,17 @@ export interface Driver {
     isNew: boolean;
     lastUpdate: number;
     approvedZones: string[];
+
 }
 
 export interface DriverWithDistance extends Driver {
     distance: number;
     priority: number;
+}
+export interface Customer {
+
+    fullName: string;
+    avatar: string;
 }
 
 export interface Job {
@@ -35,10 +41,17 @@ export interface Job {
     pickupLat: number;
     pickupLng: number;
     fare: number;
+    dropLat?: number;
+    dropLng?: number;
     vehicleType?: string;
     timestamp: number;
     excludeDrivers?: string[];
     zoneId?: string;
+    customer?: Customer;
+    rideDetails?: {
+        estimatedTime: string;
+        estimatedDistance: string;
+    };
 }
 
 export interface ProcessingMetrics {

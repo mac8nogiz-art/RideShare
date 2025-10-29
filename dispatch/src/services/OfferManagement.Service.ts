@@ -8,12 +8,15 @@ export class OfferManagementService {
     private readonly KAFKA_TOPIC_ASSIGNMENTS = 'driver-assignments';
     private readonly MAX_KAFKA_RETRIES = 2;
 
+
     async sendOffers(job: Job, driverIds: string[]): Promise<{ successful: number; failed: number }> {
         logger.info(`Sending Offers - JobId: ${job.id}, Drivers: ${driverIds.length}`);
 
         const pipeline = redis.pipeline();
         const sentAt = new Date().toISOString();
-        const expiresAt = Date.now() + (this.OFFER_EXPIRY_SECONDS * 1000);
+        const expiresAt = Date.now() + this.OFFER_EXPIRY_SECONDS * 1000;
+        let kafkaSuccess = 0;
+        let kafkaFailed = 0;
 
         for (const driverId of driverIds) {
             const offerKey = `offer:${job.id}:${driverId}`;
@@ -27,12 +30,25 @@ export class OfferManagementService {
                 vehicleType: job.vehicleType,
                 status: 'pending',
                 sentAt,
-                expiresAt
+                expiresAt,
+                rideDetails: job.rideDetails || null,
+                customer: {
+                    fullName: (job as any).customer?.fullName || "",
+                    avatar: (job as any).customer?.avatar || "",
+                }
             };
 
             pipeline.setex(offerKey, this.OFFER_EXPIRY_SECONDS, JSON.stringify(offerData));
             pipeline.sadd(`driver:${driverId}:offers`, job.id);
             pipeline.sadd(`job:${job.id}:pending_drivers`, driverId);
+
+            try {
+                await this.publishAssignmentEventWithRetry(job.id, driverId);
+                kafkaSuccess++;
+            } catch (error: any) {
+                kafkaFailed++;
+                logger.error(` Kafka Offer Publish Failed - JobId: ${job.id}, Driver: ${driverId}, Error: ${error.message}`);
+            }
         }
 
         try {
@@ -43,10 +59,11 @@ export class OfferManagementService {
             logger.info(`Offers Sent - JobId: ${job.id}, Successful: ${Math.floor(successful / 3)}, Failed: ${Math.floor(failed / 3)}`);
             return { successful: Math.floor(successful / 3), failed: Math.floor(failed / 3) };
         } catch (error) {
-            logger.error(`Send Offers Error - JobId: ${job.id}, Error: ${error}`);
+            logger.error(` Send Offers Error - JobId: ${job.id}, Error: ${error}`);
             return { successful: 0, failed: driverIds.length };
         }
     }
+
 
 
 
@@ -145,38 +162,34 @@ export class OfferManagementService {
         for (let attempt = 1; attempt <= this.MAX_KAFKA_RETRIES; attempt++) {
             try {
                 await this.publishAssignmentEvent(jobId, driverId);
-                logger.debug(`Kafka Assignment Event Published - JobId: ${jobId}, Driver: ${driverId}`);
-                return; // Success, exit retry loop
+                logger.debug(`Kafka Event Published - JobId: ${jobId}, Driver: ${driverId}`);
+                return;
             } catch (error: any) {
-                logger.warn(` Kafka Assignment Event Failed (Attempt ${attempt}/${this.MAX_KAFKA_RETRIES}) - JobId: ${jobId}, Error: ${error.message}`);
+                logger.warn(`Kafka Publish Failed (Attempt ${attempt}/${this.MAX_KAFKA_RETRIES}) - ${error.message}`);
 
                 if (attempt === this.MAX_KAFKA_RETRIES) {
-                    logger.error(` Kafka Assignment Event Failed After ${this.MAX_KAFKA_RETRIES} Attempts - JobId: ${jobId}`);
-                    break; // Max retries reached
+                    throw new Error(`Kafka publish failed after ${this.MAX_KAFKA_RETRIES} retries`);
                 }
 
-                // Try to   reconnect
                 if (error.message.includes('disconnected')) {
-                    logger.info(` Attempting Kafka reconnection before retry...`);
+                    logger.info('🔄 Reconnecting Kafka before retry...');
                     await reconnectKafka();
                 }
 
-                // Wait before retry (exponential backoff)
                 const backoffTime = Math.min(200 * Math.pow(2, attempt - 1), 2000);
-                await new Promise(resolve => setTimeout(resolve, backoffTime));
+                await new Promise(res => setTimeout(res, backoffTime));
             }
         }
     }
 
+
     private async publishAssignmentEvent(jobId: string, driverId: string): Promise<void> {
-        // Check Kafka connection status
         if (!isKafkaConnected()) {
             throw new Error('Kafka producer is disconnected');
         }
 
-        // Verify producer health
-        const isHealthy = await checkProducerHealth();
-        if (!isHealthy) {
+        const healthy = await checkProducerHealth();
+        if (!healthy) {
             throw new Error('Kafka producer health check failed');
         }
 
@@ -190,15 +203,17 @@ export class OfferManagementService {
 
         await producer.send({
             topic: this.KAFKA_TOPIC_ASSIGNMENTS,
-            messages: [{
-                key: driverId,
-                value: JSON.stringify(event),
-                headers: {
-                    'job-id': jobId,
-                    'event-type': 'assignment',
-                    'timestamp': Date.now().toString()
-                }
-            }]
+            messages: [
+                {
+                    key: driverId, // ensures message partitions to this driver only
+                    value: JSON.stringify(event),
+                    headers: {
+                        'job-id': jobId,
+                        'event-type': 'assignment',
+                        'timestamp': Date.now().toString(),
+                    },
+                },
+            ],
         });
     }
 }

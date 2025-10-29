@@ -6,6 +6,7 @@ import {JobProcessingService} from './JobProcessingService';
 import {DriverMatchingService} from './DriverMatching.Service';
 import {OfferManagementService} from './OfferManagement.Service';
 import {ZoneService} from './ZoneService';
+import {MapboxService} from './MapboxService'
 
 interface ParsedEventType {
     eventName: string;
@@ -19,6 +20,7 @@ export class JobOrchestratorService {
     private driverMatchingService: DriverMatchingService;
     private offerManagementService: OfferManagementService;
     private zoneService: ZoneService;
+    private mapboxService: MapboxService
     private isInitialized: boolean = false;
 
     private metrics: ProcessingMetrics = {
@@ -46,6 +48,7 @@ export class JobOrchestratorService {
             this.zoneService
         );
         this.offerManagementService = new OfferManagementService();
+        this.mapboxService = new MapboxService();
     }
 
     async start(): Promise<void> {
@@ -242,7 +245,7 @@ export class JobOrchestratorService {
             if (action === 'accept') {
                 await this.offerManagementService.assignDriverToJob(jobId, driverId);
                 this.jobProcessingService.removeJob(jobId);
-                logger.info(`✅ Driver Accepted - Job: ${jobId}, Driver: ${driverId}`);
+                logger.info(`Driver Accepted - Job: ${jobId}, Driver: ${driverId}`);
                 return {
                     success: true,
                     message: 'Driver assigned to job',
@@ -307,94 +310,145 @@ export class JobOrchestratorService {
     private async handleNewJobEvent(data: any, bookingId: string | null): Promise<any> {
         const startTime = Date.now();
 
-
-        if (!data.payload) {
-            logger.error('No payload in booking event');
-            return {
-                success: false,
-                error: 'No payload in booking event',
-                receivedData: data
-            };
+        if (!data?.payload) {
+            logger.error(' No payload in booking event');
+            return { success: false, error: 'No payload in booking event', receivedData: data };
         }
 
         const payload = data.payload;
-
-        // Extract booking ID
         const jobId = bookingId || payload._id;
 
         if (!jobId) {
-            logger.error('No booking ID found in event type or payload');
-            return {
-                success: false,
-                error: 'Missing booking ID',
-                eventType: data.type
+            logger.error(' No booking ID found in event type or payload');
+            return { success: false, error: 'Missing booking ID', eventType: data.type };
+        }
+
+
+        let pickup: { latitude: number; longitude: number } | null = null;
+        let drop: { latitude: number; longitude: number } | null = null;
+
+        if (Array.isArray(payload.tripAddress) && payload.tripAddress.length > 0) {
+            const pickupAddress =
+                payload.tripAddress.find(
+                    (a: any) =>
+                        a.markerType === 'pickup' ||
+                        a.markerType === 'origin' ||
+                        a.sequenceNumber === 1
+                ) || payload.tripAddress[0];
+
+            const dropAddress =
+                payload.tripAddress.find(
+                    (a: any) =>
+                        a.markerType === 'drop' ||
+                        a.markerType === 'destination' ||
+                        a.sequenceNumber === payload.tripAddress.length
+                ) || payload.tripAddress[payload.tripAddress.length - 1];
+
+            if (pickupAddress?.location?.latitude && pickupAddress?.location?.longitude) {
+                pickup = {
+                    latitude: pickupAddress.location.latitude,
+                    longitude: pickupAddress.location.longitude,
+                };
+            }
+
+            if (dropAddress?.location?.latitude && dropAddress?.location?.longitude) {
+                drop = {
+                    latitude: dropAddress.location.latitude,
+                    longitude: dropAddress.location.longitude,
+                };
+            }
+        }
+
+        if ((!pickup || !pickup.latitude || !pickup.longitude) && payload.firstTripAddressGeoLocation?.coordinates) {
+            pickup = {
+                latitude: payload.firstTripAddressGeoLocation.coordinates[1],
+                longitude: payload.firstTripAddressGeoLocation.coordinates[0],
             };
         }
 
-        // Validate pickup location
-        const pickup = payload.firstTripAddressGeoLocation?.coordinates;
-        if (!pickup || !Array.isArray(pickup) || pickup.length !== 2) {
-            logger.error(` Invalid pickup location - BookingId: ${jobId}, Pickup: ${JSON.stringify(pickup)}`);
-            return {
-                success: false,
-                error: 'Invalid pickup location',
-                jobId,
-                pickup
+        if ((!drop || !drop.latitude || !drop.longitude) && payload.lastTripAddressGeoLocation?.coordinates) {
+            drop = {
+                latitude: payload.lastTripAddressGeoLocation.coordinates[1],
+                longitude: payload.lastTripAddressGeoLocation.coordinates[0],
             };
         }
 
-        // Validate customer data
+        if (!pickup) {
+            logger.error(`Missing pickup coordinates for booking ${jobId}`);
+            return { success: false, error: 'Pickup coordinates missing', jobId };
+        }
+
+
         if (!payload.customer || !payload.customer._id) {
-            logger.error(` Invalid customer data - BookingId: ${jobId}`);
-            return {
-                success: false,
-                error: 'Invalid customer data',
-                jobId
-            };
+            logger.error(`Invalid customer data - BookingId: ${jobId}`);
+            return { success: false, error: 'Invalid customer data', jobId };
         }
 
-        // Create job object
         const job: Job = {
             id: jobId,
             customerId: payload.customer._id,
-            pickupLat: pickup[1],
-            pickupLng: pickup[0],
+            pickupLat: pickup.latitude,
+            pickupLng: pickup.longitude,
             fare: payload.grandTotal || 0,
             vehicleType: payload.selectedVehicle?.name || 'Unknown',
-            timestamp: payload.createdAt ? new Date(payload.createdAt).getTime() : Date.now()
+            timestamp: payload.createdAt ? new Date(payload.createdAt).getTime() : Date.now(),
         };
 
-        logger.info(`New Booking - OrderNo: ${payload.orderNo}, BookingId: ${jobId}, Customer: ${payload.customer.fullName || payload.customer._id}, Fare: $${job.fare}, Vehicle: ${job.vehicleType}`);
+        try {
+            if (drop?.latitude && drop?.longitude && pickup?.latitude && pickup?.longitude) {
+                const eta = await this.mapboxService.getDistanceAndDuration(
+                    pickup.latitude,
+                    pickup.longitude,
+                    drop.latitude,
+                    drop.longitude
+                );
 
+                job.dropLat = drop.latitude;
+                job.dropLng = drop.longitude;
+
+
+                job.rideDetails = {
+                    estimatedTime: eta.durationText,
+                    estimatedDistance: eta.distanceText,
+                };
+
+                logger.info(
+                    ` ETA Calculated for Job ${job.id} — ${eta.distanceText}, ${eta.durationText}`
+                );
+            } else {
+                logger.warn(`Pickup or drop missing — Skipping ETA for Job ${job.id}`);
+            }
+        } catch (error: any) {
+            logger.error(` Mapbox ETA fetch failed for Job ${job.id}: ${error.message}`);
+            job.rideDetails = { estimatedTime: "0 mins", estimatedDistance: "0 km" };
+        }
 
         try {
             await this.jobProcessingService.addJob(job);
             logger.info(`Job added to processing queue - JobId: ${job.id}`);
         } catch (error: any) {
-            logger.error(`Failed to add job to queue - JobId: ${job.id}, Error: ${error.message}`);
+            logger.error(` Failed to add job to queue - JobId: ${job.id}, Error: ${error.message}`);
             return {
                 success: false,
                 error: 'Failed to add job to queue',
                 jobId: job.id,
-                errorDetails: error.message
+                errorDetails: error.message,
             };
         }
 
-        logger.info(`Driver Search Initiated - JobId: ${job.id}`);
-
         try {
-
             const matchedDrivers = await this.driverMatchingService.findBestDrivers(job, job.customerId);
             const searchTime = Date.now() - startTime;
 
             if (matchedDrivers.length > 0) {
-
                 const offerResult = await this.offerManagementService.sendOffers(job, matchedDrivers);
 
                 this.metrics.driversMatched += matchedDrivers.length;
                 this.metrics.offersSent += offerResult.successful;
 
-                logger.info(`Job Matched - JobId: ${job.id}, Drivers: ${matchedDrivers.length}, Offers Sent: ${offerResult.successful}, Search Time: ${searchTime}ms`);
+                logger.info(
+                    `Job Matched - JobId: ${job.id}, Drivers: ${matchedDrivers.length}, Offers Sent: ${offerResult.successful}, Search Time: ${searchTime}ms`
+                );
 
                 return {
                     success: true,
@@ -406,11 +460,10 @@ export class JobOrchestratorService {
                     offersSent: offerResult.successful,
                     offersFailed: offerResult.failed,
                     searchTimeMs: searchTime,
-                    timestamp: new Date().toISOString()
+                    timestamp: new Date().toISOString(),
                 };
             } else {
-                logger.warn(` No Drivers Found - JobId: ${job.id}, Search Time: ${searchTime}ms`);
-
+                logger.warn(`No Drivers Found - JobId: ${job.id}`);
                 return {
                     success: false,
                     message: 'No drivers available',
@@ -419,15 +472,16 @@ export class JobOrchestratorService {
                     driversFound: 0,
                     driverIds: [],
                     searchTimeMs: searchTime,
-                    timestamp: new Date().toISOString()
+                    timestamp: new Date().toISOString(),
                 };
             }
-
         } catch (error: any) {
             this.metrics.errors++;
             const searchTime = Date.now() - startTime;
 
-            logger.error(`Driver Search Failed - JobId: ${job.id}, Error: ${error.message}, Search Time: ${searchTime}ms, Stack: ${error.stack}`);
+            logger.error(
+                `Driver Search Failed - JobId: ${job.id}, Error: ${error.message}, Search Time: ${searchTime}ms`
+            );
 
             return {
                 success: false,
@@ -438,10 +492,11 @@ export class JobOrchestratorService {
                 driversFound: 0,
                 driverIds: [],
                 searchTimeMs: searchTime,
-                timestamp: new Date().toISOString()
+                timestamp: new Date().toISOString(),
             };
         }
     }
+
 
     // ----------------- Stats & Health -----------------
 
