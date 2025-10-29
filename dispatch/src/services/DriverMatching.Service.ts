@@ -257,9 +257,10 @@ export class DriverMatchingService {
             const now = Date.now();
 
             // OPTIMIZATION: Use pipeline to fetch JSON data efficiently
+            // const pipeline = redis.pipeline();
             const pipeline = redis.pipeline();
             driverIds.forEach(driverId => {
-                pipeline.get(`driver:${driverId}:data`); // Get driver JSON data
+                pipeline.call('JSON.GET', `driver:${driverId}`); // Use JSON.GET command
             });
             const results = await pipeline.exec();
 
@@ -270,6 +271,7 @@ export class DriverMatchingService {
 
             logger.info(`Processing ${driverIds.length} drivers from pipeline`);
 
+            // Process each driver
             // Process each driver
             for (let i = 0; i < driverIds.length; i++) {
                 const driverId = driverIds[i];
@@ -282,7 +284,7 @@ export class DriverMatchingService {
                     continue;
                 }
 
-                const driverJson = result[1] as string | null;
+                const driverJson = result[1];
 
                 if (!driverJson) {
                     logger.debug(`${driverId}: No data found`);
@@ -290,16 +292,23 @@ export class DriverMatchingService {
                 }
 
                 try {
-                    // Parse JSON driver data
-                    const driverData = JSON.parse(driverJson);
+                    // Parse the JSON result (it might already be an object or a string)
+                    const driverData = typeof driverJson === 'string' ? JSON.parse(driverJson) : driverJson;
 
-                    // Extract required fields
-                    const lat = parseFloat(driverData.lat || driverData.location?.latitude);
-                    const lng = parseFloat(driverData.lng || driverData.location?.longitude);
-                    const lastUpdate = parseInt(driverData.lastUpdate || driverData.updatedAt || '0');
-                    const isBusy = driverData.isBusy === true || driverData.isBusy === 'true';
-                    const score = parseInt(driverData.score || driverData.rating || '0');
-                    const approvedZones = driverData.approvedZones || [];
+                    // NOW extract from the ACTUAL driver document structure
+                    // Based on your document, the structure is different!
+                    const coordinates = driverData.location?.coordinates;
+                    if (!coordinates || !Array.isArray(coordinates) || coordinates.length < 2) {
+                        logger.debug(`${driverId}: Invalid location data`);
+                        continue;
+                    }
+
+                    const [lng, lat] = coordinates;
+                    const lastUpdate = Date.now(); // Use current time since we just fetched it
+                    const isBusy = driverData.iAmBusy === true;
+                    const score = parseInt(driverData.score || '50');
+                    const approvedZones = Array.isArray(driverData.approved_zone) ? driverData.approved_zone : [];
+                    const isOnline = driverData.iAmOnline === true;
 
                     // Validate coordinates
                     if (isNaN(lat) || isNaN(lng)) {
@@ -307,10 +316,9 @@ export class DriverMatchingService {
                         continue;
                     }
 
-                    // Check staleness
-                    const age = now - lastUpdate;
-                    if (lastUpdate === 0 || age > this.DEFAULT_STALE_THRESHOLD) {
-                        logger.debug(`${driverId}: Stale data (age: ${age}ms)`);
+                    // Check if online
+                    if (!isOnline) {
+                        logger.debug(`${driverId}: Offline`);
                         continue;
                     }
 
@@ -346,7 +354,7 @@ export class DriverMatchingService {
                         priority: 0
                     });
 
-                    logger.info(`${driverId}: ELIGIBLE - ${distance.toFixed(2)}km, score: ${score}, age: ${age}ms`);
+                    logger.info(`${driverId}: ELIGIBLE - ${distance.toFixed(2)}km, score: ${score}`);
 
                 } catch (parseError) {
                     logger.error(`${driverId}: JSON parse error - ${parseError}`);

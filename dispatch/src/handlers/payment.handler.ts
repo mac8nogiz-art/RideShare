@@ -1,9 +1,9 @@
 import { logger } from "../logger";
-import { jobOrchestratorService } from "../services/JobOrchestrator.Service";
+import { jobProcessingService } from "../services/JobProcessingService";
 
 export async function handlePaymentCompleted(data: any) {
     try {
-        await jobOrchestratorService.addJob({
+        await jobProcessingService.addJob({
             id: data.jobId,
             customerId: data.customerId,
             pickupLat: data.pickupLat,
@@ -13,7 +13,7 @@ export async function handlePaymentCompleted(data: any) {
             timestamp: Date.now()
         });
 
-        logger.info({ jobId: data.jobId }, 'Payment processed, driver search initiated');
+        logger.info( 'Payment processed, driver search initiated');
 
         return {
             success: true,
@@ -22,7 +22,8 @@ export async function handlePaymentCompleted(data: any) {
             timestamp: Date.now()
         };
     } catch (error: any) {
-        logger.error({ error: error.message }, 'Payment processing failed');
+
+        logger.error(`payment processing failed: ${error.message || error}`);
         return { success: false, error: error.message };
     }
 }

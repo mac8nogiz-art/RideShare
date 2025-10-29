@@ -22,9 +22,9 @@ export class ZoneService {
             await this.ensureGeospatialIndex();
 
             this.isInitialized = true;
-            logger.info("✅ ZoneService initialized successfully");
+            logger.info(" ZoneService initialized successfully");
         } catch (error: any) {
-            logger.error(`❌ ZoneService initialization failed: ${error.message}`);
+            logger.error(` ZoneService initialization failed: ${error.message}`);
             logger.error(`Stack: ${error.stack}`);
             throw error;
         }
@@ -68,19 +68,19 @@ export class ZoneService {
                 });
 
             if (zone) {
-                logger.info(`✅ Pickup location is in zone: "${zone.name}" (${zone._id})`);
+                logger.info(`Pickup location is in zone: "${zone.name}" (${zone._id})`);
                 return zone;
             } else {
-                logger.warn(`⚠️ No zone found for job ${job.id} at ${job.pickupLat}, ${job.pickupLng}`);
+                logger.warn(`No zone found for job ${job.id} at ${job.pickupLat}, ${job.pickupLng}`);
                 return null;
             }
 
         } catch (error: any) {
-            logger.error(`❌ Error finding zone for job ${job.id}:`, error);
+            logger.error(` Error finding zone for job ${job.id}:`, error);
 
             // Check if it's an initialization error
             if (error.message.includes('not initialized')) {
-                logger.error('⚠️ ZoneService was called before initialization!');
+                logger.error('⚠ ZoneService was called before initialization!');
             }
 
             return null;

@@ -14,14 +14,14 @@ export async function handleDriverLocation(data: any): Promise<void> {
 
         await redis.expire(key, 120);
 
-        logger.debug({
-            driverId: data.driverId,
-            lat: data.lat,
-            lng: data.lng
-        }, "Driver location updated");
+
+        logger.debug(
+            `Driver location updated - ID: ${data.driverId}, Lat: ${data.lat}, Lng: ${data.lng}`
+        );
 
     } catch (err: any) {
-        logger.error({ error: err }, " Failed to update driver location");
+
+        logger.error(`Failed to update driver location: ${err.message || err}`);
         throw err;
     }
 }

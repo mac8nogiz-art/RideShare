@@ -307,9 +307,9 @@ export class JobOrchestratorService {
     private async handleNewJobEvent(data: any, bookingId: string | null): Promise<any> {
         const startTime = Date.now();
 
-        // Validate payload exists
+
         if (!data.payload) {
-            logger.error('❌ No payload in booking event');
+            logger.error('No payload in booking event');
             return {
                 success: false,
                 error: 'No payload in booking event',
@@ -319,11 +319,11 @@ export class JobOrchestratorService {
 
         const payload = data.payload;
 
-        // Extract booking ID (from event type or payload)
+        // Extract booking ID
         const jobId = bookingId || payload._id;
 
         if (!jobId) {
-            logger.error('❌ No booking ID found in event type or payload');
+            logger.error('No booking ID found in event type or payload');
             return {
                 success: false,
                 error: 'Missing booking ID',
@@ -334,7 +334,7 @@ export class JobOrchestratorService {
         // Validate pickup location
         const pickup = payload.firstTripAddressGeoLocation?.coordinates;
         if (!pickup || !Array.isArray(pickup) || pickup.length !== 2) {
-            logger.error(`❌ Invalid pickup location - BookingId: ${jobId}, Pickup: ${JSON.stringify(pickup)}`);
+            logger.error(` Invalid pickup location - BookingId: ${jobId}, Pickup: ${JSON.stringify(pickup)}`);
             return {
                 success: false,
                 error: 'Invalid pickup location',
@@ -345,7 +345,7 @@ export class JobOrchestratorService {
 
         // Validate customer data
         if (!payload.customer || !payload.customer._id) {
-            logger.error(`❌ Invalid customer data - BookingId: ${jobId}`);
+            logger.error(` Invalid customer data - BookingId: ${jobId}`);
             return {
                 success: false,
                 error: 'Invalid customer data',
@@ -364,14 +364,14 @@ export class JobOrchestratorService {
             timestamp: payload.createdAt ? new Date(payload.createdAt).getTime() : Date.now()
         };
 
-        logger.info(`🚗 New Booking - OrderNo: ${payload.orderNo}, BookingId: ${jobId}, Customer: ${payload.customer.fullName || payload.customer._id}, Fare: $${job.fare}, Vehicle: ${job.vehicleType}`);
+        logger.info(`New Booking - OrderNo: ${payload.orderNo}, BookingId: ${jobId}, Customer: ${payload.customer.fullName || payload.customer._id}, Fare: $${job.fare}, Vehicle: ${job.vehicleType}`);
 
-        // Add job to active jobs
+
         try {
             await this.jobProcessingService.addJob(job);
-            logger.info(`✅ Job added to processing queue - JobId: ${job.id}`);
+            logger.info(`Job added to processing queue - JobId: ${job.id}`);
         } catch (error: any) {
-            logger.error(`❌ Failed to add job to queue - JobId: ${job.id}, Error: ${error.message}`);
+            logger.error(`Failed to add job to queue - JobId: ${job.id}, Error: ${error.message}`);
             return {
                 success: false,
                 error: 'Failed to add job to queue',
@@ -380,21 +380,21 @@ export class JobOrchestratorService {
             };
         }
 
-        logger.info(`🔍 Driver Search Initiated - JobId: ${job.id}`);
+        logger.info(`Driver Search Initiated - JobId: ${job.id}`);
 
         try {
-            // Wait for driver matching to complete
+
             const matchedDrivers = await this.driverMatchingService.findBestDrivers(job, job.customerId);
             const searchTime = Date.now() - startTime;
 
             if (matchedDrivers.length > 0) {
-                // Send offers to matched drivers
+
                 const offerResult = await this.offerManagementService.sendOffers(job, matchedDrivers);
 
                 this.metrics.driversMatched += matchedDrivers.length;
                 this.metrics.offersSent += offerResult.successful;
 
-                logger.info(`✅ Job Matched - JobId: ${job.id}, Drivers: ${matchedDrivers.length}, Offers Sent: ${offerResult.successful}, Search Time: ${searchTime}ms`);
+                logger.info(`Job Matched - JobId: ${job.id}, Drivers: ${matchedDrivers.length}, Offers Sent: ${offerResult.successful}, Search Time: ${searchTime}ms`);
 
                 return {
                     success: true,
@@ -409,7 +409,7 @@ export class JobOrchestratorService {
                     timestamp: new Date().toISOString()
                 };
             } else {
-                logger.warn(`⚠️ No Drivers Found - JobId: ${job.id}, Search Time: ${searchTime}ms`);
+                logger.warn(` No Drivers Found - JobId: ${job.id}, Search Time: ${searchTime}ms`);
 
                 return {
                     success: false,
@@ -427,7 +427,7 @@ export class JobOrchestratorService {
             this.metrics.errors++;
             const searchTime = Date.now() - startTime;
 
-            logger.error(`❌ Driver Search Failed - JobId: ${job.id}, Error: ${error.message}, Search Time: ${searchTime}ms, Stack: ${error.stack}`);
+            logger.error(`Driver Search Failed - JobId: ${job.id}, Error: ${error.message}, Search Time: ${searchTime}ms, Stack: ${error.stack}`);
 
             return {
                 success: false,
@@ -458,7 +458,7 @@ export class JobOrchestratorService {
     }
 
     private async handleGetStats(data: any): Promise<any> {
-        logger.info(`📊 Stats Request - Client: ${data.clientId || 'unknown'}`);
+        logger.info(`Stats Request - Client: ${data.clientId || 'unknown'}`);
         return {
             success: true,
             stats: this.getStats()
@@ -466,7 +466,7 @@ export class JobOrchestratorService {
     }
 
     private async handleHealthCheck(data: any): Promise<any> {
-        logger.info('🏥 Health Check Request');
+        logger.info(' Health Check Request');
 
         try {
             const redisStart = Date.now();
@@ -483,11 +483,11 @@ export class JobOrchestratorService {
                 ...this.getStats()
             };
 
-            logger.info(`✅ Health Check Passed - Redis Latency: ${redisLatency}ms`);
+            logger.info(` Health Check Passed - Redis Latency: ${redisLatency}ms`);
             return healthData;
         } catch (error: any) {
             this.metrics.errors++;
-            logger.error(`❌ Health Check Failed - Redis: disconnected, Error: ${error.message}`);
+            logger.error(` Health Check Failed - Redis: disconnected, Error: ${error.message}`);
             return {
                 success: false,
                 status: 'unhealthy',
