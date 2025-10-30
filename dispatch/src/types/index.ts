@@ -33,6 +33,8 @@ export interface Customer {
 
     fullName: string;
     avatar: string;
+    distance: string;
+    time:string;
 }
 
 export interface Job {
@@ -45,6 +47,7 @@ export interface Job {
     dropLng?: number;
     vehicleType?: string;
     timestamp: number;
+    tripAddress?: string;
     excludeDrivers?: string[];
     zoneId?: string;
     customer?: Customer;

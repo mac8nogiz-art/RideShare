@@ -40,8 +40,8 @@ const eventPayload = {
                 "title": "122 Level 1st Floor D-199 Phase 8b Industrial Area Sector 74 Sahibzada Ajit Singh Nagar, Sector 74",
                 "address": "122 Level 1st Floor D-199 Phase 8b Industrial Area Sector 74 Sahibzada Ajit Singh Nagar, Sector 74, 160055, Industrial Area, Sas Nagar, SAS Nagar, Punjab, India",
                 "location": {
-                    "latitude": 30.7088,
-                    "longitude": 76.6883
+                    "latitude": 30.7178,
+                    "longitude": 76.6973
                 }
             },
             {

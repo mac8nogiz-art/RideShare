@@ -58,18 +58,18 @@ export class JobOrchestratorService {
         }
 
         if ((this as any)._starting) {
-            logger.info('⏳ Job Orchestrator is currently starting — please wait');
+            logger.info('Job Orchestrator is currently starting — please wait');
             return;
         }
 
         (this as any)._starting = true;
 
         try {
-            logger.info('🚀 Starting Job Orchestrator...');
+            logger.info('Starting Job Orchestrator...');
 
 
             if (!this.zoneService.isReady || !(await this.zoneService.isReady())) {
-                logger.info('🧭 Initializing ZoneService...');
+                logger.info('Initializing ZoneService...');
                 await this.zoneService.init();
                 logger.info('ZoneService initialized');
             } else {
@@ -77,7 +77,7 @@ export class JobOrchestratorService {
             }
 
             //  Refresh driver cache with timeout guard
-            logger.info('🔄 Refreshing driver cache...');
+            logger.info(' Refreshing driver cache...');
             const refreshPromise = this.driverLocationService.refreshDriverCache();
             const timeoutPromise = new Promise((_, reject) =>
                 setTimeout(() => reject(new Error('Driver cache refresh timed out after 10s')), 10_000)
@@ -170,7 +170,7 @@ export class JobOrchestratorService {
     async handleRPCRequest(data: any): Promise<any> {
         // Check if service is initialized
         if (!this.isInitialized) {
-            logger.error('❌ Job Orchestrator not initialized - rejecting request');
+            logger.error(' Job Orchestrator not initialized - rejecting request');
             return {
                 success: false,
                 error: 'Service not initialized',
@@ -202,14 +202,7 @@ export class JobOrchestratorService {
                         this.metrics.apiCalls.handleDriverResponse++;
                         result = await this.handleDriverResponse(data);
                         break;
-                    case 'get.stats':
-                        this.metrics.apiCalls.handleGetStats++;
-                        result = await this.handleGetStats(data);
-                        break;
-                    case 'health.check':
-                        this.metrics.apiCalls.handleHealthCheck++;
-                        result = await this.handleHealthCheck(data);
-                        break;
+
                     default:
                         logger.warn(`Unknown RPC request type: ${data.type} (parsed as: ${parsed.eventName})`);
                         return {
@@ -262,7 +255,7 @@ export class JobOrchestratorService {
 
                     if (alternativeDrivers.length > 0) {
                         await this.offerManagementService.sendOffers(job, alternativeDrivers);
-                        logger.info(`🔄 Alternative offers sent - Job: ${jobId}, Drivers: ${alternativeDrivers.length}`);
+                        logger.info(` Alternative offers sent - Job: ${jobId}, Drivers: ${alternativeDrivers.length}`);
                         return {
                             success: true,
                             message: 'Searching for alternative drivers',
@@ -270,7 +263,7 @@ export class JobOrchestratorService {
                             alternativeDriversFound: alternativeDrivers.length
                         };
                     } else {
-                        logger.warn(`⚠️ No alternative drivers found - Job: ${jobId}`);
+                        logger.warn(` No alternative drivers found - Job: ${jobId}`);
                         return {
                             success: false,
                             message: 'No alternative drivers available',
@@ -278,7 +271,7 @@ export class JobOrchestratorService {
                         };
                     }
                 } else {
-                    logger.warn(`⚠️ Job not found - Job: ${jobId}`);
+                    logger.warn(`Job not found - Job: ${jobId}`);
                     return {
                         success: false,
                         message: 'Job not found',
@@ -286,7 +279,7 @@ export class JobOrchestratorService {
                     };
                 }
             } else {
-                logger.warn(`❌ Unknown Driver Action - Action: ${action}`);
+                logger.warn(`Unknown Driver Action - Action: ${action}`);
                 return {
                     success: false,
                     error: 'Unknown driver action',
@@ -295,7 +288,7 @@ export class JobOrchestratorService {
             }
         } catch (error: any) {
             this.metrics.errors++;
-            logger.error(`❌ Driver Response Error - Job: ${jobId}, Driver: ${driverId}, Error: ${error.message}`);
+            logger.error(` Driver Response Error - Job: ${jobId}, Driver: ${driverId}, Error: ${error.message}`);
             return {
                 success: false,
                 error: error.message,
@@ -391,7 +384,10 @@ export class JobOrchestratorService {
             pickupLng: pickup.longitude,
             fare: payload.grandTotal || 0,
             vehicleType: payload.selectedVehicle?.name || 'Unknown',
+            tripAddress: payload.tripAddress || '',
             timestamp: payload.createdAt ? new Date(payload.createdAt).getTime() : Date.now(),
+
+
         };
 
         try {
@@ -402,14 +398,13 @@ export class JobOrchestratorService {
                     drop.latitude,
                     drop.longitude
                 );
-
                 job.dropLat = drop.latitude;
                 job.dropLng = drop.longitude;
-
-
-                job.rideDetails = {
-                    estimatedTime: eta.durationText,
-                    estimatedDistance: eta.distanceText,
+                job.customer = {
+                    time: eta.durationText,
+                    distance: eta.distanceText,
+                    fullName: payload.customer.fullName || 'Unknown',
+                    avatar: payload.customer.avatar || '',
                 };
 
                 logger.info(
@@ -441,7 +436,54 @@ export class JobOrchestratorService {
             const searchTime = Date.now() - startTime;
 
             if (matchedDrivers.length > 0) {
+                const driversWithEta = await Promise.all(
+                    matchedDrivers.map(async (driverId) => {
+                        try {
+                            // we get drivers id only form
+                            const driverDataJson = await redis.call('JSON.GET', `driver:${driverId}`);
+                            if (!driverDataJson) {
+                                logger.warn(`Driver data not found in Redis in matched service part - ${driverId}`);
+                                return null;
+                            }
+
+                            const driverData = typeof driverDataJson === 'string'
+                                ? JSON.parse(driverDataJson)
+                                : driverDataJson;
+
+                            const lat = driverData?.location?.coordinates?.[1];
+                            const lng = driverData?.location?.coordinates?.[0];
+
+                            if (!lat || !lng) {
+                                logger.warn(`Invalid driver coordinates - ${driverId}`);
+                                return null;
+                            }
+
+                            // Get ETA from driver → pickup location
+                            const estimatedArrival = await this.mapboxService.getDistanceAndDuration(
+                                lat,
+                                lng,
+                                pickup.latitude,
+                                pickup.longitude
+                            );
+                            job.rideDetails = {
+                                estimatedTime: estimatedArrival.durationText,
+                                estimatedDistance: estimatedArrival.distanceText,
+                            };
+
+                            return {
+                                driverId,
+                                distanceToPickup: estimatedArrival.distanceText,
+                                etaToPickup: estimatedArrival.durationText,
+                            };
+                        } catch (error: any) {
+                            logger.error(`ETA calculation failed for driver ${driverId}: ${error.message}`);
+                            return null;
+                        }
+                    })
+                );
+
                 const offerResult = await this.offerManagementService.sendOffers(job, matchedDrivers);
+
 
                 this.metrics.driversMatched += matchedDrivers.length;
                 this.metrics.offersSent += offerResult.successful;
@@ -497,60 +539,6 @@ export class JobOrchestratorService {
         }
     }
 
-
-    // ----------------- Stats & Health -----------------
-
-    getStats() {
-        return {
-            activeJobs: this.jobProcessingService.getActiveJobsCount(),
-            cachedDrivers: this.driverLocationService.getDriverCacheSize(),
-            processingRate: Math.round(this.jobProcessingService.getActiveJobsCount() * 10),
-            cacheHitRate: this.driverLocationService.getDriverCacheSize() > 0 ? 0.95 : 0,
-            metrics: this.metrics,
-            isInitialized: this.isInitialized,
-            timestamp: new Date().toISOString()
-        };
-    }
-
-    private async handleGetStats(data: any): Promise<any> {
-        logger.info(`Stats Request - Client: ${data.clientId || 'unknown'}`);
-        return {
-            success: true,
-            stats: this.getStats()
-        };
-    }
-
-    private async handleHealthCheck(data: any): Promise<any> {
-        logger.info(' Health Check Request');
-
-        try {
-            const redisStart = Date.now();
-            await redis.ping();
-            const redisLatency = Date.now() - redisStart;
-
-            const healthData = {
-                success: true,
-                status: 'healthy',
-                redis: 'connected',
-                redisLatencyMs: redisLatency,
-                zoneService: this.zoneService.isReady() ? 'ready' : 'not_initialized',
-                orchestratorInitialized: this.isInitialized,
-                ...this.getStats()
-            };
-
-            logger.info(` Health Check Passed - Redis Latency: ${redisLatency}ms`);
-            return healthData;
-        } catch (error: any) {
-            this.metrics.errors++;
-            logger.error(` Health Check Failed - Redis: disconnected, Error: ${error.message}`);
-            return {
-                success: false,
-                status: 'unhealthy',
-                redis: 'disconnected',
-                error: error.message
-            };
-        }
-    }
 }
 
 export const jobOrchestratorService = new JobOrchestratorService();

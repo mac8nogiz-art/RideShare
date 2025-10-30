@@ -108,21 +108,7 @@ export class DriverMatchingService {
                     }));
 
 
-                await sendKafkaMessage(
-                    'drivers-found',
-                    job.id,
-                    {
-                        jobId: job.id,
-                        customerId: customerId,
-                        driversCount: matches.length,
-                        driverIds: matches,
-                        driversDetails: matchedDriversDetails,
-                        searchTime: matchingTime,
-                        pickupLocation: { lat: job.pickupLat, lng: job.pickupLng },
-                        zone: { id: zone._id, name: zone.name },
-                        timestamp: new Date().toISOString()
-                    }
-                );
+
             } else {
 
                 await sendKafkaMessage(
@@ -160,34 +146,6 @@ export class DriverMatchingService {
             return [];
         }
     }
-
-    async getDriversInZone(zoneId: string): Promise<string[]> {
-        try {
-            const allDrivers = Array.from(this.driverLocationService.getAllDrivers().keys());
-            const driversInZone: string[] = [];
-            // Batch check zone approvals
-            const pipeline = redis.pipeline();
-            allDrivers.forEach(driverId => {
-                pipeline.smembers(`driver:${driverId}:approved_zones`);
-            });
-            const results = await pipeline.exec();
-
-            if (!results) return [];
-
-            allDrivers.forEach((driverId, index) => {
-                const approvedZones = (results[index]?.[1] as string[]) || [];
-                if (approvedZones.length === 0 || approvedZones.includes(zoneId)) {
-                    driversInZone.push(driverId);
-                }
-            });
-
-            return driversInZone;
-        } catch (error) {
-            logger.error(`Get Drivers In Zone Error - Zone: ${zoneId}, Error: ${error}`);
-            return [];
-        }
-    }
-
 
     private async getNearbyDriversInZone(jobLat: number, jobLng: number, zoneId: string, radiusKm: number): Promise<DriverWithDistance[]> {
         const nearbyDrivers: DriverWithDistance[] = [];
