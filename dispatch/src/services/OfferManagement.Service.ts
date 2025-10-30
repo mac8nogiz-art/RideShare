@@ -4,7 +4,7 @@ import { Job } from '../types';
 import { producer, isKafkaConnected, checkProducerHealth, reconnectKafka } from '../infrastructure/kafka';
 
 export class OfferManagementService {
-    private readonly OFFER_EXPIRY_SECONDS = 12;
+    private readonly OFFER_EXPIRY_SECONDS = 15;
     private readonly KAFKA_TOPIC_ASSIGNMENTS = 'driver-assignments';
     private readonly KAFKA_TOPIC_OFFERS = 'driver-offers';
     private readonly MAX_KAFKA_RETRIES = 2;

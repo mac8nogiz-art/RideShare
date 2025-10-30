@@ -316,66 +316,29 @@ export class JobOrchestratorService {
             return { success: false, error: 'Missing booking ID', eventType: data.type };
         }
 
+        const pickupData = payload.tripAddress?.[0];
+        const dropData = payload.tripAddress?.[payload.tripAddress.length - 1];
 
-        let pickup: { latitude: number; longitude: number } | null = null;
-        let drop: { latitude: number; longitude: number } | null = null;
+        const pickup = pickupData?.location
+            ? { latitude: pickupData.location.latitude, longitude: pickupData.location.longitude }
+            : null;
 
-        if (Array.isArray(payload.tripAddress) && payload.tripAddress.length > 0) {
-            const pickupAddress =
-                payload.tripAddress.find(
-                    (a: any) =>
-                        a.markerType === 'pickup' ||
-                        a.markerType === 'origin' ||
-                        a.sequenceNumber === 1
-                ) || payload.tripAddress[0];
-
-            const dropAddress =
-                payload.tripAddress.find(
-                    (a: any) =>
-                        a.markerType === 'drop' ||
-                        a.markerType === 'destination' ||
-                        a.sequenceNumber === payload.tripAddress.length
-                ) || payload.tripAddress[payload.tripAddress.length - 1];
-
-            if (pickupAddress?.location?.latitude && pickupAddress?.location?.longitude) {
-                pickup = {
-                    latitude: pickupAddress.location.latitude,
-                    longitude: pickupAddress.location.longitude,
-                };
-            }
-
-            if (dropAddress?.location?.latitude && dropAddress?.location?.longitude) {
-                drop = {
-                    latitude: dropAddress.location.latitude,
-                    longitude: dropAddress.location.longitude,
-                };
-            }
-        }
-
-        if ((!pickup || !pickup.latitude || !pickup.longitude) && payload.firstTripAddressGeoLocation?.coordinates) {
-            pickup = {
-                latitude: payload.firstTripAddressGeoLocation.coordinates[1],
-                longitude: payload.firstTripAddressGeoLocation.coordinates[0],
-            };
-        }
-
-        if ((!drop || !drop.latitude || !drop.longitude) && payload.lastTripAddressGeoLocation?.coordinates) {
-            drop = {
-                latitude: payload.lastTripAddressGeoLocation.coordinates[1],
-                longitude: payload.lastTripAddressGeoLocation.coordinates[0],
-            };
-        }
+        const drop = dropData?.location
+            ? { latitude: dropData.location.latitude, longitude: dropData.location.longitude }
+            : null;
 
         if (!pickup) {
-            logger.error(`Missing pickup coordinates for booking ${jobId}`);
-            return { success: false, error: 'Pickup coordinates missing', jobId };
+            logger.error(`Missing pickup coordinates for Job ${jobId}`);
+            return { success: false, error: "Pickup coordinates missing", jobId };
         }
 
+        const customer = payload.customer;
 
-        if (!payload.customer || !payload.customer._id) {
-            logger.error(`Invalid customer data - BookingId: ${jobId}`);
-            return { success: false, error: 'Invalid customer data', jobId };
+        if (!customer?._id) {
+            logger.error(` Invalid customer data — Job ${jobId}`);
+            return { success: false, error: "Invalid customer data", jobId };
         }
+
 
         const job: Job = {
             id: jobId,
@@ -386,7 +349,6 @@ export class JobOrchestratorService {
             vehicleType: payload.selectedVehicle?.name || 'Unknown',
             tripAddress: payload.tripAddress || '',
             timestamp: payload.createdAt ? new Date(payload.createdAt).getTime() : Date.now(),
-
 
         };
 
@@ -416,19 +378,6 @@ export class JobOrchestratorService {
         } catch (error: any) {
             logger.error(` Mapbox ETA fetch failed for Job ${job.id}: ${error.message}`);
             job.rideDetails = { estimatedTime: "0 mins", estimatedDistance: "0 km" };
-        }
-
-        try {
-            await this.jobProcessingService.addJob(job);
-            logger.info(`Job added to processing queue - JobId: ${job.id}`);
-        } catch (error: any) {
-            logger.error(` Failed to add job to queue - JobId: ${job.id}, Error: ${error.message}`);
-            return {
-                success: false,
-                error: 'Failed to add job to queue',
-                jobId: job.id,
-                errorDetails: error.message,
-            };
         }
 
         try {

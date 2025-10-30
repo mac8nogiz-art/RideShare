@@ -9,15 +9,12 @@ import { processKafkaMessage } from './handlers/mesage-processor';
 const orchestrator = jobOrchestratorService;
 
 async function start() {
-    logger.info("🚀 Starting Dispatch Service...");
+    logger.info("Starting Dispatch Service...");
 
-    // 🧭 Start Job Orchestrator
     await orchestrator.start();
 
-    // 🔌 Connect Kafka
     await connectKafka();
 
-    // 🎧 Subscribe to main topic
     await consumer.subscribe({ topic: "newJob.request" });
 
     await consumer.run({
@@ -33,10 +30,10 @@ async function start() {
         },
     });
 
-    logger.info("✅ Kafka consumer started successfully");
+    logger.info(" Kafka consumer started successfully");
 }
 
-// 🧠 HTTP Interface for Observability / RPC
+//  HTTP Interface for Observability / RPC
 const app = new Elysia()
     .use(
         kafkaRPC({
@@ -51,8 +48,7 @@ const app = new Elysia()
             topicDiscoveryInterval: 30000,
 
             onMessage: async (message: any, topic: string) => {
-                logger.info(`📨 Received event from topic: ${topic}`);
-                logger.debug(`Message Payload: ${JSON.stringify(message, null, 2)}`);
+                logger.info(`Received event from topic: ${topic}`);
 
                 return {
                     status: 'processed',
@@ -61,18 +57,10 @@ const app = new Elysia()
             },
         })
     )
-    .get('/', () => '🚀 Dispatch Service Running')
-    .get('/health', () => ({ status: 'ok' }))
-    .get('/stats', async () => {
-        const stats = orchestrator.getStats();
-        return {
-            success: true,
-            ...stats,
-        };
-    })
+    .get('/', () => ' Dispatch Service Running')
     .listen(4005);
 
-logger.info(`🌐 HTTP server running at http://localhost:4005`);
+logger.info(`HTTP server running at http://localhost:4005`);
 
 // ----------------- Global Error Handlers -----------------
 process.on('unhandledRejection', (reason: any) => {
@@ -84,6 +72,6 @@ process.on('uncaughtException', (err: any) => {
 });
 
 start().catch((err) => {
-    logger.error(`❌ Fatal error during startup: ${err.message}`);
+    logger.error(` Fatal error during startup: ${err.message}`);
     process.exit(1);
 });
