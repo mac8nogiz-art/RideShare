@@ -25,6 +25,7 @@ export class DriverMatchingService {
 
         try {
             // Set TTL marker - background search will check this
+            // we need driver id as we need to store ttl match like tabuar form
             await redis.setex(`job:${job.id}:active`, this.JOB_SEARCH_TTL, Date.now().toString());
 
             const zone = await this.zoneService.getZoneForJob(job);
@@ -52,11 +53,6 @@ export class DriverMatchingService {
             for (const radius of radiusSteps) {
                 // Check if job is still active (TTL not expired)
                 const isActive = await redis.exists(`job:${job.id}:active`);
-                if (!isActive) {
-                    logger.info(`Job ${job.id} TTL expired, stopping search at ${radius}km`);
-                    break;
-                }
-
                 logger.info(`Searching for drivers within ${radius}km...`);
 
                 const drivers = await this.getNearbyDriversInZone(job.pickupLat, job.pickupLng, zone._id, radius);

@@ -305,7 +305,7 @@ export class JobOrchestratorService {
         };
 
         try {
-            if (drop?.latitude && drop?.longitude && pickup?.latitude && pickup?.longitude) {   /// it can be drop just to process
+            if (drop) {   /// it can be drop just to process
                 const eta = await this.mapboxService.getDistanceAndDuration(
                     pickup.latitude,
                     pickup.longitude,
