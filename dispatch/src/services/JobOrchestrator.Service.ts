@@ -123,54 +123,11 @@ export class JobOrchestratorService {
         return this.isInitialized;
     }
 
-    // ----------------- Event Type Parser -----------------
-
-    private parseEventType(type: string): ParsedEventType {
-        // Handle dynamic event types like "newBookingPlaced-6900561da9ea6f1305d29aba"
-        const bookingEventPatterns = [
-            'newBookingPlaced',
-            'newJob.request',
-            'booking.created',
-            'ride.requested'
-        ];
-
-        // Check if this is a booking event
-        const isBookingEvent = bookingEventPatterns.some(pattern => type.startsWith(pattern));
-
-        if (isBookingEvent) {
-            const parts = type.split('-');
-
-            if (parts.length > 1) {
-                // Extract booking ID from type like "newBookingPlaced-6900561da9ea6f1305d29aba"
-                return {
-                    eventName: parts[0],
-                    bookingId: parts.slice(1).join('-'), // Handle multiple dashes
-                    isBookingEvent: true
-                };
-            } else {
-                // Legacy format without booking ID in type
-                return {
-                    eventName: type,
-                    bookingId: null,
-                    isBookingEvent: true
-                };
-            }
-        }
-
-        // Handle other event types like "driver.response", "get.stats", etc.
-        return {
-            eventName: type,
-            bookingId: null,
-            isBookingEvent: false
-        };
-    }
-
-    // ----------------- RPC Event Handlers -----------------
+    // ----------------- Event processng and type  -----------------
 
     async handleRPCRequest(data: any): Promise<any> {
-        // Check if service is initialized
         if (!this.isInitialized) {
-            logger.error(' Job Orchestrator not initialized - rejecting request');
+            logger.error('Job Orchestrator not initialized - rejecting request');
             return {
                 success: false,
                 error: 'Service not initialized',
@@ -179,54 +136,49 @@ export class JobOrchestratorService {
         }
 
         const requestId = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-
-        // Parse the event type dynamically
-        const parsed = this.parseEventType(data.type);
-
-        logger.info(`RPC Request Received - OriginalType: ${data.type}, EventName: ${parsed.eventName}, BookingId: ${parsed.bookingId || 'N/A'}, IsBookingEvent: ${parsed.isBookingEvent}, RequestId: ${requestId}`);
-
+        const eventType = data.type;
+        logger.info(`RPC Request Received - Type: ${eventType}, RequestId: ${requestId}`);
         this.metrics.rpcRequests++;
-
         try {
             let result;
-
-            // Route based on event type
-            if (parsed.isBookingEvent) {
-                // Handle all booking-related events
+            if (
+                eventType.startsWith('newBookingPlaced') ||
+                eventType.startsWith('newJob.request') ||
+                eventType.startsWith('booking.created') ||
+                eventType.startsWith('ride.requested')
+            ) {
                 this.metrics.apiCalls.handlePaymentCompleted++;
-                result = await this.handleNewJobEvent(data, parsed.bookingId);
+                result = await this.handleNewJobEvent(data, data.bookingId || null);
             } else {
-                // Handle other event types
-                switch (parsed.eventName) {
+                switch (eventType) {
                     case 'driver.response':
                         this.metrics.apiCalls.handleDriverResponse++;
                         result = await this.handleDriverResponse(data);
                         break;
 
                     default:
-                        logger.warn(`Unknown RPC request type: ${data.type} (parsed as: ${parsed.eventName})`);
+                        logger.warn(`Unknown RPC request type: ${eventType}`);
                         return {
                             success: false,
                             error: 'Unknown request type',
-                            receivedType: data.type,
-                            parsedEventName: parsed.eventName
+                            receivedType: eventType
                         };
                 }
             }
-
-            logger.info(`RPC Request Completed - Type: ${data.type}, RequestId: ${requestId}, Success: ${result.success}`);
+            logger.info(`RPC Request Completed - Type: ${eventType}, RequestId: ${requestId}, Success: ${result.success}`);
             return result;
         } catch (error: any) {
             this.metrics.errors++;
-            logger.error(`RPC Request Failed - Type: ${data.type}, RequestId: ${requestId}, Error: ${error.message}, Stack: ${error.stack}`);
+            logger.error(`RPC Request Failed - Type: ${eventType}, RequestId: ${requestId}, Error: ${error.message}`);
             return {
                 success: false,
                 error: error.message,
-                type: data.type,
+                type: eventType,
                 requestId
             };
         }
     }
+
 
     // ----------------- Driver Response Handler -----------------
 
@@ -353,7 +305,7 @@ export class JobOrchestratorService {
         };
 
         try {
-            if (drop?.latitude && drop?.longitude && pickup?.latitude && pickup?.longitude) {
+            if (drop?.latitude && drop?.longitude && pickup?.latitude && pickup?.longitude) {   /// it can be drop just to process
                 const eta = await this.mapboxService.getDistanceAndDuration(
                     pickup.latitude,
                     pickup.longitude,

@@ -52,10 +52,9 @@ export class ZoneService {
         try {
             this.ensureInitialized();
 
-            // MongoDB $geoIntersects spatial query to find zone containing the point
-            const zone = await this.db!
+            const cursor = this.db!
                 .collection<Zone>('geoareas')
-                .findOne({
+                .find({
                     status: true,
                     location: {
                         $geoIntersects: {
@@ -65,27 +64,31 @@ export class ZoneService {
                             }
                         }
                     }
-                });
+                })
 
-            if (zone) {
-                logger.info(`Pickup location is in zone: "${zone.name}" (${zone._id})`);
-                return zone;
-            } else {
+
+            const zones = await cursor.toArray();
+
+            if (!zones || zones.length === 0) {
                 logger.warn(`No zone found for job ${job.id} at ${job.pickupLat}, ${job.pickupLng}`);
                 return null;
             }
 
+            // You can add selection logic here if multiple zones overlap
+            const selectedZone = zones[0];
+
+            logger.info(`Pickup location is in zone: "${selectedZone.name}" (${selectedZone._id})`);
+            return selectedZone;
+
         } catch (error: any) {
-            logger.error(` Error finding zone for job ${job.id}:`, error);
-
-            // Check if it's an initialization error
+            logger.error(`Error finding zone for job ${job.id}: ${error.message}`);
             if (error.message.includes('not initialized')) {
-                logger.error('⚠ ZoneService was called before initialization!');
+                logger.error('ZoneService was called before initialization!');
             }
-
             return null;
         }
     }
+
 
     /**
      * STEP 2: Check if driver is approved for the zone
@@ -100,34 +103,34 @@ export class ZoneService {
      * @param zoneId - The zone ID (or null if no zones configured)
      * @returns true if driver can accept rides in this zone
      */
-    public async isDriverApprovedForZone(driverId: string, zoneId: string | null): Promise<boolean> {
-        try {
-            if (!zoneId) {
-                logger.info(`No zone restrictions - Driver ${driverId} approved`);
-                return true;
-            }
-
-            const approvedZones = await redis.smembers(`driver:${driverId}:approved_zones`);
-
-            if (approvedZones.length === 0) {
-                logger.info(`Driver ${driverId} has empty approved_zones - approved for ALL zones including ${zoneId}`);
-                return true;
-            }
-
-            const isApproved = approvedZones.includes(zoneId);
-
-            if (isApproved) {
-                logger.info(`✅ Driver ${driverId} is approved for zone ${zoneId}`);
-            } else {
-                logger.warn(`⚠️ Driver ${driverId} is NOT approved for zone ${zoneId} (approved for: ${approvedZones.join(', ')})`);
-            }
-
-            return isApproved;
-        } catch (error: any) {
-            logger.error(`❌ Error checking driver ${driverId} approval for zone ${zoneId}: ${error.message}`);
-            return false;
-        }
-    }
+    // public async isDriverApprovedForZone(driverId: string, zoneId: string | null): Promise<boolean> {
+    //     try {
+    //         if (!zoneId) {
+    //             logger.info(`No zone restrictions - Driver ${driverId} approved`);
+    //             return true;
+    //         }
+    //
+    //         const approvedZones = await redis.smembers(`driver:${driverId}:approved_zones`);
+    //
+    //         if (approvedZones.length === 0) {
+    //             logger.info(`Driver ${driverId} has empty approved_zones - approved for ALL zones including ${zoneId}`);
+    //             return true;
+    //         }
+    //
+    //         const isApproved = approvedZones.includes(zoneId);
+    //
+    //         if (isApproved) {
+    //             logger.info(`✅ Driver ${driverId} is approved for zone ${zoneId}`);
+    //         } else {
+    //             logger.warn(`⚠️ Driver ${driverId} is NOT approved for zone ${zoneId} (approved for: ${approvedZones.join(', ')})`);
+    //         }
+    //
+    //         return isApproved;
+    //     } catch (error: any) {
+    //         logger.error(`❌ Error checking driver ${driverId} approval for zone ${zoneId}: ${error.message}`);
+    //         return false;
+    //     }
+    // }
 
 
     /**
@@ -142,13 +145,13 @@ export class ZoneService {
 
             // Create index on 'geoareas' collection (not 'drivergeoareas')
             await this.db.collection('geoareas').createIndex({location: "2dsphere"});
-            logger.info("✅ Geospatial index verified on geoareas.location");
+            logger.info(" Geospatial index verified on geoareas.location");
         } catch (error: any) {
             // Index might already exist - this is not a critical error
             if (error.code === 85 || error.message.includes('already exists')) {
-                logger.info("ℹ️ Geospatial index already exists on geoareas.location");
+                logger.info("Geospatial index already exists on geoareas.location");
             } else {
-                logger.warn(`⚠️ Geospatial index creation warning: ${error.message}`);
+                logger.warn(`Geospatial index creation warning: ${error.message}`);
             }
         }
     }

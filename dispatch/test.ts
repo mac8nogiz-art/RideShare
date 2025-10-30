@@ -19,7 +19,7 @@ const producer = kafka.producer();
 
 // Event payload from your document
 const eventPayload = {
-    "type": "newBookingPlaced-6900561da9ea6f1305d29aba",
+    "type": "newBookingPlaced",
     "payload": {
         "_id": "6900561da9ea6f1305d29aba",
         "orderNo": "17616297252927556",

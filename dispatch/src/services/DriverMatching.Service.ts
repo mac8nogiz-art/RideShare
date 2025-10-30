@@ -11,7 +11,6 @@ export class DriverMatchingService {
     private spatialService: SpatialService;
 
     private readonly DEFAULT_STALE_THRESHOLD = 30000;
-    private readonly MAX_RADIUS = 15;
     private readonly JOB_SEARCH_TTL = 15;
     private readonly MATCHED_DRIVERS_TTL = 900;
 
