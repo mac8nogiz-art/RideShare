@@ -102,62 +102,9 @@ export const ensureKafkaConnection = async (): Promise<boolean> => {
     return await connectKafka();
 };
 
-export const sendKafkaMessage = async (topic: string, key: string, value: any): Promise<boolean> => {
-    const maxRetries = 3;
 
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-        try {
 
-            const connected = await ensureKafkaConnection();
-            if (!connected) {
-                throw new Error('Kafka not connected');
-            }
 
-            await producer.send({
-                topic,
-                messages: [{
-                    key,
-                    value: JSON.stringify(value),
-                    headers: {
-                        'attempt': attempt.toString(),
-                        'timestamp': Date.now().toString()
-                    }
-                }]
-            });
-
-            logger.debug(`Kafka message sent - Topic: ${topic}, Key: ${key}, Attempt: ${attempt}`);
-            return true;
-
-        } catch (error: any) {
-            logger.warn(`Kafka send failed (Attempt ${attempt}/${maxRetries}) - Topic: ${topic}, Error: ${error.message}`);
-
-            if (attempt === maxRetries) {
-                logger.error(`Failed to send Kafka message after ${maxRetries} attempts: ${error.message}`);
-                return false;
-            }
-
-            // Wait before retry with exponential backoff
-            const backoffTime = Math.min(200 * Math.pow(2, attempt - 1), 2000);
-            await new Promise(resolve => setTimeout(resolve, backoffTime));
-        }
-    }
-
-    return false;
-};
-
-export const disconnectKafka = async (): Promise<void> => {
-    try {
-        await Promise.allSettled([
-            producer.disconnect(),
-            consumer.disconnect(),
-            admin.disconnect()
-        ]);
-        isConnected = false;
-        logger.info('Kafka disconnected');
-    } catch (error: any) {
-        logger.error(`Kafka disconnection error: ${error.message}`);
-    }
-};
 
 export const isKafkaConnected = (): boolean => isConnected;
 

@@ -17,7 +17,9 @@ export class OfferManagementService {
             logger.info(` Sending Offer to Driver: ${driverId}`);
             try {
                 await this.sendSingleOffer(job, driverId);
+
                 successful++;
+
                 logger.info(`Offer Sent - JobId: ${job.id}, Driver: ${driverId}`);
                 const accepted = await this.waitForDriverResponseOrTimeout(job.id, driverId, this.OFFER_EXPIRY_SECONDS * 1000);
                 if (accepted) {
@@ -40,7 +42,7 @@ export class OfferManagementService {
             const status = await redis.hget(`job:${job.id}`, 'status');
             const assignedDriver = await redis.hget(`job:${job.id}`, 'assignedDriver');
             if (status === 'accepted' || assignedDriver) {
-                logger.info(`🚦 Job already assigned (${assignedDriver || 'unknown'}) — stopping offer cycle.`);
+                logger.info(` Job already assigned (${assignedDriver || 'unknown'}) — stopping offer cycle.`);
                 break;
             }
         }

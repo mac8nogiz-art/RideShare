@@ -4,7 +4,6 @@ import {Driver, DriverWithDistance, Job} from '../types';
 import {DriverLocationService} from './DriverLocation.Service';
 import {ZoneService} from './ZoneService';
 import {SpatialService} from '../infrastructure/spatial';
-import { sendKafkaMessage } from '../infrastructure/kafka';
 
 export class DriverMatchingService {
     private driverLocationService: DriverLocationService;
@@ -13,6 +12,8 @@ export class DriverMatchingService {
 
     private readonly DEFAULT_STALE_THRESHOLD = 30000;
     private readonly MAX_RADIUS = 15;
+    private readonly JOB_SEARCH_TTL = 15;
+    private readonly MATCHED_DRIVERS_TTL = 900;
 
     constructor(driverLocationService: DriverLocationService, zoneService: ZoneService) {
         this.driverLocationService = driverLocationService;
@@ -20,157 +21,235 @@ export class DriverMatchingService {
         this.spatialService = new SpatialService();
     }
 
-    async findBestDrivers(job: Job, customerId: string, maxDrivers: number = 10): Promise<string[]> {
+    async findBestDrivers(job: Job, customerId: string): Promise<string[]> {
         const startTime = Date.now();
 
         try {
+            // Set TTL marker - background search will check this
+            await redis.setex(`job:${job.id}:active`, this.JOB_SEARCH_TTL, Date.now().toString());
+
             const zone = await this.zoneService.getZoneForJob(job);
 
             if (!zone) {
                 logger.warn(`No zone found for job ${job.id} at ${job.pickupLat}, ${job.pickupLng}`);
+                await redis.del(`job:${job.id}:active`);
                 return [];
             }
 
             logger.info(`Job ${job.id} at [${job.pickupLat}, ${job.pickupLng}] assigned to zone: ${zone.name} (${zone._id})`);
-            logger.info(`Searching for drivers within 3km...`);
 
-            let nearbyDrivers = await this.getNearbyDriversInZone(job.pickupLat, job.pickupLng, zone._id, 3);
-
-            if (nearbyDrivers.length < maxDrivers) {
-                logger.info(`Expanding search to 5km (found ${nearbyDrivers.length} so far)...`);
-                const drivers5km = await this.getNearbyDriversInZone(job.pickupLat, job.pickupLng, zone._id, 5);
-                nearbyDrivers = [...nearbyDrivers, ...drivers5km.filter(d => d.distance > 3)];
-            }
-
-            if (nearbyDrivers.length < maxDrivers) {
-                logger.info(`Expanding search to 15km (found ${nearbyDrivers.length} so far)...`);
-                const drivers15km = await this.getNearbyDriversInZone(job.pickupLat, job.pickupLng, zone._id, 15);
-                nearbyDrivers = [...nearbyDrivers, ...drivers15km.filter(d => d.distance > 5)];
-            }
-
-
-            if (nearbyDrivers.length === 0) {
-                logger.info(`No eligible drivers found in zone ${zone.name} for job ${job.id}`);
-
-
-                await sendKafkaMessage(
-                    'no-drivers-found',
-                    job.id,
-                    {
-                        jobId: job.id,
-                        customerId: customerId,
-                        searchTime: Date.now() - startTime,
-                        pickupLocation: { lat: job.pickupLat, lng: job.pickupLng },
-                        zone: { id: zone._id, name: zone.name },
-                        timestamp: new Date().toISOString()
-                    }
-                );
-
-                return [];
-            }
-
+            // Store all unique
+            const allMatchedDrivers = new Map<string, DriverWithDistance>();
             const favoriteDriverIds = await this.getCustomerFavorites(customerId);
             const favoriteSet = new Set(favoriteDriverIds);
 
-            const driversWithPriority = nearbyDrivers.map(driver => ({
-                driverId: driver.driverId,
-                priority: this.calculateDriverPriority(driver, favoriteSet.has(driver.driverId)),
-                distance: driver.distance,
-                isFavorite: favoriteSet.has(driver.driverId)
-            }));
+            let firstDriverFound = false;
+            const radiusSteps = [3, 6, 9, 12, 15];
 
-            const matches = driversWithPriority
-                .filter(d => d.priority > 0)
-                .sort((a, b) => {
-                    if (b.priority !== a.priority) return b.priority - a.priority;
-                    return a.distance - b.distance;
-                })
-                .slice(0, maxDrivers)
-                .map(d => d.driverId);
+            // Store zone info
+            await redis.setex(`job:${job.id}:zone`, this.MATCHED_DRIVERS_TTL, zone._id);
+
+            // Progressive search through radius steps
+            for (const radius of radiusSteps) {
+                // Check if job is still active (TTL not expired)
+                const isActive = await redis.exists(`job:${job.id}:active`);
+                if (!isActive) {
+                    logger.info(`Job ${job.id} TTL expired, stopping search at ${radius}km`);
+                    break;
+                }
+
+                logger.info(`Searching for drivers within ${radius}km...`);
+
+                const drivers = await this.getNearbyDriversInZone(job.pickupLat, job.pickupLng, zone._id, radius);
+
+                // Add new drivers (avoid duplicates)
+                let newDriversCount = 0;
+                for (const driver of drivers) {
+                    if (!allMatchedDrivers.has(driver.driverId)) {
+                        allMatchedDrivers.set(driver.driverId, driver);
+                        newDriversCount++;
+                    }
+                }
+
+                logger.info(`Found ${newDriversCount} new drivers at ${radius}km (Total: ${allMatchedDrivers.size})`);
+
+                // If this is the first driver found, return immediately
+                if (!firstDriverFound && allMatchedDrivers.size > 0) {
+                    firstDriverFound = true;
+
+                    const matches = this.processBestDrivers(
+                        Array.from(allMatchedDrivers.values()),
+                        favoriteSet
+                    );
+
+                    logger.info(`IMMEDIATE RESPONSE: Returning ${matches.length} driver(s) at ${radius}km in ${Date.now() - startTime}ms`);
+
+
+                    await redis.setex(`job:${job.id}:matched_drivers`, this.MATCHED_DRIVERS_TTL, JSON.stringify(matches));
+
+                    // Continue background search (will stop after 15s TTL)
+                    this.continueBackgroundSearch(
+                        job,
+                        zone,
+                        allMatchedDrivers,
+                        favoriteSet,
+                        radiusSteps,
+                        radius,
+                        startTime
+                    ).catch(err => {
+                        logger.error(`Background search error for job ${job.id}: ${err.message}`);
+                    });
+
+                    return matches;
+                }
+            }
+
+
+            if (allMatchedDrivers.size === 0) {
+                logger.info(`No eligible drivers found in zone ${zone.name} for job ${job.id}`);
+                await redis.del(`job:${job.id}:active`);
+                return [];
+            }
+
+            // Process final results
+            const matches = this.processBestDrivers(
+                Array.from(allMatchedDrivers.values()),
+                favoriteSet
+            );
 
             if (matches.length > 0) {
-                await redis.setex(`job:${job.id}:matched_drivers`, 300, JSON.stringify(matches));
-                await redis.setex(`job:${job.id}:zone`, 300, zone._id);
+                await redis.setex(`job:${job.id}:matched_drivers`, this.MATCHED_DRIVERS_TTL, JSON.stringify(matches));
             }
+
+            await redis.del(`job:${job.id}:active`);
 
             const matchingTime = Date.now() - startTime;
             logger.info(`Matched ${matches.length} drivers in zone ${zone.name} for job ${job.id} in ${matchingTime}ms`);
-
-
-            if (matches.length > 0) {
-                const matchedDriversDetails = driversWithPriority
-                    .filter(d => matches.includes(d.driverId))
-                    .map(d => ({
-                        driverId: d.driverId,
-                        distance: d.distance,
-                        priority: d.priority,
-                        isFavorite: d.isFavorite
-                    }));
-
-
-
-            } else {
-
-                await sendKafkaMessage(
-                    'no-drivers-found',
-                    job.id,
-                    {
-                        jobId: job.id,
-                        customerId: customerId,
-                        searchTime: matchingTime,
-                        pickupLocation: { lat: job.pickupLat, lng: job.pickupLng },
-                        zone: { id: zone._id, name: zone.name },
-                        reason: 'No drivers passed priority filter',
-                        timestamp: new Date().toISOString()
-                    }
-                );
-            }
 
             return matches;
 
         } catch (error) {
             logger.error(`Driver matching failed for job ${job.id}: ${error}`);
-
-
-            await sendKafkaMessage(
-                'driver-matching-error',
-                job.id,
-                {
-                    jobId: job.id,
-                    customerId: customerId,
-                    error: error instanceof Error ? error.message : String(error),
-                    timestamp: new Date().toISOString()
-                }
-            );
-
+            await redis.del(`job:${job.id}:active`);
             return [];
         }
+    }
+
+    /**
+     * Continue searching for more drivers in the background
+     * Stops automatically when TTL expires (15 seconds)
+     */
+    private async continueBackgroundSearch(
+        job: Job,
+        zone: any,
+        allMatchedDrivers: Map<string, DriverWithDistance>,
+        favoriteSet: Set<string>,
+        radiusSteps: number[],
+        currentRadius: number,
+        startTime: number
+    ): Promise<void> {
+        logger.info(`Background search continuing for job ${job.id} from ${currentRadius}km...`);
+
+        const remainingRadii = radiusSteps.filter(r => r > currentRadius);
+
+        for (const radius of remainingRadii) {
+            // Check if TTL has expired
+            const isActive = await redis.exists(`job:${job.id}:active`);
+            if (!isActive) {
+                logger.info(` Job ${job.id} TTL expired (15s), stopping background search`);
+                break;
+            }
+
+            try {
+                logger.info(`Background: Searching ${radius}km...`);
+
+                const drivers = await this.getNearbyDriversInZone(
+                    job.pickupLat,
+                    job.pickupLng,
+                    zone._id,
+                    radius
+                );
+
+                let newDriversCount = 0;
+                for (const driver of drivers) {
+                    if (!allMatchedDrivers.has(driver.driverId)) {
+                        allMatchedDrivers.set(driver.driverId, driver);
+                        newDriversCount++;
+                    }
+                }
+
+                if (newDriversCount > 0) {
+                    logger.info(`Background: Found ${newDriversCount} new drivers at ${radius}km (Total: ${allMatchedDrivers.size})`);
+
+                    const updatedMatches = this.processBestDrivers(
+                        Array.from(allMatchedDrivers.values()),
+                        favoriteSet
+                    );
+
+                    await redis.setex(`job:${job.id}:matched_drivers`, this.MATCHED_DRIVERS_TTL, JSON.stringify(updatedMatches));
+
+                    logger.info(`Background: Updated matched drivers list with ${updatedMatches.length} drivers`);
+
+                    // Publish update via Redis Pub/Sub
+                    await redis.publish(
+                        `job:${job.id}:driver-updates`,
+                        JSON.stringify({
+                            jobId: job.id,
+                            totalDrivers: updatedMatches.length,
+                            newDriversAdded: newDriversCount,
+                            searchRadius: radius,
+                            timestamp: new Date().toISOString()
+                        })
+                    );
+                }
+            } catch (error) {
+                logger.error(`Background search failed at ${radius}km: ${error}`);
+            }
+        }
+
+        // Cleanup - remove active marker
+        await redis.del(`job:${job.id}:active`);
+
+        const totalTime = Date.now() - startTime;
+        logger.info(`🏁 Background search completed for job ${job.id}. Total: ${allMatchedDrivers.size} drivers in ${totalTime}ms`);
+    }
+
+    /**
+     * Process and rank drivers based on priority and distance
+     * NO MAX LIMIT - returns all eligible drivers
+     */
+    private processBestDrivers(
+        drivers: DriverWithDistance[],
+        favoriteSet: Set<string>
+    ): string[] {
+        const driversWithPriority = drivers.map(driver => ({
+            driverId: driver.driverId,
+            priority: this.calculateDriverPriority(driver, favoriteSet.has(driver.driverId)),
+            distance: driver.distance,
+            isFavorite: favoriteSet.has(driver.driverId)
+        }));
+
+        // Return ALL drivers, sorted by priority and distance
+        return driversWithPriority
+            .filter(d => d.priority > 0)
+            .sort((a, b) => {
+                if (b.priority !== a.priority) return b.priority - a.priority;
+                return a.distance - b.distance;
+            })
+            .map(d => d.driverId);
     }
 
     private async getNearbyDriversInZone(jobLat: number, jobLng: number, zoneId: string, radiusKm: number): Promise<DriverWithDistance[]> {
         const nearbyDrivers: DriverWithDistance[] = [];
 
         try {
-            logger.info(`GEOSEARCH: Looking for drivers near [${jobLat}, ${jobLng}] within ${radiusKm}km`);
-
-            const geoCount = await redis.zcard('drivers:locations');
-            logger.info(`Geospatial index has ${geoCount} entries`);
-
-            if (geoCount === 0) {
-                logger.warn(`Geospatial index is EMPTY - falling back to memory search`);
-                return this.getNearbyDriversInZoneFallback(jobLat, jobLng, zoneId, radiusKm);
-            }
-
             // Get drivers within radius
             const result = await redis.geosearch('drivers:locations', 'FROMLONLAT', jobLng, jobLat, 'BYRADIUS', radiusKm, 'km', 'WITHDIST', 'ASC') as any;
-
             logger.info(`GEOSEARCH raw result length: ${result?.length || 0}`);
-
             if (!result || result.length === 0) {
                 logger.warn(`GEOSEARCH returned 0 results within ${radiusKm}km`);
                 return nearbyDrivers;
             }
-
             // Parse GEOSEARCH results
             const driverIds: string[] = [];
             const distances: number[] = [];
@@ -212,13 +291,10 @@ export class DriverMatchingService {
                 return nearbyDrivers;
             }
 
-            const now = Date.now();
-
             // OPTIMIZATION: Use pipeline to fetch JSON data efficiently
-            // const pipeline = redis.pipeline();
             const pipeline = redis.pipeline();
             driverIds.forEach(driverId => {
-                pipeline.call('JSON.GET', `driver:${driverId}`); // Use JSON.GET command
+                pipeline.call('JSON.GET', `driver:${driverId}`);
             });
             const results = await pipeline.exec();
 
@@ -230,7 +306,6 @@ export class DriverMatchingService {
             logger.info(`Processing ${driverIds.length} drivers from pipeline`);
 
             // Process each driver
-            // Process each driver
             for (let i = 0; i < driverIds.length; i++) {
                 const driverId = driverIds[i];
                 const distance = distances[i];
@@ -238,7 +313,8 @@ export class DriverMatchingService {
                 const result = results[i];
 
                 if (result[0]) {
-                    logger.warn(`Redis error for driver ${driverId}: ${result[0]}`);
+                    const errorMsg = result[0] instanceof Error ? result[0].message : JSON.stringify(result[0]);
+                    logger.warn(`Redis error for driver ${driverId}: ${errorMsg}`);
                     continue;
                 }
 
@@ -250,11 +326,10 @@ export class DriverMatchingService {
                 }
 
                 try {
-                    // Parse the JSON result (it might already be an object or a string)
+                    // Parse the JSON result
                     const driverData = typeof driverJson === 'string' ? JSON.parse(driverJson) : driverJson;
 
-                    // NOW extract from the ACTUAL driver document structure
-                    // Based on your document, the structure is different!
+                    // Extract location coordinates
                     const coordinates = driverData.location?.coordinates;
                     if (!coordinates || !Array.isArray(coordinates) || coordinates.length < 2) {
                         logger.debug(`${driverId}: Invalid location data`);
@@ -262,29 +337,10 @@ export class DriverMatchingService {
                     }
 
                     const [lng, lat] = coordinates;
-                    const lastUpdate = Date.now(); // Use current time since we just fetched it
+                    const lastUpdate = Date.now();
                     const isBusy = driverData.iAmBusy === true;
                     const score = parseInt(driverData.score || '50');
                     const approvedZones = Array.isArray(driverData.approved_zone) ? driverData.approved_zone : [];
-                    const isOnline = driverData.iAmOnline === true;
-
-                    // Validate coordinates
-                    if (isNaN(lat) || isNaN(lng)) {
-                        logger.debug(`${driverId}: Invalid coordinates`);
-                        continue;
-                    }
-
-                    // Check if online
-                    if (!isOnline) {
-                        logger.debug(`${driverId}: Offline`);
-                        continue;
-                    }
-
-                    // Check if busy
-                    if (isBusy) {
-                        logger.debug(`${driverId}: Busy`);
-                        continue;
-                    }
 
                     // Check zone approval
                     const isApproved = approvedZones.length === 0 || approvedZones.includes(zoneId);
@@ -316,7 +372,6 @@ export class DriverMatchingService {
 
                 } catch (parseError) {
                     logger.error(`${driverId}: JSON parse error - ${parseError}`);
-                    continue;
                 }
             }
 
@@ -330,45 +385,6 @@ export class DriverMatchingService {
         return nearbyDrivers;
     }
 
-    private async getNearbyDriversInZoneFallback(jobLat: number, jobLng: number, zoneId: string, radiusKm: number): Promise<DriverWithDistance[]> {
-        const nearbyDrivers: DriverWithDistance[] = [];
-        const now = Date.now();
-        const allDrivers = this.driverLocationService.getAllDrivers();
-
-        logger.warn(`  Using FALLBACK search (in-memory has ${allDrivers.size} drivers)`);
-
-        for (const [driverId, driver] of allDrivers.entries()) {
-            // Skip stale or busy drivers
-            const age = now - driver.lastUpdate;
-            if (age > this.DEFAULT_STALE_THRESHOLD) {
-                continue;
-            }
-            if (driver.isBusy) {
-                continue;
-            }
-
-            // Calculate distance
-            const distance = this.spatialService.calculateDistance(jobLat, jobLng, driver.lat, driver.lng);
-
-            // Check radius
-            if (distance > radiusKm) {
-                continue;
-            }
-
-            // Check zone approval
-            const isApproved = await this.zoneService.isDriverApprovedForZone(driverId, zoneId);
-            if (!isApproved) {
-                continue;
-            }
-
-            nearbyDrivers.push({
-                ...driver, distance, priority: 0
-            });
-        }
-
-        logger.info(` Fallback found ${nearbyDrivers.length} eligible drivers`);
-        return nearbyDrivers;
-    }
 
     private async getCustomerFavorites(customerId: string): Promise<Set<string>> {
         try {
@@ -402,4 +418,6 @@ export class DriverMatchingService {
 
         return priority;
     }
+
+
 }
