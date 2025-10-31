@@ -17,21 +17,23 @@ export class OfferManagementService {
             logger.info(` Sending Offer to Driver: ${driverId}`);
             try {
                 await this.sendSingleOffer(job, driverId);
-
                 successful++;
 
                 logger.info(`Offer Sent - JobId: ${job.id}, Driver: ${driverId}`);
                 const accepted = await this.waitForDriverResponseOrTimeout(job.id, driverId, this.OFFER_EXPIRY_SECONDS * 1000);
+
                 if (accepted) {
                     logger.info(` Driver ${driverId} accepted Job ${job.id}. Stopping offer cycle.`);
                     this.cancelOtherOffers(job.id, driverId).catch(err => {
                         logger.error(`Cancel Other Offers Error - JobId: ${job.id}, Error: ${err}`);
                     });
                     break;
+
                 } else {
                     logger.warn(` Driver ${driverId} did not respond in time for Job ${job.id}. Auto-rejecting.`);
                     await this.handleDriverRejection(job.id, driverId, 'Offer timed out');
                 }
+
                 // Small pause before next offer
                 await new Promise(res => setTimeout(res, 200));
             } catch (error: any) {
@@ -78,8 +80,6 @@ export class OfferManagementService {
         };
         const pipeline = redis.pipeline();
         pipeline.setex(offerKey, this.OFFER_EXPIRY_SECONDS, JSON.stringify(offerData));
-        pipeline.sadd(`driver:${driverId}:offers`, job.id);
-        pipeline.sadd(`job:${job.id}:pending_drivers`, driverId);
         await pipeline.exec();
         await this.publishAssignmentEventWithRetry(
             'new_job.offer_sent',
@@ -94,8 +94,7 @@ export class OfferManagementService {
         logger.info(`Finding Alternative Drivers - JobId: ${jobId}`);
 
         try {
-            const rejectedDrivers = await redis.smembers(`job:${jobId}:rejected_drivers`);
-            const availableDrivers = nearbyDrivers.filter(d => !rejectedDrivers.includes(d));
+            const availableDrivers = nearbyDrivers;
 
             logger.info(`Alternative Drivers Found - JobId: ${jobId}, Count: ${availableDrivers.length}`);
             return availableDrivers;

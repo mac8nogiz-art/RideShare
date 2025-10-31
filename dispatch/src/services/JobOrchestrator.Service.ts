@@ -141,30 +141,29 @@ export class JobOrchestratorService {
         this.metrics.rpcRequests++;
         try {
             let result;
-            if (
-                eventType.startsWith('newBookingPlaced') ||
-                eventType.startsWith('newJob.request') ||
-                eventType.startsWith('booking.created') ||
-                eventType.startsWith('ride.requested')
-            ) {
-                this.metrics.apiCalls.handlePaymentCompleted++;
-                result = await this.handleNewJobEvent(data, data.bookingId || null);
-            } else {
-                switch (eventType) {
-                    case 'driver.response':
-                        this.metrics.apiCalls.handleDriverResponse++;
-                        result = await this.handleDriverResponse(data);
-                        break;
 
-                    default:
-                        logger.warn(`Unknown RPC request type: ${eventType}`);
-                        return {
-                            success: false,
-                            error: 'Unknown request type',
-                            receivedType: eventType
-                        };
-                }
+            switch (true) {
+
+                case eventType.startsWith('newBookingPlaced'):
+                case eventType.startsWith('newJob.request'):
+                    this.metrics.apiCalls.handlePaymentCompleted++;
+                    result = await this.handleNewJobEvent(data, data.bookingId || null);
+                    break;
+
+                case eventType === 'driver.response':
+                    this.metrics.apiCalls.handleDriverResponse++;
+                    result = await this.handleDriverResponse(data);
+                    break;
+
+                default:
+                    logger.warn(`Unknown RPC request type: ${eventType}`);
+                    return {
+                        success: false,
+                        error: 'Unknown request type',
+                        receivedType: eventType
+                    };
             }
+
             logger.info(`RPC Request Completed - Type: ${eventType}, RequestId: ${requestId}, Success: ${result.success}`);
             return result;
         } catch (error: any) {
@@ -254,58 +253,45 @@ export class JobOrchestratorService {
 
     private async handleNewJobEvent(data: any, bookingId: string | null): Promise<any> {
         const startTime = Date.now();
-
-        if (!data?.payload) {
-            logger.error(' No payload in booking event');
-            return { success: false, error: 'No payload in booking event', receivedData: data };
-        }
-
         const payload = data.payload;
-        const jobId = bookingId || payload._id;
-
-        if (!jobId) {
-            logger.error(' No booking ID found in event type or payload');
-            return { success: false, error: 'Missing booking ID', eventType: data.type };
-        }
+        const jobId = payload._id;
 
         const pickupData = payload.tripAddress?.[0];
         const dropData = payload.tripAddress?.[payload.tripAddress.length - 1];
-
         const pickup = pickupData?.location
             ? { latitude: pickupData.location.latitude, longitude: pickupData.location.longitude }
             : null;
-
         const drop = dropData?.location
             ? { latitude: dropData.location.latitude, longitude: dropData.location.longitude }
             : null;
 
         if (!pickup) {
+
             logger.error(`Missing pickup coordinates for Job ${jobId}`);
-            return { success: false, error: "Pickup coordinates missing", jobId };
+            return { success: false, error: 'Pickup coordinates missing', jobId };
         }
 
         const customer = payload.customer;
-
         if (!customer?._id) {
-            logger.error(` Invalid customer data — Job ${jobId}`);
-            return { success: false, error: "Invalid customer data", jobId };
-        }
 
+            logger.error(`Invalid customer data — Job ${jobId}`);
+            return { success: false, error: 'Invalid customer data', jobId };
+        }
 
         const job: Job = {
             id: jobId,
-            customerId: payload.customer._id,
+            customerId: customer._id,
             pickupLat: pickup.latitude,
             pickupLng: pickup.longitude,
             fare: payload.grandTotal || 0,
             vehicleType: payload.selectedVehicle?.name || 'Unknown',
             tripAddress: payload.tripAddress || '',
             timestamp: payload.createdAt ? new Date(payload.createdAt).getTime() : Date.now(),
-
         };
 
         try {
-            if (drop) {   /// it can be drop just to process
+
+            if (drop) {
                 const eta = await this.mapboxService.getDistanceAndDuration(
                     pickup.latitude,
                     pickup.longitude,
@@ -317,80 +303,24 @@ export class JobOrchestratorService {
                 job.customer = {
                     time: eta.durationText,
                     distance: eta.distanceText,
-                    fullName: payload.customer.fullName || 'Unknown',
-                    avatar: payload.customer.avatar || '',
+                    fullName: customer.fullName || 'Unknown',
+                    avatar: customer.avatar || '',
                 };
 
-                logger.info(
-                    ` ETA Calculated for Job ${job.id} — ${eta.distanceText}, ${eta.durationText}`
-                );
+                logger.info(`ETA Calculated for Job ${job.id} — ${eta.distanceText}, ${eta.durationText}`);
             } else {
                 logger.warn(`Pickup or drop missing — Skipping ETA for Job ${job.id}`);
             }
-        } catch (error: any) {
-            logger.error(` Mapbox ETA fetch failed for Job ${job.id}: ${error.message}`);
-            job.rideDetails = { estimatedTime: "0 mins", estimatedDistance: "0 km" };
-        }
 
-        try {
             const matchedDrivers = await this.driverMatchingService.findBestDrivers(job, job.customerId);
             const searchTime = Date.now() - startTime;
 
             if (matchedDrivers.length > 0) {
-                const driversWithEta = await Promise.all(
-                    matchedDrivers.map(async (driverId) => {
-                        try {
-                            // we get drivers id only form
-                            const driverDataJson = await redis.call('JSON.GET', `driver:${driverId}`);
-                            if (!driverDataJson) {
-                                logger.warn(`Driver data not found in Redis in matched service part - ${driverId}`);
-                                return null;
-                            }
-
-                            const driverData = typeof driverDataJson === 'string'
-                                ? JSON.parse(driverDataJson)
-                                : driverDataJson;
-
-                            const lat = driverData?.location?.coordinates?.[1];
-                            const lng = driverData?.location?.coordinates?.[0];
-
-                            if (!lat || !lng) {
-                                logger.warn(`Invalid driver coordinates - ${driverId}`);
-                                return null;
-                            }
-
-                            // Get ETA from driver → pickup location
-                            const estimatedArrival = await this.mapboxService.getDistanceAndDuration(
-                                lat,
-                                lng,
-                                pickup.latitude,
-                                pickup.longitude
-                            );
-                            job.rideDetails = {
-                                estimatedTime: estimatedArrival.durationText,
-                                estimatedDistance: estimatedArrival.distanceText,
-                            };
-
-                            return {
-                                driverId,
-                                distanceToPickup: estimatedArrival.distanceText,
-                                etaToPickup: estimatedArrival.durationText,
-                            };
-                        } catch (error: any) {
-                            logger.error(`ETA calculation failed for driver ${driverId}: ${error.message}`);
-                            return null;
-                        }
-                    })
-                );
-
                 const offerResult = await this.offerManagementService.sendOffers(job, matchedDrivers);
-
-
                 this.metrics.driversMatched += matchedDrivers.length;
                 this.metrics.offersSent += offerResult.successful;
-
                 logger.info(
-                    `Job Matched - JobId: ${job.id}, Drivers: ${matchedDrivers.length}, Offers Sent: ${offerResult.successful}, Search Time: ${searchTime}ms`
+                    ` Job Matched - JobId: ${job.id}, Drivers: ${matchedDrivers.length}, Offers Sent: ${offerResult.successful}, Search Time: ${searchTime}ms`
                 );
 
                 return {
@@ -406,7 +336,8 @@ export class JobOrchestratorService {
                     timestamp: new Date().toISOString(),
                 };
             } else {
-                logger.warn(`No Drivers Found - JobId: ${job.id}`);
+
+                logger.warn(` No Drivers Found - JobId: ${job.id}`);
                 return {
                     success: false,
                     message: 'No drivers available',
@@ -419,6 +350,7 @@ export class JobOrchestratorService {
                 };
             }
         } catch (error: any) {
+
             this.metrics.errors++;
             const searchTime = Date.now() - startTime;
 
@@ -439,6 +371,7 @@ export class JobOrchestratorService {
             };
         }
     }
+
 
 }
 
