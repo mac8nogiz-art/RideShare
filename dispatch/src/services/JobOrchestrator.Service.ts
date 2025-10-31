@@ -7,6 +7,11 @@ import {DriverMatchingService} from './DriverMatching.Service';
 import {OfferManagementService} from './OfferManagement.Service';
 import {ZoneService} from './ZoneService';
 import {MapboxService} from './MapboxService'
+import {
+    newJobEventSchema,
+    driverResponseSchema,
+    validateSchema
+} from './validation';
 
 interface ParsedEventType {
     eventName: string;
@@ -141,33 +146,39 @@ export class JobOrchestratorService {
         const eventType = data.type;
         logger.info(`RPC Request Received - Type: ${eventType}, RequestId: ${requestId}`);
         this.metrics.rpcRequests++;
+
         try {
             let result;
 
-            switch (true) {
+            // Step 1: Validate the payload before any processing
+            if (eventType.startsWith('newBookingPlaced') || eventType.startsWith('newJob.request')) {
+                const validation = await validateSchema(newJobEventSchema, data);
+                if (!validation.valid) {
+                    logger.error(`Validation failed for new job event: ${validation.errors?.join(', ')}`);
+                    return { success: false, error: 'Validation failed', details: validation.errors };
+                }
+                this.metrics.apiCalls.handlePaymentCompleted++;
+                result = await this.handleNewJobEvent(validation.data, data.bookingId || null);
+            }
 
-                case eventType.startsWith('newBookingPlaced'):
-                case eventType.startsWith('newJob.request'):
-                    this.metrics.apiCalls.handlePaymentCompleted++;
-                    result = await this.handleNewJobEvent(data, data.bookingId || null);
-                    break;
+            else if (eventType === 'driver.response') {
+                const validation = await validateSchema(driverResponseSchema, data);
+                if (!validation.valid) {
+                    logger.error(`Validation failed for driver response: ${validation.errors?.join(', ')}`);
+                    return { success: false, error: 'Validation failed', details: validation.errors };
+                }
+                this.metrics.apiCalls.handleDriverResponse++;
+                result = await this.handleDriverResponse(validation.data);
+            }
 
-                case eventType === 'driver.response':
-                    this.metrics.apiCalls.handleDriverResponse++;
-                    result = await this.handleDriverResponse(data);
-                    break;
-
-                default:
-                    logger.warn(`Unknown RPC request type: ${eventType}`);
-                    return {
-                        success: false,
-                        error: 'Unknown request type',
-                        receivedType: eventType
-                    };
+            else {
+                logger.warn(`Unknown RPC request type: ${eventType}`);
+                return { success: false, error: 'Unknown request type', receivedType: eventType };
             }
 
             logger.info(`RPC Request Completed - Type: ${eventType}, RequestId: ${requestId}, Success: ${result.success}`);
             return result;
+
         } catch (error: any) {
             this.metrics.errors++;
             logger.error(`RPC Request Failed - Type: ${eventType}, RequestId: ${requestId}, Error: ${error.message}`);
@@ -179,7 +190,6 @@ export class JobOrchestratorService {
             };
         }
     }
-
 
     // ----------------- Driver Response Handler -----------------
 
