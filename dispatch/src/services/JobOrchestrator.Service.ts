@@ -70,6 +70,8 @@ export class JobOrchestratorService {
 
             if (!this.zoneService.isReady || !(await this.zoneService.isReady())) {
                 logger.info('Initializing ZoneService...');
+
+
                 await this.zoneService.init();
                 logger.info('ZoneService initialized');
             } else {

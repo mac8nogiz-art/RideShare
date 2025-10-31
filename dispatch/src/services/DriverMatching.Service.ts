@@ -13,7 +13,7 @@ export class DriverMatchingService {
     private readonly MATCHED_DRIVERS_TTL = 900; // 15 min
     private mongoClient: MongoClient;
 
-    constructor(driverLocationService: DriverLocationService, zoneService: ZoneService, mongoClient: MongoClient) {
+    constructor(driverLocationService: DriverLocationService, zoneService: ZoneService) {
         this.driverLocationService = driverLocationService;
         this.zoneService = zoneService;
         this.spatialService = new SpatialService();
