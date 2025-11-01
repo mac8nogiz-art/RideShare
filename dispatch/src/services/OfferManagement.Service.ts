@@ -94,7 +94,8 @@ export class OfferManagementService {
         logger.info(`Finding Alternative Drivers - JobId: ${jobId}`);
 
         try {
-            const availableDrivers = nearbyDrivers;
+            const rejectedDrivers = await redis.smembers(`job:${jobId}:rejected_drivers`);
+            const availableDrivers = nearbyDrivers.filter(d => !rejectedDrivers.includes(d));
 
             logger.info(`Alternative Drivers Found - JobId: ${jobId}, Count: ${availableDrivers.length}`);
             return availableDrivers;
@@ -137,9 +138,9 @@ export class OfferManagementService {
             status: 'accepted',
             assignedAt: new Date().toISOString()
         });
-        pipeline.hset(`driver:${driverId}:profile`, 'isBusy', 'true');
-        pipeline.del(`offer:${jobId}:${driverId}`);
-        pipeline.srem(`driver:${driverId}:offers`, jobId);
+        // pipeline.hset(`driver:${driverId}:profile`, 'isBusy', 'true');
+        // pipeline.del(`offer:${jobId}:${driverId}`);
+        // pipeline.srem(`driver:${driverId}:offers`, jobId);
 
         await pipeline.exec();
 

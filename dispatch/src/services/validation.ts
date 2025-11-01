@@ -1,6 +1,6 @@
 import { t } from "elysia";
+import { Value } from "@sinclair/typebox/value";
 
-// ============= LOCATION SCHEMA =============
 export const locationSchema = t.Object({
     latitude: t.Number({
         minimum: -90,
@@ -16,7 +16,6 @@ export const locationSchema = t.Object({
     })
 });
 
-// ============= TRIP ADDRESS SCHEMA =============
 export const tripAddressSchema = t.Object({
     markerType: t.String({ error: "Marker type is required" }),
     title: t.String({ error: "Title is required" }),
@@ -24,19 +23,17 @@ export const tripAddressSchema = t.Object({
     location: locationSchema
 });
 
-// ============= CUSTOMER SCHEMA =============
 export const customerSchema = t.Object({
     _id: t.String({ error: "Customer ID is required" }),
     fullName: t.Optional(t.String()),
     avatar: t.Optional(t.String())
 });
 
-// ============= VEHICLE SCHEMA =============
+
 export const selectedVehicleSchema = t.Object({
     name: t.String({ error: "Vehicle name is required" })
 });
 
-// ============= JOB PAYLOAD SCHEMA =============
 export const jobPayloadSchema = t.Object({
     _id: t.String({ error: "Job ID is required" }),
     customer: customerSchema,
@@ -53,14 +50,14 @@ export const jobPayloadSchema = t.Object({
     createdAt: t.Optional(t.String())
 });
 
-// ============= NEW JOB EVENT SCHEMA =============
+
 export const newJobEventSchema = t.Object({
     type: t.String({ error: "Event type is required" }),
     payload: jobPayloadSchema,
     bookingId: t.Optional(t.Nullable(t.String()))
 });
 
-// ============= DRIVER RESPONSE SCHEMA =============
+
 export const driverResponseSchema = t.Object({
     driverId: t.String({ error: "Driver ID is required" }),
     jobId: t.String({ error: "Job ID is required" }),
@@ -71,27 +68,57 @@ export const driverResponseSchema = t.Object({
     reason: t.Optional(t.String())
 });
 
-// ============= VALIDATION RESULT INTERFACE =============
+
 export interface ValidationResult {
     valid: boolean;
     data?: any;
     errors?: string[];
 }
 
-// ============= VALIDATION HELPER FUNCTION =============
-export function validateSchema(schema: any, data: any): ValidationResult {
-    const result = schema.safeParse(data);
 
-    if (result.success) {
+export function validateSchema(schema: any, data: any): ValidationResult {
+
+    if (data === null || data === undefined) {
         return {
-            valid: true,
-            data: result.data
+            valid: false,
+            errors: ["Data is null or undefined"]
         };
     }
 
-    const errors = result.error?.issues?.map((i: any) => i.message) || ["Unknown validation error"];
-    return {
-        valid: false,
-        errors
-    };
+
+    if (typeof data !== 'object') {
+        return {
+            valid: false,
+            errors: [`Data must be an object, got ${typeof data}`]
+        };
+    }
+
+    try {
+
+        const valid = Value.Check(schema, data);
+
+        if (valid) {
+            return {
+                valid: true,
+                data
+            };
+        }
+
+
+        const errors = [...Value.Errors(schema, data)].map((error: any) => {
+            const path = error.path || '/';
+            return `${path}: ${error.message}`;
+        });
+
+        return {
+            valid: false,
+            errors: errors.length ? errors : ["Unknown validation error"]
+        };
+    } catch (error: any) {
+        return {
+            valid: false,
+            errors: [`Validation exception: ${error.message}`]
+        };
+    }
 }
+

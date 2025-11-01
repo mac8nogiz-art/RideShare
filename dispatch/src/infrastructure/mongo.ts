@@ -1,40 +1,90 @@
-import { MongoClient, Db } from "mongodb";
-import logger from "../logger";
+import mongoose from "mongoose";
+import { logger } from "../logger";
 
-let client: MongoClient;
-let db: Db;
+let isConnected = false;
 
-
-export async function connectMongo(): Promise<Db> {
-    if (db) return db;
+export async function connectMongo(): Promise<typeof mongoose> {
+    if (isConnected) {
+        logger.info("MongoDB already connected - reusing connection");
+        return mongoose;
+    }
 
     const uri = process.env.MONGO_URI;
-    if (!uri) throw new Error("MONGO_URI is not defined in environment variables");
+    if (!uri) {
+        throw new Error("MONGO_URI is not defined in environment variables");
+    }
 
     try {
-        client = new MongoClient(uri);
-        await client.connect();
+        await mongoose.connect(uri, {
 
-        const dbName = uri.split("/").pop()?.split("?")[0];
-        if (!dbName) throw new Error("Cannot parse database name from MONGO_URI");
+            maxPoolSize: 10,
+            serverSelectionTimeoutMS: 5000,
+            socketTimeoutMS: 45000,
+        });
 
-        db = client.db(dbName);
-        logger.info(`Connected to MongoDB database: ${dbName}`);
-        return db;
+        isConnected = true;
+
+        const dbName = mongoose.connection.db?.databaseName || 'unknown';
+        logger.info(`✅Connected to MongoDB database: ${dbName}`);
+
+        // Handle connection events
+        mongoose.connection.on('error', (err) => {
+            logger.error('MongoDB connection error:', err);
+            isConnected = false;
+        });
+
+        mongoose.connection.on('disconnected', () => {
+            logger.warn('MongoDB disconnected');
+            isConnected = false;
+        });
+
+        mongoose.connection.on('reconnected', () => {
+            logger.info('MongoDB reconnected');
+            isConnected = true;
+        });
+
+        return mongoose;
     } catch (error: any) {
         logger.error("Failed to connect to MongoDB:", error);
+        isConnected = false;
         throw error;
     }
 }
 
-export function getMongoDB(): Db {
-    if (!db) throw new Error("MongoDB not connected. Call connectMongo first.");
-    return db;
+export function getMongoose(): typeof mongoose {
+    if (!isConnected || !mongoose.connection.readyState) {
+        throw new Error("MongoDB not connected. Call connectMongo first.");
+    }
+    return mongoose;
+}
+
+export function getMongoDB() {
+    if (!isConnected || !mongoose.connection.db) {
+        throw new Error("MongoDB not connected. Call connectMongo first.");
+    }
+    return mongoose.connection.db;
+}
+
+export function getMongoClient() {
+    if (!isConnected || !mongoose.connection.getClient()) {
+        throw new Error("MongoDB not connected. Call connectMongo first.");
+    }
+    return mongoose.connection.getClient();
 }
 
 export async function closeMongo(): Promise<void> {
-    if (client) {
-        await client.close();
+    if (isConnected) {
+        await mongoose.connection.close();
+        isConnected = false;
         logger.info("MongoDB connection closed");
     }
 }
+
+// Check if connected
+export function isMongoConnected(): boolean {
+    return isConnected && mongoose.connection.readyState === 1;
+}
+
+// Export mongoose instance directly
+export { mongoose };
+export default mongoose;

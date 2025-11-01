@@ -4,20 +4,19 @@ import {DriverWithDistance, Job} from '../types';
 import {DriverLocationService} from './DriverLocation.Service';
 import {ZoneService} from './ZoneService';
 import {SpatialService} from '../infrastructure/spatial';
-import {MongoClient, ObjectId} from 'mongodb';
+import {ObjectId} from 'mongodb';
+import {connectMongo, getMongoDB} from "../infrastructure/mongo";
 
 export class DriverMatchingService {
     private driverLocationService: DriverLocationService;
     private zoneService: ZoneService;
     private spatialService: SpatialService;
     private readonly MATCHED_DRIVERS_TTL = 900; // 15 min
-    private mongoClient: MongoClient;
 
     constructor(driverLocationService: DriverLocationService, zoneService: ZoneService) {
         this.driverLocationService = driverLocationService;
         this.zoneService = zoneService;
         this.spatialService = new SpatialService();
-        this.mongoClient = mongoClient;
     }
 
     async findBestDrivers(job: Job, customerId: string): Promise<string[]> {
@@ -175,22 +174,28 @@ export class DriverMatchingService {
         blockedSet: Set<string>;
     }> {
         try {
-            const db = this.mongoClient.db('ridesharing_test');
+
+            const db = getMongoDB();
+
             const cursor = db.collection('users').find(
                 { _id: new ObjectId(customerId) },
                 { projection: { favDriver: 1, blockedDrivers: 1 } }
             );
             const users = await cursor.toArray();
             const user = users[0];
-            const favorites = Array.isArray(user?.favdriver)
-                ? user.favdriver.map(String)
+
+
+            const favorites = Array.isArray(user?.favDriver)
+                ? user.favDriver.map(String)
                 : [];
             const blocked = Array.isArray(user?.blockedDrivers)
                 ? user.blockedDrivers.map(String)
                 : [];
+
             logger.info(
                 `Fetched favorites(${favorites.length}) & blocked(${blocked.length}) for customer ${customerId}`
             );
+
             return {
                 favoriteSet: new Set(favorites),
                 blockedSet: new Set(blocked)
@@ -230,8 +235,3 @@ export class DriverMatchingService {
         return Math.max(0, Math.round(priority));
     }
 }
-
-
-
-
-

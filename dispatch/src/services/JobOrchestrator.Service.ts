@@ -13,12 +13,6 @@ import {
     validateSchema
 } from './validation';
 
-interface ParsedEventType {
-    eventName: string;
-    bookingId: string | null;
-    isBookingEvent: boolean;
-}
-
 export class JobOrchestratorService {
     private driverLocationService: DriverLocationService;
     private jobProcessingService: JobProcessingService;
@@ -328,6 +322,53 @@ export class JobOrchestratorService {
             const searchTime = Date.now() - startTime;
 
             if (matchedDrivers.length > 0) {
+
+                const driversWithEta = await Promise.all(
+                    matchedDrivers.map(async (driverId) => {
+                        try {
+                            // we get drivers id only form
+                            const driverDataJson = await redis.call('JSON.GET', `driver:${driverId}`);
+                            if (!driverDataJson) {
+                                logger.warn(`Driver data not found in Redis in matched service part - ${driverId}`);
+                                return null;
+                            }
+
+                            const driverData = typeof driverDataJson === 'string'
+                                ? JSON.parse(driverDataJson)
+                                : driverDataJson;
+
+                            const lat = driverData?.location?.coordinates?.[1];
+                            const lng = driverData?.location?.coordinates?.[0];
+
+                            if (!lat || !lng) {
+                                logger.warn(`Invalid driver coordinates - ${driverId}`);
+                                return null;
+                            }
+
+                            // Get ETA from driver → pickup location
+                            const estimatedArrival = await this.mapboxService.getDistanceAndDuration(
+                                lat,
+                                lng,
+                                pickup.latitude,
+                                pickup.longitude
+                            );
+                            job.rideDetails = {
+                                estimatedTime: estimatedArrival.durationText,
+                                estimatedDistance: estimatedArrival.distanceText,
+                            };
+
+                            return {
+                                driverId,
+                                distanceToPickup: estimatedArrival.distanceText,
+                                etaToPickup: estimatedArrival.durationText,
+                            };
+                        } catch (error: any) {
+                            logger.error(`ETA calculation failed for driver ${driverId}: ${error.message}`);
+                            return null;
+                        }
+                    })
+                );
+
                 const offerResult = await this.offerManagementService.sendOffers(job, matchedDrivers);
                 this.metrics.driversMatched += matchedDrivers.length;
                 this.metrics.offersSent += offerResult.successful;
