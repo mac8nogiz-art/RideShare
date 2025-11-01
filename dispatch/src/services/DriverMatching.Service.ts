@@ -5,7 +5,7 @@ import {DriverLocationService} from './DriverLocation.Service';
 import {ZoneService} from './ZoneService';
 import {SpatialService} from '../infrastructure/spatial';
 import {ObjectId} from 'mongodb';
-import {connectMongo, getMongoDB} from "../infrastructure/mongo";
+import {getMongoDB} from "../infrastructure/mongo";
 
 export class DriverMatchingService {
     private driverLocationService: DriverLocationService;
@@ -23,149 +23,137 @@ export class DriverMatchingService {
         const startTime = Date.now();
 
         try {
-            const zone = await this.zoneService.getZoneForJob(job);
-            if (!zone) {
+            const [zoneIds, {favoriteSet, blockedSet}] = await Promise.all([
+                this.zoneService.getZoneForJob(job),
+                this.getCustomerFavoritesAndBlocked(customerId)
+            ]);
+
+            if (!zoneIds || zoneIds.length === 0) {
                 logger.warn(`No zone found for job ${job.id} at ${job.pickupLat}, ${job.pickupLng}`);
                 return [];
             }
 
-            logger.info(`Job ${job.id} in zone ${zone.name} (${zone._id})`);
-
-            const allMatchedDrivers = new Map<string, DriverWithDistance>();
-
-            //  Get favorites & blocked drivers from MongoDB
-            const {favoriteSet, blockedSet} = await this.getCustomerFavoritesAndBlocked(customerId);
+            logger.info(`Looking for drivers approved for zones: ${zoneIds.join(', ')}`);
 
             const radiusSteps = [3, 6, 9, 12, 15];
             let bestMatches: string[] = [];
 
             for (const radius of radiusSteps) {
-                const drivers = await this.getNearbyDriversInZone(job.pickupLat, job.pickupLng, zone._id, radius);
+                const drivers = await this.getNearbyDriversInZone(job.pickupLat, job.pickupLng, zoneIds, radius);
+                logger.info(`Found ${drivers.length} drivers within ${radius}km`);
 
-                // Skip blocked drivers immediately
                 const eligibleDrivers = drivers.filter(d => !blockedSet.has(d.driverId));
 
-                for (const driver of eligibleDrivers) {
-                    if (!allMatchedDrivers.has(driver.driverId)) {
-                        allMatchedDrivers.set(driver.driverId, driver);
-                    }
-                }
+                if (eligibleDrivers.length > 0) {
+                    const categorizedDrivers = await this.processBestDrivers(eligibleDrivers, favoriteSet);
 
-                if (allMatchedDrivers.size > 0) {
-                    bestMatches = this.processBestDrivers(Array.from(allMatchedDrivers.values()), favoriteSet);
+                    // Flatten categorized drivers into priority order
+                    bestMatches = [
+                        ...categorizedDrivers.favDriver,
+                        ...categorizedDrivers.priorityDrivers,
+                        ...categorizedDrivers.newDrivers,
+                        ...categorizedDrivers.nonPriorityDrivers,
+                        ...categorizedDrivers.remainingDrivers,
+                        ...categorizedDrivers.busyDrivers
+                    ];
 
                     logger.info(`Matched ${bestMatches.length} driver(s) at ${radius}km in ${Date.now() - startTime}ms`);
 
-                    // Save ranked drivers in Redis
+                    // Fetch priority scores and store
                     const rankingKey = `job:${job.id}:matched_drivers`;
+                    const driverKeys = bestMatches.map(id => id);
+                    const priorityScores: any = await redis.call('JSON.MGET', ...driverKeys, '$.priorityScore');
+                    console.log("priorityScores----->", priorityScores);
+
                     const pipeline = redis.pipeline();
 
-                    bestMatches.forEach((driverId) => {
-                        const driverData = allMatchedDrivers.get(driverId);
-                        const score = driverData?.score || 0;
+                    for (let i = 0; i < bestMatches.length; i++) {
+                        const driverId = bestMatches[i];
+                        let score = -1; // Default lowest priority
+
+                        if (favoriteSet.has(driverId)) {
+                            score = 10000; // Favorites
+                        } else if (priorityScores[i]) {
+                            const parsed = JSON.parse(priorityScores[i])?.[0];
+                            score = parsed !== undefined && parsed !== null ? parsed : -1;
+                        }
+
                         pipeline.zadd(rankingKey, score, driverId);
-                    });
+                    }
 
                     pipeline.expire(rankingKey, this.MATCHED_DRIVERS_TTL);
                     await pipeline.exec();
 
                     logger.info(`Saved ${bestMatches.length} matched drivers for job ${job.id}`);
-                    break; // stop after first successful radius
+                    break;
                 }
             }
 
             logger.info(`Finished driver matching for job ${job.id} in ${Date.now() - startTime}ms`);
             return bestMatches;
-        } catch (error) {
-            logger.error(`Driver matching failed for job ${job.id}: ${error}`);
+        } catch (error: any) {
+            logger.error(`Driver matching failed for job ${job.id}: ${error.message}`);
+            logger.error(`Stack: ${error.stack}`);
             return [];
         }
     }
 
-
-    private async getNearbyDriversInZone(jobLat: number, jobLng: number, zoneId: string, radiusKm: number): Promise<DriverWithDistance[]> {
-        const nearbyDrivers: DriverWithDistance[] = [];
-
+    private async getNearbyDriversInZone(
+        jobLat: number,
+        jobLng: number,
+        jobZoneIds: string[],
+        radiusKm: number
+    ): Promise<DriverWithDistance[]> {
         try {
-            const result = (await redis.geosearch('drivers:locations', 'FROMLONLAT', jobLng, jobLat, 'BYRADIUS', radiusKm, 'km', 'WITHDIST', 'ASC')) as any;
+            const result = (await redis.geosearch(
+                'drivers:locations',
+                'FROMLONLAT',
+                jobLng,
+                jobLat,
+                'BYRADIUS',
+                radiusKm,
+                'km',
+                'WITHDIST',
+                'ASC'
+            )) as any;
 
-            if (!result || result.length === 0) return nearbyDrivers;
+            const driverIds = result.map((item: any) => `driver:${item[0]}`);
+            const distances = result.map((item: any) => parseFloat(item[1]));
 
-            const driverIds: string[] = [];
-            const distances: number[] = [];
-            const isNestedArray = Array.isArray(result[0]);
+            const jsonStrings: any = await redis.call('JSON.MGET', ...driverIds, "$");
 
-            if (isNestedArray) {
-                result.forEach((item: any) => {
-                    if (Array.isArray(item) && item.length >= 2) {
-                        const driverId = item[0];
-                        const distance = parseFloat(item[1]);
-                        if (driverId && !isNaN(distance) && distance <= radiusKm) {
-                            driverIds.push(driverId);
-                            distances.push(distance);
-                        }
+            const afterParse = jsonStrings
+                ?.map((item: any, i: number) => {
+                    const driverData = JSON.parse(item)?.[0];
+
+                    const driverApprovedZones = Array.isArray(driverData.approved_zone)
+                        ? driverData.approved_zone.map(String)
+                        : [];
+
+                    if (driverApprovedZones.length > 0 && !jobZoneIds.some(zoneId => driverApprovedZones.includes(zoneId))) {
+                        return null;
                     }
-                });
-            } else {
-                for (let i = 0; i < result.length; i += 2) {
-                    const driverId = result[i];
-                    const distance = parseFloat(result[i + 1]);
-                    if (driverId && !isNaN(distance) && distance <= radiusKm) {
-                        driverIds.push(driverId);
-                        distances.push(distance);
-                    }
-                }
-            }
 
-            const pipeline = redis.pipeline();
-            driverIds.forEach((driverId) => pipeline.call('JSON.GET', `driver:${driverId}`));
-            const results = await pipeline.exec();
+                    const [lng, lat] = driverData.location?.coordinates || [];
 
-            // Ensure we always have an array, even if null is returned
-            if (!results || !Array.isArray(results)) {
-                logger.warn('Redis pipeline returned null or invalid result');
-                return nearbyDrivers;
-            }
-
-            for (let i = 0; i < driverIds.length; i++) {
-                const driverId = driverIds[i];
-                const distance = distances[i];
-                const driverJson = results[i][1];
-
-                if (!driverJson) continue;
-
-                try {
-                    const driverData = typeof driverJson === 'string' ? JSON.parse(driverJson) : driverJson;
-                    const coordinates = driverData.location?.coordinates || [];
-                    if (!coordinates.length) continue;
-
-                    const [lng, lat] = coordinates;
-                    const isBusy = driverData.iAmBusy === true;
-                    const score = parseInt(driverData.score || '50');
-                    const approvedZones = Array.isArray(driverData.approved_zone) ? driverData.approved_zone : [];
-
-                    if (approvedZones.length && !approvedZones.includes(zoneId)) continue;
-
-                    nearbyDrivers.push({
-                        driverId,
+                    return {
+                        driverId: driverIds[i],
                         lat,
                         lng,
-                        score,
-                        isBusy,
-                        isNew: false,
-                        lastUpdate: Date.now(),
-                        approvedZones,
-                        distance,
-                        priority: 0
-                    });
-                } catch (err) {
-                    logger.error(`${driverId}: JSON parse error - ${err}`);
-                }
-            }
-            return nearbyDrivers;
-        } catch (error) {
-            logger.error(`GEOSEARCH failed - Radius: ${radiusKm}km, Error: ${error}`);
-            return nearbyDrivers;
+                        score: parseInt(driverData.score || '50'),
+                        iAmBusy: driverData.iAmBusy,
+                        isNew: driverData.isNew || false,
+                        distance: distances[i],
+                        priorityScore: driverData.priorityScore
+                    };
+                })
+                .filter((item: any) => item !== null);
+
+            logger.debug(`Filtered to ${afterParse.length} eligible drivers`);
+            return afterParse;
+        } catch (error: any) {
+            logger.error(`GEOSEARCH failed - Radius: ${radiusKm}km, Error: ${error.message}`);
+            return [];
         }
     }
 
@@ -174,64 +162,80 @@ export class DriverMatchingService {
         blockedSet: Set<string>;
     }> {
         try {
-
             const db = getMongoDB();
 
-            const cursor = db.collection('users').find(
-                { _id: new ObjectId(customerId) },
-                { projection: { favDriver: 1, blockedDrivers: 1 } }
-            );
+            const cursor = db.collection('users').find({_id: new ObjectId(customerId)}, {
+                projection: {
+                    favDrivers: 1,
+                    blockDrivers: 1
+                }
+            });
             const users = await cursor.toArray();
+
+            if (!users || users.length === 0) {
+                logger.warn(`Customer ${customerId} not found in database`);
+                return {favoriteSet: new Set(), blockedSet: new Set()};
+            }
+
             const user = users[0];
+            const favorites = Array.isArray(user?.favDrivers) ? user.favDrivers.map(String) : [];
+            const blocked = Array.isArray(user?.blockDrivers) ? user.blockDrivers.map(String) : [];
 
-
-            const favorites = Array.isArray(user?.favDriver)
-                ? user.favDriver.map(String)
-                : [];
-            const blocked = Array.isArray(user?.blockedDrivers)
-                ? user.blockedDrivers.map(String)
-                : [];
-
-            logger.info(
-                `Fetched favorites(${favorites.length}) & blocked(${blocked.length}) for customer ${customerId}`
-            );
+            logger.info(`Fetched favorites(${favorites.length}) & blocked(${blocked.length}) for customer ${customerId}`);
 
             return {
                 favoriteSet: new Set(favorites),
                 blockedSet: new Set(blocked)
             };
-        } catch (error) {
-            logger.error(
-                `MongoDB fetch failed for favorites/blocked - Customer: ${customerId}, Error: ${error}`
-            );
-            return { favoriteSet: new Set(), blockedSet: new Set() };
+        } catch (error: any) {
+            logger.error(`MongoDB fetch failed for favorites/blocked - Customer: ${customerId}, Error: ${error.message}`);
+            return {favoriteSet: new Set(), blockedSet: new Set()};
         }
     }
 
-    private processBestDrivers(drivers: DriverWithDistance[], favoriteSet: Set<string>): string[] {
-        return drivers
-            .map((driver) => ({
-                driverId: driver.driverId,
-                priority: this.calculateDriverPriority(driver, favoriteSet.has(driver.driverId)),
-                distance: driver.distance
-            }))
-            .filter((d) => d.priority > 0)
-            .sort((a, b) => (b.priority !== a.priority ? b.priority - a.priority : a.distance - b.distance))
-            .map((d) => d.driverId);
-    }
+    private async processBestDrivers(drivers: DriverWithDistance[], favoriteSet: Set<string>): Promise<{
+        favDriver: string[];
+        priorityDrivers: string[];
+        newDrivers: string[];
+        nonPriorityDrivers: string[];
+        remainingDrivers: string[];
+        busyDrivers: string[];
+    }> {
+        const favDriver: any[] = [];
+        const priorityDrivers: any[] = [];
+        const newDrivers: any[] = [];
+        const nonPriorityDrivers: any[] = [];
+        const remainingDrivers: any[] = [];
+        const busyDrivers: any[] = [];
 
+        for (const d of drivers) {
+            const obj = {id: d.driverId, dist: d.distance};
 
-    private calculateDriverPriority(driver: DriverWithDistance, isFavorite: boolean): number {
-        const {distance, score, isNew, isBusy} = driver;
-        let priority = 0;
+            if (favoriteSet.has(d.driverId)) {
+                favDriver.push(obj);
+            } else if (d.score >= 80 && d.score <= 100) {
+                priorityDrivers.push(obj);
+            } else if (d.isNew) {
+                newDrivers.push(obj);
+            } else if (d.score >= 60 && d.score < 80) {
+                nonPriorityDrivers.push(obj);
+            } else if (d.iAmBusy) {
+                busyDrivers.push(obj);
+            } else {
+                remainingDrivers.push(obj);
+            }
+        }
 
-        priority += Math.max(0, 15 - distance) * 30;
-        priority += score * 5;
-        if (isFavorite) priority += 300;
-        if (isNew && distance <= 3) priority += 150;
-        if (isBusy) priority -= 200;
-        if (distance > 3) priority -= Math.min(300, (distance - 3) * 20);
+        // Sort each category by distance
+        const sortByDist = (arr: any[]) => arr.sort((a, b) => a.dist - b.dist).map(x => x.id);
 
-        return Math.max(0, Math.round(priority));
+        return {
+            favDriver: sortByDist(favDriver),
+            priorityDrivers: sortByDist(priorityDrivers),
+            newDrivers: sortByDist(newDrivers),
+            nonPriorityDrivers: sortByDist(nonPriorityDrivers),
+            remainingDrivers: sortByDist(remainingDrivers),
+            busyDrivers: sortByDist(busyDrivers)
+        };
     }
 }

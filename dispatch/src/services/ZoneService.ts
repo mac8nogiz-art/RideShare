@@ -46,46 +46,38 @@ export class ZoneService {
      * @param job - The job/booking request with pickup coordinates
      * @returns Zone object or null if no zones configured
      */
-    public async getZoneForJob(job: Job): Promise<Zone | null> {
+    public async getZoneForJob(job: Job): Promise<string[]> {
         logger.info(`Finding zone for pickup location: [${job.pickupLat}, ${job.pickupLng}]`);
 
         try {
             this.ensureInitialized();
 
-            const cursor = this.db!
-                .collection<Zone>('geoareas')
-                .find({
-                    status: true,
-                    location: {
-                        $geoIntersects: {
-                            $geometry: {
-                                type: "Point",
-                                coordinates: [job.pickupLng, job.pickupLat]
+            const cursor = await this.db!
+                .collection('geoareas')
+                .find(
+                    {
+                        status: true,
+                        location: {
+                            $geoIntersects: {
+                                $geometry: {
+                                    type: "Point",
+                                    coordinates: [job.pickupLng, job.pickupLat]
+                                }
                             }
                         }
+                    },
+                    {
+                        projection: { _id: 1 }
                     }
-                })
+                ).toArray();
 
-
-            const zones = await cursor.toArray();
-
-            if (!zones || zones.length === 0) {
-                logger.warn(`No zone found for job ${job.id} at ${job.pickupLat}, ${job.pickupLng}`);
-                return null;
-            }
-
-            // You can add selection logic here if multiple zones overlap
-            const selectedZone = zones[0];
-
-            logger.info(`Pickup location is in zone: "${selectedZone.name}" (${selectedZone._id})`);
-            return selectedZone;
-
+            return cursor?.map(z => z._id.toString()) || [];
         } catch (error: any) {
             logger.error(`Error finding zone for job ${job.id}: ${error.message}`);
             if (error.message.includes('not initialized')) {
                 logger.error('ZoneService was called before initialization!');
             }
-            return null;
+            return [];
         }
     }
 
