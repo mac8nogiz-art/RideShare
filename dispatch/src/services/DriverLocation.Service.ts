@@ -105,7 +105,7 @@ export class DriverLocationService {
                         driverId,
                         lat,
                         lng,
-                        score: driverData.score || 50,
+                        priorityScore: driverData.score || 50,
                         isBusy: driverData.iAmBusy || false,
                         isNew: false,
                         lastUpdate: Date.now(),

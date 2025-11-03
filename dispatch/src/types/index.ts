@@ -16,7 +16,7 @@ export interface Driver {
     driverId: string;
     lat: number;
     lng: number;
-    score: number;
+    priorityScore: number;
     isFavorite?: boolean;
     isBusy: boolean;
     isNew: boolean;

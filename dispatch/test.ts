@@ -8,10 +8,7 @@ const TOPIC_NAME = 'newJob.request';
 const kafka = new Kafka({
     clientId: 'booking-test-producer',
     brokers: [KAFKA_BROKER],
-    retry: {
-        initialRetryTime: 100,
-        retries: 8
-    }
+
 });
 
 // Create producer
@@ -21,7 +18,7 @@ const producer = kafka.producer();
 const eventPayload = {
     "type": "newBookingPlaced",
     "payload": {
-        "_id": "6900561da9ea6f1305d29aba",
+        "_id": "6900561da9ea6f1301d29aba",
         "orderNo": "17616297252927556",
         "serviceType": "rideBooking",
         "estimatedDirection": "",

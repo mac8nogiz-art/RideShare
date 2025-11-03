@@ -29,8 +29,8 @@ export const producer: Producer = kafka.producer({
 
 export const consumer: Consumer = kafka.consumer({
     groupId: `${process.env.SERVICE_NAME}-group`,
-    sessionTimeout: 30000,
-    heartbeatInterval: 10000,
+    sessionTimeout: 60000,
+    heartbeatInterval: 3000,
     retry: {
         initialRetryTime: 100,
         retries: 5

@@ -1,7 +1,8 @@
-import { redis } from '../infrastructure/redis';
+// import { redis } from '../infrastructure/redis';
 import { logger } from '../logger';
 import { Job } from '../types';
 import { producer, isKafkaConnected, checkProducerHealth, reconnectKafka } from '../infrastructure/kafka';
+import { redis, redisSubscriber } from '../infrastructure/redis';
 
 export class OfferManagementService {
     private readonly OFFER_EXPIRY_SECONDS = 15;
@@ -57,10 +58,15 @@ export class OfferManagementService {
         const expiryTime = this.OFFER_EXPIRY_SECONDS + Math.floor(Math.random() * 3);
         const expiresAt = expiryTime;
 
+        const driverObjectId = driverId.startsWith('driver:')
+            ? driverId.split(':')[1]
+            : driverId;
+        console.log(job.rideDetails,"----------->")
+
         const offerKey = `offer:${job.id}:${driverId}`;
         const offerData = {
             id: job.id,
-            driverId,
+            driverId:driverObjectId,
             customerId: job.customerId,
             pickupLat: job.pickupLat,
             pickupLng: job.pickupLng,
@@ -106,27 +112,36 @@ export class OfferManagementService {
     }
 
     private async waitForDriverResponseOrTimeout(jobId: string, driverId: string, timeoutMs: number): Promise<boolean> {
-        const intervalMs = 1000;
-        const start = Date.now();
+        return new Promise(async (resolve) => {
+            const channel = `driver_response:${jobId}:${driverId}`;
 
-        while (Date.now() - start < timeoutMs) {
-            try {
-                const [assignedDriver, status, existsOffer] = await Promise.all([
-                    redis.hget(`job:${jobId}`, 'assignedDriver'),
-                    redis.hget(`job:${jobId}`, 'status'),
-                    redis.exists(`offer:${jobId}:${driverId}`)
-                ]);
+            const onMessage = (channelName: string, message: string) => {
+                if (channelName === channel) {
+                    try {
+                        const data = JSON.parse(message);
+                        redisSubscriber.off("message", onMessage); // remove listener
+                        redisSubscriber.unsubscribe(channel);      // stop listening to this channel
+                        clearTimeout(timeoutId);
+                        resolve(data.type === "offer_accepted");
+                    } catch {
+                        resolve(false);
+                    }
+                }
+            };
 
-                if (assignedDriver === driverId || status === 'accepted') return true;
-                if (!existsOffer) return false;
+            // attach event listener before subscribing
+            redisSubscriber.on("message", onMessage);
 
-            } catch (err: any) {
-                logger.error(`Error while waiting for driver response - Job: ${jobId}, Driver: ${driverId}: ${err?.message || err}`);
-            }
-            await new Promise(res => setTimeout(res, intervalMs));
-        }
+            // subscribe to the Redis channel
+            await redisSubscriber.subscribe(channel);
 
-        return false;
+            // timeout fallback
+            const timeoutId = setTimeout(() => {
+                redisSubscriber.off("message", onMessage);
+                redisSubscriber.unsubscribe(channel);
+                resolve(false);
+            }, timeoutMs);
+        });
     }
 
     async assignDriverToJob(jobId: string, driverId: string): Promise<void> {
@@ -138,9 +153,9 @@ export class OfferManagementService {
             status: 'accepted',
             assignedAt: new Date().toISOString()
         });
-        // pipeline.hset(`driver:${driverId}:profile`, 'isBusy', 'true');
-        // pipeline.del(`offer:${jobId}:${driverId}`);
-        // pipeline.srem(`driver:${driverId}:offers`, jobId);
+        pipeline.hset(`driver:${driverId}:profile`, 'isBusy', 'true');
+        pipeline.del(`offer:${jobId}:${driverId}`);
+        pipeline.srem(`driver:${driverId}:offers`, jobId);
 
         await pipeline.exec();
 

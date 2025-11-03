@@ -199,7 +199,7 @@ export const kafkaRPC = (options: KafkaRPCOptions) => {
         if (consumerInitialized) return;
 
         consumer = kafka.consumer({
-            groupId: `${serviceName}-consumer`, sessionTimeout: 30000, heartbeatInterval: 3000,
+            groupId: `${serviceName}-consumer`, sessionTimeout: 60000, heartbeatInterval: 3000,
         });
 
         await consumer.connect();

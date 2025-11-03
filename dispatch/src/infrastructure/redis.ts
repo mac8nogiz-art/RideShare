@@ -15,6 +15,17 @@ export const redis = new Redis({
     enableReadyCheck: true,
     lazyConnect: false,
 });
+export const redisSubscriber = new Redis({
+    host: redisHost,
+    port: redisPort,
+    username: process.env.REDIS_USERNAME || undefined,
+    password: process.env.REDIS_PASSWORD || undefined,
+    db: Number(process.env.REDIS_DB || 0),
+    maxRetriesPerRequest: null,
+    enableReadyCheck: true,
+    lazyConnect: false,
+});
+
 
 redis.on("connect", () => {
     logger.info(" Connected to Redis successfully");

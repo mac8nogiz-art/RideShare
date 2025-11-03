@@ -8,9 +8,7 @@ import {OfferManagementService} from './OfferManagement.Service';
 import {ZoneService} from './ZoneService';
 import {MapboxService} from './MapboxService'
 import {
-    newJobEventSchema,
-    driverResponseSchema,
-    validateSchema
+    newJobEventSchema, driverResponseSchema, validateSchema
 } from './validation';
 
 export class JobOrchestratorService {
@@ -23,12 +21,7 @@ export class JobOrchestratorService {
     private isInitialized: boolean = false;
 
     private metrics: ProcessingMetrics = {
-        rpcRequests: 0,
-        jobsProcessed: 0,
-        driversMatched: 0,
-        offersSent: 0,
-        errors: 0,
-        apiCalls: {
+        rpcRequests: 0, jobsProcessed: 0, driversMatched: 0, offersSent: 0, errors: 0, apiCalls: {
             handlePaymentCompleted: 0,
             handleDriverResponse: 0,
             handleGetStats: 0,
@@ -42,10 +35,7 @@ export class JobOrchestratorService {
         this.driverLocationService = new DriverLocationService();
         this.zoneService = new ZoneService();
         this.jobProcessingService = new JobProcessingService();
-        this.driverMatchingService = new DriverMatchingService(
-            this.driverLocationService,
-            this.zoneService
-        );
+        this.driverMatchingService = new DriverMatchingService(this.driverLocationService, this.zoneService);
         this.offerManagementService = new OfferManagementService();
         this.mapboxService = new MapboxService();
     }
@@ -66,27 +56,20 @@ export class JobOrchestratorService {
         try {
             logger.info('Starting Job Orchestrator...');
 
-
             if (!this.zoneService.isReady || !(await this.zoneService.isReady())) {
                 logger.info('Initializing ZoneService...');
-
-
                 await this.zoneService.init();
                 logger.info('ZoneService initialized');
             } else {
                 logger.info('ZoneService already ready');
             }
 
-            //  Refresh driver cache with timeout guard
             logger.info(' Refreshing driver cache...');
             const refreshPromise = this.driverLocationService.refreshDriverCache();
-            const timeoutPromise = new Promise((_, reject) =>
-                setTimeout(() => reject(new Error('Driver cache refresh timed out after 10s')), 10_000)
-            );
+            const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('Driver cache refresh timed out after 10s')), 10_000));
 
             await Promise.race([refreshPromise, timeoutPromise]);
             logger.info('Driver cache refreshed');
-
 
             if (!(this as any)._cacheIntervalSet) {
                 const refreshInterval = 30_000;
@@ -114,7 +97,6 @@ export class JobOrchestratorService {
         }
     }
 
-
     stop(): void {
         this.isInitialized = false;
         logger.info(' Job Orchestrator stopped');
@@ -124,15 +106,11 @@ export class JobOrchestratorService {
         return this.isInitialized;
     }
 
-    // ----------------- Event processng and type  -----------------
-
     async handleRPCRequest(data: any): Promise<any> {
         if (!this.isInitialized) {
             logger.error('Job Orchestrator not initialized - rejecting request');
             return {
-                success: false,
-                error: 'Service not initialized',
-                status: 'SERVICE_NOT_READY'
+                success: false, error: 'Service not initialized', status: 'SERVICE_NOT_READY'
             };
         }
 
@@ -144,30 +122,25 @@ export class JobOrchestratorService {
         try {
             let result;
 
-            // Step 1: Validate the payload before any processing
             if (eventType.startsWith('newBookingPlaced') || eventType.startsWith('newJob.request')) {
                 const validation = await validateSchema(newJobEventSchema, data);
                 if (!validation.valid) {
                     logger.error(`Validation failed for new job event: ${validation.errors?.join(', ')}`);
-                    return { success: false, error: 'Validation failed', details: validation.errors };
+                    return {success: false, error: 'Validation failed', details: validation.errors};
                 }
                 this.metrics.apiCalls.handlePaymentCompleted++;
                 result = await this.handleNewJobEvent(validation.data, data.bookingId || null);
-            }
-
-            else if (eventType === 'driver.response') {
+            } else if (eventType === 'driver.response') {
                 const validation = await validateSchema(driverResponseSchema, data);
                 if (!validation.valid) {
                     logger.error(`Validation failed for driver response: ${validation.errors?.join(', ')}`);
-                    return { success: false, error: 'Validation failed', details: validation.errors };
+                    return {success: false, error: 'Validation failed', details: validation.errors};
                 }
                 this.metrics.apiCalls.handleDriverResponse++;
                 result = await this.handleDriverResponse(validation.data);
-            }
-
-            else {
+            } else {
                 logger.warn(`Unknown RPC request type: ${eventType}`);
-                return { success: false, error: 'Unknown request type', receivedType: eventType };
+                return {success: false, error: 'Unknown request type', receivedType: eventType};
             }
 
             logger.info(`RPC Request Completed - Type: ${eventType}, RequestId: ${requestId}, Success: ${result.success}`);
@@ -177,15 +150,10 @@ export class JobOrchestratorService {
             this.metrics.errors++;
             logger.error(`RPC Request Failed - Type: ${eventType}, RequestId: ${requestId}, Error: ${error.message}`);
             return {
-                success: false,
-                error: error.message,
-                type: eventType,
-                requestId
+                success: false, error: error.message, type: eventType, requestId
             };
         }
     }
-
-    // ----------------- Driver Response Handler -----------------
 
     async handleDriverResponse(data: any): Promise<any> {
         const {driverId, jobId, action, reason} = data;
@@ -197,18 +165,25 @@ export class JobOrchestratorService {
                 this.jobProcessingService.removeJob(jobId);
                 logger.info(`Driver Accepted - Job: ${jobId}, Driver: ${driverId}`);
                 return {
-                    success: true,
-                    message: 'Driver assigned to job',
-                    jobId,
-                    driverId
+                    success: true, message: 'Driver assigned to job', jobId, driverId
                 };
             } else if (action === 'reject') {
                 await this.offerManagementService.handleDriverRejection(jobId, driverId, reason);
 
                 const job = this.jobProcessingService.getJob(jobId);
                 if (job) {
-                    const nearbyDrivers = await this.driverMatchingService.findBestDrivers(job, job.customerId);
-                    const alternativeDrivers = await this.offerManagementService.findAlternativeDrivers(jobId, nearbyDrivers);
+                    const categorizedDrivers = await this.driverMatchingService.findBestDrivers(job, job.customerId);
+
+                    if (!categorizedDrivers) {
+                        logger.warn(`No drivers available - Job: ${jobId}`);
+                        return {
+                            success: false, message: 'No alternative drivers available', jobId
+                        };
+                    }
+
+                    const allDrivers = [...categorizedDrivers.favDriver, ...categorizedDrivers.priorityDrivers, ...categorizedDrivers.newDrivers, ...categorizedDrivers.nonPriorityDrivers, ...categorizedDrivers.remainingDrivers, ...categorizedDrivers.busyDrivers];
+
+                    const alternativeDrivers = await this.offerManagementService.findAlternativeDrivers(jobId, allDrivers);
 
                     if (alternativeDrivers.length > 0) {
                         await this.offerManagementService.sendOffers(job, alternativeDrivers);
@@ -222,40 +197,29 @@ export class JobOrchestratorService {
                     } else {
                         logger.warn(` No alternative drivers found - Job: ${jobId}`);
                         return {
-                            success: false,
-                            message: 'No alternative drivers available',
-                            jobId
+                            success: false, message: 'No alternative drivers available', jobId
                         };
                     }
                 } else {
                     logger.warn(`Job not found - Job: ${jobId}`);
                     return {
-                        success: false,
-                        message: 'Job not found',
-                        jobId
+                        success: false, message: 'Job not found', jobId
                     };
                 }
             } else {
                 logger.warn(`Unknown Driver Action - Action: ${action}`);
                 return {
-                    success: false,
-                    error: 'Unknown driver action',
-                    action
+                    success: false, error: 'Unknown driver action', action
                 };
             }
         } catch (error: any) {
             this.metrics.errors++;
             logger.error(` Driver Response Error - Job: ${jobId}, Driver: ${driverId}, Error: ${error.message}`);
             return {
-                success: false,
-                error: error.message,
-                jobId,
-                driverId
+                success: false, error: error.message, jobId, driverId
             };
         }
     }
-
-    // ----------------- New Job Event Handler -----------------
 
     private async handleNewJobEvent(data: any, bookingId: string | null): Promise<any> {
         const startTime = Date.now();
@@ -264,24 +228,22 @@ export class JobOrchestratorService {
 
         const pickupData = payload.tripAddress?.[0];
         const dropData = payload.tripAddress?.[payload.tripAddress.length - 1];
-        const pickup = pickupData?.location
-            ? { latitude: pickupData.location.latitude, longitude: pickupData.location.longitude }
-            : null;
-        const drop = dropData?.location
-            ? { latitude: dropData.location.latitude, longitude: dropData.location.longitude }
-            : null;
+        const pickup = pickupData?.location ? {
+            latitude: pickupData.location.latitude, longitude: pickupData.location.longitude
+        } : null;
+        const drop = dropData?.location ? {
+            latitude: dropData.location.latitude, longitude: dropData.location.longitude
+        } : null;
 
         if (!pickup) {
-
             logger.error(`Missing pickup coordinates for Job ${jobId}`);
-            return { success: false, error: 'Pickup coordinates missing', jobId };
+            return {success: false, error: 'Pickup coordinates missing', jobId};
         }
 
         const customer = payload.customer;
         if (!customer?._id) {
-
             logger.error(`Invalid customer data — Job ${jobId}`);
-            return { success: false, error: 'Invalid customer data', jobId };
+            return {success: false, error: 'Invalid customer data', jobId};
         }
 
         const job: Job = {
@@ -296,14 +258,9 @@ export class JobOrchestratorService {
         };
 
         try {
-
+            // Calculate trip ETA (pickup to drop)
             if (drop) {
-                const eta = await this.mapboxService.getDistanceAndDuration(
-                    pickup.latitude,
-                    pickup.longitude,
-                    drop.latitude,
-                    drop.longitude
-                );
+                const eta = await this.mapboxService.getDistanceAndDuration(pickup.latitude, pickup.longitude, drop.latitude, drop.longitude);
                 job.dropLat = drop.latitude;
                 job.dropLng = drop.longitude;
                 job.customer = {
@@ -318,63 +275,92 @@ export class JobOrchestratorService {
                 logger.warn(`Pickup or drop missing — Skipping ETA for Job ${job.id}`);
             }
 
-            const matchedDrivers = await this.driverMatchingService.findBestDrivers(job, job.customerId);
+            const categorizedDrivers = await this.driverMatchingService.findBestDrivers(job, job.customerId);
             const searchTime = Date.now() - startTime;
 
-            if (matchedDrivers.length > 0) {
+            if (categorizedDrivers) {
+                const matchedDrivers = [...categorizedDrivers.favDriver, ...categorizedDrivers.priorityDrivers, ...categorizedDrivers.newDrivers, ...categorizedDrivers.nonPriorityDrivers, ...categorizedDrivers.remainingDrivers, ...categorizedDrivers.busyDrivers];
 
-                const driversWithEta = await Promise.all(
-                    matchedDrivers.map(async (driverId) => {
-                        try {
-                            // we get drivers id only form
-                            const driverDataJson = await redis.call('JSON.GET', `driver:${driverId}`);
-                            if (!driverDataJson) {
-                                logger.warn(`Driver data not found in Redis in matched service part - ${driverId}`);
-                                return null;
-                            }
-
-                            const driverData = typeof driverDataJson === 'string'
-                                ? JSON.parse(driverDataJson)
-                                : driverDataJson;
-
-                            const lat = driverData?.location?.coordinates?.[1];
-                            const lng = driverData?.location?.coordinates?.[0];
-
-                            if (!lat || !lng) {
-                                logger.warn(`Invalid driver coordinates - ${driverId}`);
-                                return null;
-                            }
-
-                            // Get ETA from driver → pickup location
-                            const estimatedArrival = await this.mapboxService.getDistanceAndDuration(
-                                lat,
-                                lng,
-                                pickup.latitude,
-                                pickup.longitude
-                            );
-                            job.rideDetails = {
-                                estimatedTime: estimatedArrival.durationText,
-                                estimatedDistance: estimatedArrival.distanceText,
-                            };
-
-                            return {
-                                driverId,
-                                distanceToPickup: estimatedArrival.distanceText,
-                                etaToPickup: estimatedArrival.durationText,
-                            };
-                        } catch (error: any) {
-                            logger.error(`ETA calculation failed for driver ${driverId}: ${error.message}`);
+                // Calculate driver-to-pickup ETAs
+                const driversWithEta = await Promise.all(matchedDrivers.map(async (driverId) => {
+                    try {
+                        const driverDataJson = await redis.call('JSON.GET', `drivers:${driverId}`);
+                        if (!driverDataJson) {
+                            logger.warn(`Driver data not found in Redis - ${driverId}`);
                             return null;
+                        }
+
+                        const driverData = typeof driverDataJson === 'string' ? JSON.parse(driverDataJson) : driverDataJson;
+
+                        const lat = driverData?.location?.coordinates?.[1];
+                        const lng = driverData?.location?.coordinates?.[0];
+
+                        if (!lat || !lng) {
+                            logger.warn(`Invalid driver coordinates - ${driverId}`);
+                            return null;
+                        }
+
+                        const estimatedArrival = await this.mapboxService.getDistanceAndDuration(lat, lng, pickup.latitude, pickup.longitude);
+
+                        return {
+                            driverId,
+                            distanceToPickup: estimatedArrival.distanceText,
+                            etaToPickup: estimatedArrival.durationText,
+                        };
+                    } catch (error: any) {
+                        logger.error(`ETA calculation failed for driver ${driverId}: ${error.message}`);
+                        return null;
+                    }
+                }));
+
+                const validDriverEtas = driversWithEta.filter((d) => d !== null);
+                console.log(validDriverEtas, "<___-----validDriverEtas------>")
+                // Set base ride details (closest driver's ETA)
+                if (validDriverEtas.length === 0) {
+                    logger.warn(`No valid ETA data found for Job ${job.id}. Setting fallback values.`);
+                    job.rideDetails = {
+                        estimatedTime: 'N/A',
+                        estimatedDistance: 'N/A',
+                    } as any;
+                } else {
+                    const bestDriver = validDriverEtas.sort((a, b) => {
+                        const aTime = parseFloat(a.etaToPickup) || Number.MAX_SAFE_INTEGER;
+                        const bTime = parseFloat(b.etaToPickup) || Number.MAX_SAFE_INTEGER;
+                        return aTime - bTime;
+                    })[0];
+
+                    job.rideDetails = {
+                        estimatedTime: bestDriver.etaToPickup,
+                        estimatedDistance: bestDriver.distanceToPickup,
+                    } as any;
+                }
+
+                // Send offers with driver-specific ETAs (extend job with each driver's ETA)
+                const offerResults = await Promise.all(
+                    validDriverEtas.map(async (driverEta) => {
+                        try {
+                            const jobWithDriverEta = {
+                                ...job,
+                                rideDetails: {
+                                    estimatedTime: driverEta.etaToPickup,
+                                    estimatedDistance: driverEta.distanceToPickup,
+                                }
+                            };
+                            await this.offerManagementService.sendOffers(jobWithDriverEta, [driverEta.driverId]);
+                            return true;
+                        } catch (error: any) {
+                            logger.error(`Failed to send offer to driver ${driverEta.driverId}: ${error.message}`);
+                            return false;
                         }
                     })
                 );
 
-                const offerResult = await this.offerManagementService.sendOffers(job, matchedDrivers);
+                const successful = offerResults.filter(r => r).length;
+                const failed = offerResults.length - successful;
+
                 this.metrics.driversMatched += matchedDrivers.length;
-                this.metrics.offersSent += offerResult.successful;
-                logger.info(
-                    ` Job Matched - JobId: ${job.id}, Drivers: ${matchedDrivers.length}, Offers Sent: ${offerResult.successful}, Search Time: ${searchTime}ms`
-                );
+                this.metrics.offersSent += successful;
+                logger.info(` Job Matched - JobId: ${job.id}, Drivers: ${matchedDrivers.length}, Offers Sent: ${successful}, Search Time: ${searchTime}ms`);
 
                 return {
                     success: true,
@@ -383,13 +369,12 @@ export class JobOrchestratorService {
                     orderNo: payload.orderNo,
                     driversFound: matchedDrivers.length,
                     driverIds: matchedDrivers,
-                    offersSent: offerResult.successful,
-                    offersFailed: offerResult.failed,
+                    offersSent: successful,
+                    offersFailed: failed,
                     searchTimeMs: searchTime,
                     timestamp: new Date().toISOString(),
                 };
             } else {
-
                 logger.warn(` No Drivers Found - JobId: ${job.id}`);
                 return {
                     success: false,
@@ -402,14 +387,12 @@ export class JobOrchestratorService {
                     timestamp: new Date().toISOString(),
                 };
             }
-        } catch (error: any) {
 
+        } catch (error: any) {
             this.metrics.errors++;
             const searchTime = Date.now() - startTime;
 
-            logger.error(
-                `Driver Search Failed - JobId: ${job.id}, Error: ${error.message}, Search Time: ${searchTime}ms`
-            );
+            logger.error(`Driver Search Failed - JobId: ${job.id}, Error: ${error.message}, Search Time: ${searchTime}ms`);
 
             return {
                 success: false,
@@ -424,8 +407,6 @@ export class JobOrchestratorService {
             };
         }
     }
-
-
 }
 
 export const jobOrchestratorService = new JobOrchestratorService();
