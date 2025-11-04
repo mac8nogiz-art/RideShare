@@ -101,3 +101,606 @@ dispatch-service/
     │   └── create-topics.sh
     └── redis/
         └── redis.conf
+
+
+
+
+import { redis, redisSubscriber } from '../infrastructure/redis';
+import { logger } from '../logger';
+import { Job, ProcessingMetrics } from '../types';
+import { DriverLocationService } from './DriverLocation.Service';
+import { DriverMatchingService } from './DriverMatching.Service';
+import { OfferManagementService } from './OfferManagement.Service';
+import { ZoneService } from './ZoneService';
+import { MapboxService } from './MapboxService';
+import { getMongoDB } from '../infrastructure/mongo';
+import { ObjectId } from 'mongodb';
+
+interface DriverQueueItem {
+    driverId: string;
+    distance: number;
+    lat: number;
+    lng: number;
+    priorityScore: number;
+    isFavorite: boolean;
+}
+
+export class JobOrchestratorService {
+    private driverLocationService: DriverLocationService;
+    private driverMatchingService: DriverMatchingService;
+    private offerManagementService: OfferManagementService;
+    private zoneService: ZoneService;
+    private mapboxService: MapboxService;
+    private isInitialized: boolean = false;
+
+    // Batch Processing Configuration (FALLBACK)
+    private readonly BATCH_SIZE = 3; // Send to 3 drivers simultaneously
+    private readonly RADIUS_INCREMENT = 0.25; // 0.25km radius increments
+    private readonly MAX_RADIUS = 15; // Maximum 15km search
+    private readonly BATCH_WAIT_TIME_MS = 15000; // 15 seconds wait per batch
+
+    private metrics: ProcessingMetrics = {
+        rpcRequests: 0,
+        jobsProcessed: 0,
+        driversMatched: 0,
+        offersSent: 0,
+        errors: 0,
+        apiCalls: {
+            handlePaymentCompleted: 0,
+            handleDriverResponse: 0,
+            handleGetStats: 0,
+            handleHealthCheck: 0,
+            addJobs: 0,
+            addJob: 0
+        }
+    };
+
+    constructor() {
+        this.driverLocationService = new DriverLocationService();
+        this.zoneService = new ZoneService();
+        this.driverMatchingService = new DriverMatchingService(this.driverLocationService, this.zoneService);
+        this.offerManagementService = new OfferManagementService();
+        this.mapboxService = new MapboxService();
+    }
+
+    // ... keep existing start(), stop(), isReady(), handleRPCRequest(), handleDriverResponse() methods ...
+
+    /**
+     * 🎯 MAIN HANDLER: Sequential First, Batch Fallback
+     */
+    private async handleNewJobEvent(data: any, bookingId: string | null): Promise<any> {
+        const startTime = Date.now();
+        const payload = data.payload;
+        const jobId = payload._id;
+
+        const pickupData = payload.tripAddress?.[0];
+        const dropData = payload.tripAddress?.[payload.tripAddress.length - 1];
+        const pickup = pickupData?.location ? {
+            latitude: pickupData.location.latitude,
+            longitude: pickupData.location.longitude
+        } : null;
+        const drop = dropData?.location ? {
+            latitude: dropData.location.latitude,
+            longitude: dropData.location.longitude
+        } : null;
+
+        if (!pickup) {
+            logger.error(`Missing pickup coordinates for Job ${jobId}`);
+            return { success: false, error: 'Pickup coordinates missing', jobId };
+        }
+
+        const customer = payload.customer;
+        if (!customer?._id) {
+            logger.error(`Invalid customer data — Job ${jobId}`);
+            return { success: false, error: 'Invalid customer data', jobId };
+        }
+
+        const job: Job = {
+            id: jobId,
+            customerId: customer._id,
+            pickupLat: pickup.latitude,
+            pickupLng: pickup.longitude,
+            fare: payload.grandTotal || 0,
+            vehicleType: payload.selectedVehicle?.name || 'Unknown',
+            tripAddress: payload.tripAddress || '',
+            timestamp: payload.createdAt ? new Date(payload.createdAt).getTime() : Date.now(),
+        };
+
+        try {
+            // Calculate trip ETA
+            if (drop) {
+                const tripEta = await this.mapboxService.getDistanceAndDuration(
+                    pickup.latitude, pickup.longitude, drop.latitude, drop.longitude
+                );
+                job.dropLat = drop.latitude;
+                job.dropLng = drop.longitude;
+                job.customer = {
+                    time: tripEta.durationText,
+                    distance: tripEta.distanceKm,
+                    fullName: customer.fullName || 'Unknown',
+                    avatar: customer.avatar || '',
+                };
+            } else {
+                job.customer = {
+                    time: 'N/A',
+                    distance: 0,
+                    fullName: customer.fullName || 'Unknown',
+                    avatar: customer.avatar || '',
+                };
+            }
+
+            // 🔵 PHASE 1: NORMAL SEQUENTIAL FLOW (Your existing logic)
+            logger.info(`🔵 PHASE 1: Starting Sequential Driver Matching - Job: ${job.id}`);
+            const sequentialResult = await this.runSequentialMatching(job, payload.orderNo);
+
+            // Check if job was assigned in sequential flow
+            const jobStatus = await redis.hget(`job:${job.id}`, 'status');
+            const assignedDriver = await redis.hget(`job:${job.id}`, 'assignedDriver');
+
+            if (jobStatus === 'accepted' || assignedDriver) {
+                logger.info(`✅ Job Assigned in Sequential Flow - Job: ${job.id}, Driver: ${assignedDriver}`);
+                return {
+                    ...sequentialResult,
+                    assignmentPhase: 'sequential',
+                    searchTimeMs: Date.now() - startTime,
+                    timestamp: new Date().toISOString(),
+                };
+            }
+
+            // 🟡 PHASE 2: BATCH PROCESSING FALLBACK (If no one accepted)
+            logger.info(`🟡 PHASE 2: Starting Batch Processing Fallback - Job: ${job.id}`);
+            logger.info(`   Sequential flow completed with no acceptance. Starting batch processing...`);
+
+            const batchResult = await this.runBatchProcessingFallback(job, payload.orderNo);
+
+            return {
+                ...batchResult,
+                assignmentPhase: batchResult.success ? 'batch' : 'failed',
+                sequentialAttempts: sequentialResult.offersSent || 0,
+                searchTimeMs: Date.now() - startTime,
+                timestamp: new Date().toISOString(),
+            };
+
+        } catch (error: any) {
+            this.metrics.errors++;
+            logger.error(`Job Processing Failed - JobId: ${job.id}, Error: ${error.message}`);
+            return {
+                success: false,
+                message: 'Job processing failed',
+                error: error.message,
+                jobId: job.id,
+                orderNo: payload.orderNo,
+                searchTimeMs: Date.now() - startTime,
+            };
+        }
+    }
+
+    /**
+     * 🔵 PHASE 1: YOUR EXISTING SEQUENTIAL MATCHING FLOW
+     */
+    private async runSequentialMatching(job: Job, orderNo: string): Promise<any> {
+        const startTime = Date.now();
+
+        // Find available drivers using your existing matching service
+        const categorizedDrivers = await this.driverMatchingService.findBestDrivers(job, job.customerId);
+
+        if (!categorizedDrivers) {
+            logger.warn(`No Drivers Found in Sequential Flow - JobId: ${job.id}`);
+            return {
+                success: false,
+                message: 'No drivers available',
+                jobId: job.id,
+                orderNo,
+                driversFound: 0,
+                offersSent: 0,
+            };
+        }
+
+        const matchedDrivers = [
+            ...categorizedDrivers.favDriver,
+            ...categorizedDrivers.priorityDrivers,
+            ...categorizedDrivers.newDrivers,
+            ...categorizedDrivers.nonPriorityDrivers,
+            ...categorizedDrivers.remainingDrivers,
+        ];
+
+        logger.info(`Found ${matchedDrivers.length} drivers in sequential matching - Job: ${job.id}`);
+
+        // Calculate driver ETAs and send offers sequentially (YOUR EXISTING LOGIC)
+        const driversWithEta = await Promise.all(
+            matchedDrivers.map(async (driverId) => {
+                try {
+                    const driverDataJson = await redis.call('JSON.GET', `${driverId}`);
+                    if (!driverDataJson) return null;
+
+                    const driverData = typeof driverDataJson === 'string'
+                        ? JSON.parse(driverDataJson)
+                        : driverDataJson;
+
+                    const lat = driverData?.location?.coordinates?.[1];
+                    const lng = driverData?.location?.coordinates?.[0];
+                    if (!lat || !lng) return null;
+
+                    const pickup = { latitude: job.pickupLat, longitude: job.pickupLng };
+                    const driverToPickupEta = await this.mapboxService.getDistanceAndDuration(
+                        lat, lng, pickup.latitude, pickup.longitude
+                    );
+
+                    return {
+                        driverId,
+                        distanceToPickup: driverToPickupEta.distanceText,
+                        etaToPickup: driverToPickupEta.durationText,
+                    };
+                } catch (error: any) {
+                    logger.error(`ETA calculation failed for driver ${driverId}: ${error.message}`);
+                    return null;
+                }
+            })
+        );
+
+        const validDriverEtas = driversWithEta.filter((d) => d !== null);
+
+        if (validDriverEtas.length === 0) {
+            logger.warn(`No valid driver ETA data for Job ${job.id}`);
+            return {
+                success: false,
+                message: 'No drivers with valid location data',
+                jobId: job.id,
+                orderNo,
+                driversFound: matchedDrivers.length,
+                offersSent: 0,
+            };
+        }
+
+        // Send offers sequentially using your existing OfferManagementService
+        let totalOffersSent = 0;
+        for (const driverEta of validDriverEtas) {
+            try {
+                const jobWithDriverEta = {
+                    ...job,
+                    rideDetails: {
+                        estimatedTime: driverEta.etaToPickup,
+                        estimatedDistance: parseFloat(driverEta.distanceToPickup) || 0,
+                    }
+                };
+
+                // Use your existing sendOffers method (sequential, with 15s wait per driver)
+                await this.offerManagementService.sendOffers(jobWithDriverEta, [driverEta.driverId]);
+                totalOffersSent++;
+
+                // Check if job was assigned
+                const status = await redis.hget(`job:${job.id}`, 'status');
+                const assignedDriver = await redis.hget(`job:${job.id}`, 'assignedDriver');
+                if (status === 'accepted' || assignedDriver) {
+                    logger.info(`✅ Driver accepted in sequential flow - Job: ${job.id}, Driver: ${assignedDriver}`);
+                    break;
+                }
+            } catch (error: any) {
+                logger.error(`Failed to send offer in sequential flow to driver ${driverEta.driverId}: ${error.message}`);
+            }
+        }
+
+        return {
+            success: totalOffersSent > 0,
+            message: 'Sequential offers sent',
+            jobId: job.id,
+            orderNo,
+            driversFound: matchedDrivers.length,
+            offersSent: totalOffersSent,
+        };
+    }
+
+    /**
+     * 🟡 PHASE 2: BATCH PROCESSING FALLBACK
+     * Only runs if no one accepted in sequential flow
+     */
+    private async runBatchProcessingFallback(job: Job, orderNo: string): Promise<any> {
+        logger.info(`🔄 Building 15km Driver Queue for Batch Processing - Job: ${job.id}`);
+
+        // Build complete 15km driver queue
+        const queueData = await this.buildComplete15kmQueue(job);
+        if (!queueData || queueData.queue.length === 0) {
+            logger.warn(`No drivers in 15km queue for Job ${job.id}`);
+            await redis.hset(`job:${job.id}`, {
+                status: 'no_drivers_available',
+                completedAt: new Date().toISOString()
+            });
+            return {
+                success: false,
+                message: `No drivers found within ${this.MAX_RADIUS}km`,
+                jobId: job.id,
+                orderNo,
+                driversFound: 0,
+                offersSent: 0,
+                finalRadius: 0
+            };
+        }
+
+        const { queue, rejectedDrivers } = queueData;
+        let totalOffersSent = 0;
+        let currentRadiusKm = this.RADIUS_INCREMENT;
+
+        logger.info(`📦 Queue Built - Total: ${queue.length} drivers, Starting batch processing...`);
+
+        // Process in 0.25km radius increments
+        while (currentRadiusKm <= this.MAX_RADIUS) {
+            logger.info(`\n🔍 Processing Radius: ${currentRadiusKm}km - Job: ${job.id}`);
+
+            // Get drivers within current radius (not yet processed)
+            const driversInRadius = queue.filter(
+                d => d.distance <= currentRadiusKm && !rejectedDrivers.has(d.driverId)
+            );
+
+            if (driversInRadius.length === 0) {
+                logger.info(`   No new drivers at ${currentRadiusKm}km, moving to next radius...`);
+                currentRadiusKm += this.RADIUS_INCREMENT;
+                continue;
+            }
+
+            logger.info(`   Found ${driversInRadius.length} drivers at ${currentRadiusKm}km`);
+
+            // Process in batches of 3
+            for (let i = 0; i < driversInRadius.length; i += this.BATCH_SIZE) {
+                const batch = driversInRadius.slice(i, i + this.BATCH_SIZE);
+                logger.info(`   📨 Sending batch ${Math.floor(i / this.BATCH_SIZE) + 1}: ${batch.length} drivers`);
+
+                // Send parallel notifications to 3 drivers
+                const batchResult = await this.sendParallelBatchOffers(job, batch);
+                totalOffersSent += batchResult.successful;
+
+                // Wait 15 seconds for any acceptance
+                const accepted = await this.waitForBatchAcceptance(job.id, batch, this.BATCH_WAIT_TIME_MS);
+
+                if (accepted) {
+                    const assignedDriver = await redis.hget(`job:${job.id}`, 'assignedDriver');
+                    logger.info(`   ✅ Driver accepted in batch! Job: ${job.id}, Driver: ${assignedDriver}`);
+                    return {
+                        success: true,
+                        message: 'Driver assigned via batch processing',
+                        jobId: job.id,
+                        orderNo,
+                        driversFound: queue.length,
+                        offersSent: totalOffersSent,
+                        assignedDriver,
+                        finalRadius: currentRadiusKm
+                    };
+                }
+
+                // Mark batch drivers as rejected
+                batch.forEach(d => rejectedDrivers.add(d.driverId));
+                logger.info(`   ⏱️ Batch timeout - no acceptance, moving to next batch...`);
+
+                // Small delay between batches
+                if (i + this.BATCH_SIZE < driversInRadius.length) {
+                    await new Promise(resolve => setTimeout(resolve, 200));
+                }
+            }
+
+            // Move to next radius
+            currentRadiusKm += this.RADIUS_INCREMENT;
+        }
+
+        // No drivers accepted within 15km
+        logger.warn(`❌ No drivers accepted within ${this.MAX_RADIUS}km - Job: ${job.id}`);
+        await redis.hset(`job:${job.id}`, {
+            status: 'no_drivers_available',
+            completedAt: new Date().toISOString()
+        });
+
+        return {
+            success: false,
+            message: `No drivers accepted within ${this.MAX_RADIUS}km`,
+            jobId: job.id,
+            orderNo,
+            driversFound: queue.length,
+            offersSent: totalOffersSent,
+            finalRadius: this.MAX_RADIUS
+        };
+    }
+
+    /**
+     * Build complete driver queue within 15km
+     */
+    private async buildComplete15kmQueue(job: Job): Promise<{
+        queue: DriverQueueItem[];
+        rejectedDrivers: Set<string>;
+    } | null> {
+        const zoneIds = await this.zoneService.getZoneForJob(job);
+        if (!zoneIds || zoneIds.length === 0) return null;
+
+        const { favoriteSet, blockedSet } = await this.getCustomerFavoritesAndBlocked(job.customerId);
+        const rejectedDrivers = await this.getAlreadyRejectedDrivers(job.id);
+
+        // Get all drivers within 15km using GEOSEARCH
+        const result = await redis.geosearch(
+            'drivers:locations',
+            'FROMLONLAT',
+            job.pickupLng,
+            job.pickupLat,
+            'BYRADIUS',
+            this.MAX_RADIUS,
+            'km',
+            'WITHDIST',
+            'ASC'
+        ) as any;
+
+        const driverIds = result.map((item: any) => `driver:${item[0]}`);
+        const distances = result.map((item: any) => parseFloat(item[1]));
+
+        if (driverIds.length === 0) return null;
+
+        // Get driver data from Redis JSON
+        const jsonStrings: any = await redis.call('JSON.MGET', ...driverIds, '$');
+
+        const queue: DriverQueueItem[] = [];
+
+        for (let i = 0; i < jsonStrings.length; i++) {
+            const driverData = jsonStrings[i] ? JSON.parse(jsonStrings[i])?.[0] : null;
+            if (!driverData) continue;
+
+            const driverId = driverIds[i];
+
+            // Skip blocked, rejected, and busy drivers
+            if (blockedSet.has(driverId) || rejectedDrivers.has(driverId) || driverData.iAmBusy) {
+                continue;
+            }
+
+            // Check zone approval
+            const driverApprovedZones = Array.isArray(driverData.approved_zones)
+                ? driverData.approved_zones.map(String)
+                : [];
+
+            if (driverApprovedZones.length > 0 &&
+                !zoneIds.some(zoneId => driverApprovedZones.includes(zoneId))) {
+                continue;
+            }
+
+            const [lng, lat] = driverData.location?.coordinates || [];
+
+            queue.push({
+                driverId,
+                distance: distances[i],
+                lat,
+                lng,
+                priorityScore: driverData.priorityScore || 0,
+                isFavorite: favoriteSet.has(driverId)
+            });
+        }
+
+        // Sort: Favorites first, then by priority score, then by distance
+        queue.sort((a, b) => {
+            if (a.isFavorite !== b.isFavorite) return b.isFavorite ? 1 : -1;
+            if (a.priorityScore !== b.priorityScore) return b.priorityScore - a.priorityScore;
+            return a.distance - b.distance;
+        });
+
+        logger.info(`Queue built: ${queue.length} eligible drivers (${queue.filter(d => d.isFavorite).length} favorites)`);
+
+        return { queue, rejectedDrivers };
+    }
+
+    /**
+     * Send parallel offers to batch of 3 drivers
+     */
+    private async sendParallelBatchOffers(job: Job, batch: DriverQueueItem[]): Promise<{ successful: number; failed: number }> {
+        const offerPromises = batch.map(async (driver) => {
+            try {
+                // Calculate ETA for this driver
+                const driverEta = await this.mapboxService.getDistanceAndDuration(
+                    driver.lat,
+                    driver.lng,
+                    job.pickupLat,
+                    job.pickupLng
+                );
+
+                const jobWithEta = {
+                    ...job,
+                    rideDetails: {
+                        estimatedTime: driverEta.durationText,
+                        estimatedDistance: parseFloat(driverEta.distanceText) || 0,
+                    }
+                };
+
+                // Send notification using OfferManagementService (without waiting)
+                const currentAskDrivers = await this.offerManagementService['getAskDriversFromBooking'](job.id, job.customerId);
+                await this.offerManagementService['sendSingleOffer'](jobWithEta, driver.driverId, currentAskDrivers);
+
+                logger.info(`      ✉️ Notification sent to ${driver.driverId} (${driver.distance.toFixed(2)}km)`);
+                return true;
+            } catch (error: any) {
+                logger.error(`      ❌ Failed to send to ${driver.driverId}: ${error.message}`);
+                return false;
+            }
+        });
+
+        const results = await Promise.all(offerPromises);
+        const successful = results.filter(r => r).length;
+
+        return { successful, failed: results.length - successful };
+    }
+
+    /**
+     * Wait for any driver in batch to accept (15 seconds)
+     */
+    private async waitForBatchAcceptance(jobId: string, batch: DriverQueueItem[], timeoutMs: number): Promise<boolean> {
+        return new Promise((resolve) => {
+            let resolved = false;
+
+            const channels = batch.map(d => `driver_response:${jobId}:${d.driverId}`);
+
+            const onMessage = async (channelName: string, message: string) => {
+                if (resolved) return;
+
+                try {
+                    const data = JSON.parse(message);
+                    if (data.type === 'offer_accepted') {
+                        resolved = true;
+                        cleanup();
+                        resolve(true);
+                    }
+                } catch (error) {
+                    logger.error(`Parse batch response error: ${error}`);
+                }
+            };
+
+            const cleanup = () => {
+                redisSubscriber.off('message', onMessage);
+                channels.forEach(channel => redisSubscriber.unsubscribe(channel));
+                clearTimeout(timeoutId);
+            };
+
+            redisSubscriber.on('message', onMessage);
+            channels.forEach(channel => redisSubscriber.subscribe(channel));
+
+            const timeoutId = setTimeout(() => {
+                if (!resolved) {
+                    resolved = true;
+                    cleanup();
+                    resolve(false);
+                }
+            }, timeoutMs);
+        });
+    }
+
+    /**
+     * Get customer favorites and blocked drivers
+     */
+    private async getCustomerFavoritesAndBlocked(customerId: string): Promise<{
+        favoriteSet: Set<string>;
+        blockedSet: Set<string>;
+    }> {
+        try {
+            const db = getMongoDB();
+            const user = await db.collection('users').findOne(
+                { _id: new ObjectId(customerId) },
+                { projection: { favDrivers: 1, blockDrivers: 1 } }
+            );
+
+            const favorites = Array.isArray(user?.favDrivers) ? user.favDrivers.map(String) : [];
+            const blocked = Array.isArray(user?.blockDrivers) ? user.blockDrivers.map(String) : [];
+
+            return {
+                favoriteSet: new Set(favorites),
+                blockedSet: new Set(blocked)
+            };
+        } catch (error: any) {
+            logger.error(`Failed to fetch customer preferences: ${error.message}`);
+            return { favoriteSet: new Set(), blockedSet: new Set() };
+        }
+    }
+
+    /**
+     * Get already rejected drivers for this job
+     */
+    private async getAlreadyRejectedDrivers(jobId: string): Promise<Set<string>> {
+        try {
+            const rejected = await redis.smembers(`job:${jobId}:rejected_drivers`);
+            return new Set(rejected);
+        } catch (error) {
+            logger.error(`Failed to get rejected drivers: ${error}`);
+            return new Set();
+        }
+    }
+}
+
+export const jobOrchestratorService = new JobOrchestratorService();
