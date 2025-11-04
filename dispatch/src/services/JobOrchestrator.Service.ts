@@ -229,10 +229,12 @@ export class JobOrchestratorService {
         const pickupData = payload.tripAddress?.[0];
         const dropData = payload.tripAddress?.[payload.tripAddress.length - 1];
         const pickup = pickupData?.location ? {
-            latitude: pickupData.location.latitude, longitude: pickupData.location.longitude
+            latitude: pickupData.location.latitude,
+            longitude: pickupData.location.longitude
         } : null;
         const drop = dropData?.location ? {
-            latitude: dropData.location.latitude, longitude: dropData.location.longitude
+            latitude: dropData.location.latitude,
+            longitude: dropData.location.longitude
         } : null;
 
         if (!pickup) {
@@ -258,124 +260,41 @@ export class JobOrchestratorService {
         };
 
         try {
-            // Calculate trip ETA (pickup to drop)
+            // Calculate trip ETA (pickup to drop) - stored in job.customer
             if (drop) {
-                const eta = await this.mapboxService.getDistanceAndDuration(pickup.latitude, pickup.longitude, drop.latitude, drop.longitude);
+                const tripEta = await this.mapboxService.getDistanceAndDuration(
+                    pickup.latitude,
+                    pickup.longitude,
+                    drop.latitude,
+                    drop.longitude
+                );
+
                 job.dropLat = drop.latitude;
                 job.dropLng = drop.longitude;
                 job.customer = {
-                    time: eta.durationText,
-                    distance: eta.distanceText,
+                    time: tripEta.durationText,        // Trip duration (pickup → drop)
+                    distance: tripEta.distanceText,    // Trip distance (pickup → drop)
                     fullName: customer.fullName || 'Unknown',
                     avatar: customer.avatar || '',
                 };
 
-                logger.info(`ETA Calculated for Job ${job.id} — ${eta.distanceText}, ${eta.durationText}`);
+                logger.info(`Trip ETA Calculated for Job ${job.id} — Distance: ${tripEta.distanceText}, Duration: ${tripEta.durationText}`);
             } else {
-                logger.warn(`Pickup or drop missing — Skipping ETA for Job ${job.id}`);
+                logger.warn(`Drop location missing — Skipping trip ETA calculation for Job ${job.id}`);
+                job.customer = {
+                    time: 'N/A',
+                    distance: 'N/A',
+                    fullName: customer.fullName || 'Unknown',
+                    avatar: customer.avatar || '',
+                };
             }
 
+            // Find available drivers
             const categorizedDrivers = await this.driverMatchingService.findBestDrivers(job, job.customerId);
             const searchTime = Date.now() - startTime;
 
-            if (categorizedDrivers) {
-                const matchedDrivers = [...categorizedDrivers.favDriver, ...categorizedDrivers.priorityDrivers, ...categorizedDrivers.newDrivers, ...categorizedDrivers.nonPriorityDrivers, ...categorizedDrivers.remainingDrivers, ...categorizedDrivers.busyDrivers];
-
-                // Calculate driver-to-pickup ETAs
-                const driversWithEta = await Promise.all(matchedDrivers.map(async (driverId) => {
-                    try {
-                        const driverDataJson = await redis.call('JSON.GET', `drivers:${driverId}`);
-                        if (!driverDataJson) {
-                            logger.warn(`Driver data not found in Redis - ${driverId}`);
-                            return null;
-                        }
-
-                        const driverData = typeof driverDataJson === 'string' ? JSON.parse(driverDataJson) : driverDataJson;
-
-                        const lat = driverData?.location?.coordinates?.[1];
-                        const lng = driverData?.location?.coordinates?.[0];
-
-                        if (!lat || !lng) {
-                            logger.warn(`Invalid driver coordinates - ${driverId}`);
-                            return null;
-                        }
-
-                        const estimatedArrival = await this.mapboxService.getDistanceAndDuration(lat, lng, pickup.latitude, pickup.longitude);
-
-                        return {
-                            driverId,
-                            distanceToPickup: estimatedArrival.distanceText,
-                            etaToPickup: estimatedArrival.durationText,
-                        };
-                    } catch (error: any) {
-                        logger.error(`ETA calculation failed for driver ${driverId}: ${error.message}`);
-                        return null;
-                    }
-                }));
-
-                const validDriverEtas = driversWithEta.filter((d) => d !== null);
-                console.log(validDriverEtas, "<___-----validDriverEtas------>")
-                // Set base ride details (closest driver's ETA)
-                if (validDriverEtas.length === 0) {
-                    logger.warn(`No valid ETA data found for Job ${job.id}. Setting fallback values.`);
-                    job.rideDetails = {
-                        estimatedTime: 'N/A',
-                        estimatedDistance: 'N/A',
-                    } as any;
-                } else {
-                    const bestDriver = validDriverEtas.sort((a, b) => {
-                        const aTime = parseFloat(a.etaToPickup) || Number.MAX_SAFE_INTEGER;
-                        const bTime = parseFloat(b.etaToPickup) || Number.MAX_SAFE_INTEGER;
-                        return aTime - bTime;
-                    })[0];
-
-                    job.rideDetails = {
-                        estimatedTime: bestDriver.etaToPickup,
-                        estimatedDistance: bestDriver.distanceToPickup,
-                    } as any;
-                }
-
-                // Send offers with driver-specific ETAs (extend job with each driver's ETA)
-                const offerResults = await Promise.all(
-                    validDriverEtas.map(async (driverEta) => {
-                        try {
-                            const jobWithDriverEta = {
-                                ...job,
-                                rideDetails: {
-                                    estimatedTime: driverEta.etaToPickup,
-                                    estimatedDistance: driverEta.distanceToPickup,
-                                }
-                            };
-                            await this.offerManagementService.sendOffers(jobWithDriverEta, [driverEta.driverId]);
-                            return true;
-                        } catch (error: any) {
-                            logger.error(`Failed to send offer to driver ${driverEta.driverId}: ${error.message}`);
-                            return false;
-                        }
-                    })
-                );
-
-                const successful = offerResults.filter(r => r).length;
-                const failed = offerResults.length - successful;
-
-                this.metrics.driversMatched += matchedDrivers.length;
-                this.metrics.offersSent += successful;
-                logger.info(` Job Matched - JobId: ${job.id}, Drivers: ${matchedDrivers.length}, Offers Sent: ${successful}, Search Time: ${searchTime}ms`);
-
-                return {
-                    success: true,
-                    message: 'Drivers found and offers sent',
-                    jobId: job.id,
-                    orderNo: payload.orderNo,
-                    driversFound: matchedDrivers.length,
-                    driverIds: matchedDrivers,
-                    offersSent: successful,
-                    offersFailed: failed,
-                    searchTimeMs: searchTime,
-                    timestamp: new Date().toISOString(),
-                };
-            } else {
-                logger.warn(` No Drivers Found - JobId: ${job.id}`);
+            if (!categorizedDrivers) {
+                logger.warn(`No Drivers Found - JobId: ${job.id}`);
                 return {
                     success: false,
                     message: 'No drivers available',
@@ -387,6 +306,120 @@ export class JobOrchestratorService {
                     timestamp: new Date().toISOString(),
                 };
             }
+
+            const matchedDrivers = [
+                ...categorizedDrivers.favDriver,
+                ...categorizedDrivers.priorityDrivers,
+                ...categorizedDrivers.newDrivers,
+                ...categorizedDrivers.nonPriorityDrivers,
+                ...categorizedDrivers.remainingDrivers,
+                ...categorizedDrivers.busyDrivers
+            ];
+
+            // Calculate driver-to-pickup ETAs for all matched drivers
+            const driversWithEta = await Promise.all(
+                matchedDrivers.map(async (driverId) => {
+                    try {
+                        const driverDataJson = await redis.call('JSON.GET', `${driverId}`);
+                        if (!driverDataJson) {
+                            logger.warn(`Driver data not found in Redis - ${driverId}`);
+                            return null;
+                        }
+
+                        const driverData = typeof driverDataJson === 'string'
+                            ? JSON.parse(driverDataJson)
+                            : driverDataJson;
+
+                        const lat = driverData?.location?.coordinates?.[1];
+                        const lng = driverData?.location?.coordinates?.[0];
+
+                        if (!lat || !lng) {
+                            logger.warn(`Invalid driver coordinates - ${driverId}`);
+                            return null;
+                        }
+
+                        // Calculate driver → pickup ETA
+                        const driverToPickupEta = await this.mapboxService.getDistanceAndDuration(
+                            lat,
+                            lng,
+                            pickup.latitude,
+                            pickup.longitude
+                        );
+
+                        return {
+                            driverId,
+                            distanceToPickup: driverToPickupEta.distanceText,
+                            etaToPickup: driverToPickupEta.durationText,
+                        };
+                    } catch (error: any) {
+                        logger.error(`ETA calculation failed for driver ${driverId}: ${error.message}`);
+                        return null;
+                    }
+                })
+            );
+
+            const validDriverEtas = driversWithEta.filter((d) => d !== null);
+
+            logger.info(`Driver ETAs calculated - Job: ${job.id}, Valid: ${validDriverEtas.length}, Invalid: ${matchedDrivers.length - validDriverEtas.length}`);
+
+            if (validDriverEtas.length === 0) {
+                logger.warn(`No valid driver ETA data for Job ${job.id}`);
+                return {
+                    success: false,
+                    message: 'No drivers with valid location data',
+                    jobId: job.id,
+                    orderNo: payload.orderNo,
+                    driversFound: matchedDrivers.length,
+                    driverIds: matchedDrivers,
+                    searchTimeMs: searchTime,
+                    timestamp: new Date().toISOString(),
+                };
+            }
+
+
+            const offerResults = await Promise.all(
+                validDriverEtas.map(async (driverEta) => {
+                    try {
+
+                        const jobWithDriverEta = {
+                            ...job,
+                            rideDetails: {
+                                estimatedTime: driverEta.etaToPickup,
+                                estimatedDistance: driverEta.distanceToPickup,
+                            }
+
+                        };
+
+                        await this.offerManagementService.sendOffers(jobWithDriverEta, [driverEta.driverId]);
+                        logger.info(`Offer sent to driver ${driverEta.driverId} - ETA: ${driverEta.etaToPickup}`);
+                        return true;
+                    } catch (error: any) {
+                        logger.error(`Failed to send offer to driver ${driverEta.driverId}: ${error.message}`);
+                        return false;
+                    }
+                })
+            );
+
+            const successful = offerResults.filter(r => r).length;
+            const failed = offerResults.length - successful;
+
+            this.metrics.driversMatched += matchedDrivers.length;
+            this.metrics.offersSent += successful;
+
+            logger.info(`Job Matched - JobId: ${job.id}, Drivers: ${matchedDrivers.length}, Offers Sent: ${successful}, Failed: ${failed}, Search Time: ${searchTime}ms`);
+
+            return {
+                success: true,
+                message: 'Drivers found and offers sent',
+                jobId: job.id,
+                orderNo: payload.orderNo,
+                driversFound: matchedDrivers.length,
+                driverIds: matchedDrivers,
+                offersSent: successful,
+                offersFailed: failed,
+                searchTimeMs: searchTime,
+                timestamp: new Date().toISOString(),
+            };
 
         } catch (error: any) {
             this.metrics.errors++;
