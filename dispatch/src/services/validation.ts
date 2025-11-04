@@ -63,7 +63,10 @@ export const driverResponseSchema = t.Object({
     jobId: t.String({ error: "Job ID is required" }),
     action: t.Union([
         t.Literal("accept"),
-        t.Literal("reject")
+        t.Literal("reject"),
+        t.Literal("statusUpdate"),
+        t.Literal("canceled"),
+
     ], { error: "Action must be either accept or reject" }),
     reason: t.Optional(t.String())
 });

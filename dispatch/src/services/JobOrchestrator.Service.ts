@@ -2,7 +2,6 @@ import {redis} from '../infrastructure/redis';
 import {logger} from '../logger';
 import {Job, ProcessingMetrics} from '../types';
 import {DriverLocationService} from './DriverLocation.Service';
-import {JobProcessingService} from './JobProcessingService';
 import {DriverMatchingService} from './DriverMatching.Service';
 import {OfferManagementService} from './OfferManagement.Service';
 import {ZoneService} from './ZoneService';
@@ -13,15 +12,19 @@ import {
 
 export class JobOrchestratorService {
     private driverLocationService: DriverLocationService;
-    private jobProcessingService: JobProcessingService;
     private driverMatchingService: DriverMatchingService;
     private offerManagementService: OfferManagementService;
     private zoneService: ZoneService;
-    private mapboxService: MapboxService
+    private mapboxService: MapboxService;
     private isInitialized: boolean = false;
 
     private metrics: ProcessingMetrics = {
-        rpcRequests: 0, jobsProcessed: 0, driversMatched: 0, offersSent: 0, errors: 0, apiCalls: {
+        rpcRequests: 0,
+        jobsProcessed: 0,
+        driversMatched: 0,
+        offersSent: 0,
+        errors: 0,
+        apiCalls: {
             handlePaymentCompleted: 0,
             handleDriverResponse: 0,
             handleGetStats: 0,
@@ -34,7 +37,6 @@ export class JobOrchestratorService {
     constructor() {
         this.driverLocationService = new DriverLocationService();
         this.zoneService = new ZoneService();
-        this.jobProcessingService = new JobProcessingService();
         this.driverMatchingService = new DriverMatchingService(this.driverLocationService, this.zoneService);
         this.offerManagementService = new OfferManagementService();
         this.mapboxService = new MapboxService();
@@ -64,9 +66,11 @@ export class JobOrchestratorService {
                 logger.info('ZoneService already ready');
             }
 
-            logger.info(' Refreshing driver cache...');
+            logger.info('Refreshing driver cache...');
             const refreshPromise = this.driverLocationService.refreshDriverCache();
-            const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('Driver cache refresh timed out after 10s')), 10_000));
+            const timeoutPromise = new Promise((_, reject) =>
+                setTimeout(() => reject(new Error('Driver cache refresh timed out after 10s')), 10_000)
+            );
 
             await Promise.race([refreshPromise, timeoutPromise]);
             logger.info('Driver cache refreshed');
@@ -99,7 +103,7 @@ export class JobOrchestratorService {
 
     stop(): void {
         this.isInitialized = false;
-        logger.info(' Job Orchestrator stopped');
+        logger.info('Job Orchestrator stopped');
     }
 
     isReady(): boolean {
@@ -110,7 +114,9 @@ export class JobOrchestratorService {
         if (!this.isInitialized) {
             logger.error('Job Orchestrator not initialized - rejecting request');
             return {
-                success: false, error: 'Service not initialized', status: 'SERVICE_NOT_READY'
+                success: false,
+                error: 'Service not initialized',
+                status: 'SERVICE_NOT_READY'
             };
         }
 
@@ -130,7 +136,7 @@ export class JobOrchestratorService {
                 }
                 this.metrics.apiCalls.handlePaymentCompleted++;
                 result = await this.handleNewJobEvent(validation.data, data.bookingId || null);
-            } else if (eventType === 'driver.response') {
+            } else if (eventType === 'newBooking.response') {
                 const validation = await validateSchema(driverResponseSchema, data);
                 if (!validation.valid) {
                     logger.error(`Validation failed for driver response: ${validation.errors?.join(', ')}`);
@@ -150,7 +156,10 @@ export class JobOrchestratorService {
             this.metrics.errors++;
             logger.error(`RPC Request Failed - Type: ${eventType}, RequestId: ${requestId}, Error: ${error.message}`);
             return {
-                success: false, error: error.message, type: eventType, requestId
+                success: false,
+                error: error.message,
+                type: eventType,
+                requestId
             };
         }
     }
@@ -161,62 +170,156 @@ export class JobOrchestratorService {
 
         try {
             if (action === 'accept') {
-                await this.offerManagementService.assignDriverToJob(jobId, driverId);
-                this.jobProcessingService.removeJob(jobId);
+                // Get customerId from Redis before assigning
+                const bookingPattern = `booking:${jobId}-*`;
+                const bookingKeys = await redis.keys(bookingPattern);
+
+                let customerId: string | undefined;
+                if (bookingKeys.length > 0) {
+                    const bookingData = await redis.call('JSON.GET', bookingKeys[0], '$.customer._id') as any;
+                    if (bookingData && typeof bookingData === 'string') {
+                        const parsed = JSON.parse(bookingData);
+                        customerId = Array.isArray(parsed) ? parsed[0] : parsed;
+                    }
+                }
+
+                await this.offerManagementService.assignDriverToJob(jobId, driverId, customerId);
+
                 logger.info(`Driver Accepted - Job: ${jobId}, Driver: ${driverId}`);
                 return {
-                    success: true, message: 'Driver assigned to job', jobId, driverId
+                    success: true,
+                    message: 'Driver assigned to job',
+                    jobId,
+                    driverId
                 };
+
             } else if (action === 'reject') {
-                await this.offerManagementService.handleDriverRejection(jobId, driverId, reason);
+                // Get booking data from Redis to reconstruct job
+                const bookingPattern = `booking:${jobId}-*`;
+                const bookingKeys = await redis.keys(bookingPattern);
 
-                const job = this.jobProcessingService.getJob(jobId);
-                if (job) {
-                    const categorizedDrivers = await this.driverMatchingService.findBestDrivers(job, job.customerId);
-
-                    if (!categorizedDrivers) {
-                        logger.warn(`No drivers available - Job: ${jobId}`);
-                        return {
-                            success: false, message: 'No alternative drivers available', jobId
-                        };
-                    }
-
-                    const allDrivers = [...categorizedDrivers.favDriver, ...categorizedDrivers.priorityDrivers, ...categorizedDrivers.newDrivers, ...categorizedDrivers.nonPriorityDrivers, ...categorizedDrivers.remainingDrivers, ...categorizedDrivers.busyDrivers];
-
-                    const alternativeDrivers = await this.offerManagementService.findAlternativeDrivers(jobId, allDrivers);
-
-                    if (alternativeDrivers.length > 0) {
-                        await this.offerManagementService.sendOffers(job, alternativeDrivers);
-                        logger.info(` Alternative offers sent - Job: ${jobId}, Drivers: ${alternativeDrivers.length}`);
-                        return {
-                            success: true,
-                            message: 'Searching for alternative drivers',
-                            jobId,
-                            alternativeDriversFound: alternativeDrivers.length
-                        };
-                    } else {
-                        logger.warn(` No alternative drivers found - Job: ${jobId}`);
-                        return {
-                            success: false, message: 'No alternative drivers available', jobId
-                        };
-                    }
-                } else {
-                    logger.warn(`Job not found - Job: ${jobId}`);
+                if (bookingKeys.length === 0) {
+                    logger.warn(`No booking found for Job: ${jobId}`);
                     return {
-                        success: false, message: 'Job not found', jobId
+                        success: false,
+                        message: 'Job not found in Redis',
+                        jobId
                     };
                 }
+
+                const bookingKey = bookingKeys[0];
+                const bookingDataJson = await redis.call('JSON.GET', bookingKey) as any;
+
+                if (!bookingDataJson) {
+                    logger.warn(`Job data not found - Job: ${jobId}`);
+                    return {
+                        success: false,
+                        message: 'Job data not found',
+                        jobId
+                    };
+                }
+
+                const bookingData = typeof bookingDataJson === 'string'
+                    ? JSON.parse(bookingDataJson)
+                    : bookingDataJson;
+
+                // Extract customer ID from booking pattern or data
+                const customerId = bookingData.customer?._id || bookingKey.split('-')[1];
+
+                // Handle rejection in Redis
+                await this.offerManagementService.handleDriverRejection(jobId, customerId, driverId, reason);
+
+                // Reconstruct Job object from booking data
+                const pickupData = bookingData.tripAddress?.[0];
+                const dropData = bookingData.tripAddress?.[bookingData.tripAddress.length - 1];
+
+                if (!pickupData?.location) {
+                    logger.error(`Invalid pickup data for Job: ${jobId}`);
+                    return {
+                        success: false,
+                        message: 'Invalid job data',
+                        jobId
+                    };
+                }
+
+                const job: Job = {
+                    id: jobId,
+                    customerId: customerId,
+                    pickupLat: pickupData.location.latitude,
+                    pickupLng: pickupData.location.longitude,
+                    dropLat: dropData?.location?.latitude,
+                    dropLng: dropData?.location?.longitude,
+                    fare: bookingData.grandTotal || 0,
+                    vehicleType: bookingData.selectedVehicle?.name || 'Unknown',
+                    tripAddress: bookingData.tripAddress || [],
+                    timestamp: bookingData.createdAt
+                        ? new Date(bookingData.createdAt).getTime()
+                        : Date.now(),
+                    customer: {
+                        fullName: bookingData.customer?.fullName || 'Unknown',
+                        avatar: bookingData.customer?.avatar || '',
+                        distance: bookingData.expectedBilling?.kmText || 'N/A',
+                        time: bookingData.expectedBilling?.durationText || 'N/A'
+                    }
+                };
+
+                // Find alternative drivers
+                const categorizedDrivers = await this.driverMatchingService.findBestDrivers(job, customerId);
+
+                if (!categorizedDrivers) {
+                    logger.warn(`No drivers available - Job: ${jobId}`);
+                    return {
+                        success: false,
+                        message: 'No alternative drivers available',
+                        jobId
+                    };
+                }
+
+                const allDrivers = [
+                    ...categorizedDrivers.favDriver,
+                    ...categorizedDrivers.priorityDrivers,
+                    ...categorizedDrivers.newDrivers,
+                    ...categorizedDrivers.nonPriorityDrivers,
+                    ...categorizedDrivers.remainingDrivers,
+                    ...categorizedDrivers.busyDrivers
+                ];
+
+                const alternativeDrivers = await this.offerManagementService.findAlternativeDrivers(jobId, allDrivers);
+
+                if (alternativeDrivers.length > 0) {
+                    await this.offerManagementService.sendOffers(job, alternativeDrivers);
+                    logger.info(`Alternative offers sent - Job: ${jobId}, Drivers: ${alternativeDrivers.length}`);
+                    return {
+                        success: true,
+                        message: 'Searching for alternative drivers',
+                        jobId,
+                        alternativeDriversFound: alternativeDrivers.length
+                    };
+                } else {
+                    logger.warn(`No alternative drivers found - Job: ${jobId}`);
+                    return {
+                        success: false,
+                        message: 'No alternative drivers available',
+                        jobId
+                    };
+                }
+
             } else {
                 logger.warn(`Unknown Driver Action - Action: ${action}`);
                 return {
-                    success: false, error: 'Unknown driver action', action
+                    success: false,
+                    error: 'Unknown driver action',
+                    action
                 };
             }
         } catch (error: any) {
             this.metrics.errors++;
-            logger.error(` Driver Response Error - Job: ${jobId}, Driver: ${driverId}, Error: ${error.message}`);
+            logger.error(`Driver Response Error - Job: ${jobId}, Driver: ${driverId}, Error: ${error.message}`);
             return {
-                success: false, error: error.message, jobId, driverId
+                success: false,
+                error: error.message,
+                jobId,
+                driverId
             };
         }
     }
@@ -260,7 +363,7 @@ export class JobOrchestratorService {
         };
 
         try {
-            // Calculate trip ETA (pickup to drop) - stored in job.customer
+            // Calculate trip ETA (pickup to drop)
             if (drop) {
                 const tripEta = await this.mapboxService.getDistanceAndDuration(
                     pickup.latitude,
@@ -272,8 +375,8 @@ export class JobOrchestratorService {
                 job.dropLat = drop.latitude;
                 job.dropLng = drop.longitude;
                 job.customer = {
-                    time: tripEta.durationText,        // Trip duration (pickup → drop)
-                    distance: tripEta.distanceText,    // Trip distance (pickup → drop)
+                    time: tripEta.durationText,
+                    distance: tripEta.distanceKm,
                     fullName: customer.fullName || 'Unknown',
                     avatar: customer.avatar || '',
                 };
@@ -283,7 +386,7 @@ export class JobOrchestratorService {
                 logger.warn(`Drop location missing — Skipping trip ETA calculation for Job ${job.id}`);
                 job.customer = {
                     time: 'N/A',
-                    distance: 'N/A',
+                    distance: 0,
                     fullName: customer.fullName || 'Unknown',
                     avatar: customer.avatar || '',
                 };
@@ -316,7 +419,7 @@ export class JobOrchestratorService {
                 ...categorizedDrivers.busyDrivers
             ];
 
-            // Calculate driver-to-pickup ETAs for all matched drivers
+            // Calculate driver-to-pickup ETAs
             const driversWithEta = await Promise.all(
                 matchedDrivers.map(async (driverId) => {
                     try {
@@ -338,7 +441,6 @@ export class JobOrchestratorService {
                             return null;
                         }
 
-                        // Calculate driver → pickup ETA
                         const driverToPickupEta = await this.mapboxService.getDistanceAndDuration(
                             lat,
                             lng,
@@ -376,18 +478,15 @@ export class JobOrchestratorService {
                 };
             }
 
-
             const offerResults = await Promise.all(
                 validDriverEtas.map(async (driverEta) => {
                     try {
-
                         const jobWithDriverEta = {
                             ...job,
                             rideDetails: {
                                 estimatedTime: driverEta.etaToPickup,
-                                estimatedDistance: driverEta.distanceToPickup,
+                                estimatedDistance: parseFloat(driverEta.distanceToPickup) || 0,
                             }
-
                         };
 
                         await this.offerManagementService.sendOffers(jobWithDriverEta, [driverEta.driverId]);

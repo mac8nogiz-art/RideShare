@@ -33,7 +33,7 @@ export interface Customer {
 
     fullName: string;
     avatar: string;
-    distance: string;
+    distance: number;
     time:string;
 }
 
@@ -53,7 +53,7 @@ export interface Job {
     customer?: Customer;
     rideDetails?: {
         estimatedTime: string;
-        estimatedDistance: string;
+        estimatedDistance: number;
     };
 }
 
