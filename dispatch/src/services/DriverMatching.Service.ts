@@ -56,12 +56,13 @@ export class DriverMatchingService {
 
                 if (eligibleDrivers.length > 0) {
 
-                    const categorizedDrivers = this.categorizeDrivers(eligibleDrivers, favoriteSet);
+                    const categorizedDrivers = this.categorizeDrivers(eligibleDrivers, favoriteSet, job.id);
 
-                    await this.storeMatchedDrivers(job.id, categorizedDrivers);
+
 
                     logger.info(`Matched ${eligibleDrivers.length} driver(s) at ${radius}km in ${Date.now() - startTime}ms`);
 
+                    // @ts-ignore
                     return categorizedDrivers;
                 }
             }
@@ -115,7 +116,7 @@ export class DriverMatchingService {
                     const [lng, lat] = driverData.location?.coordinates || [];
 
                     return {
-                        driverId: driverIds[i],
+                        driverId: driverIds[i].replaceAll('driver:',''),
                         lat,
                         lng,
                         iAmBusy: driverData.iAmBusy,
@@ -125,6 +126,7 @@ export class DriverMatchingService {
                     };
                 })
                 .filter((item: any) => item !== null);
+            console.log("drivers----->", drivers);
 
             return drivers;
         } catch (error: any) {
@@ -160,39 +162,43 @@ export class DriverMatchingService {
             return {favoriteSet: new Set(), blockedSet: new Set()};
         }
     }
+    private async categorizeDrivers(
+        drivers: DriverWithDistance[],
+        favoriteSet: Set<string>,
+        jobId: string
+    ){
 
-    private categorizeDrivers(drivers: DriverWithDistance[], favoriteSet: Set<string>): CategorizedDrivers {
         const categories = {
-            favDriver: [] as Array<{id: string; dist: number}>,
-            priorityDrivers: [] as Array<{id: string; dist: number}>,
-            newDrivers: [] as Array<{id: string; dist: number}>,
-            nonPriorityDrivers: [] as Array<{id: string; dist: number}>,
-            remainingDrivers: [] as Array<{id: string; dist: number}>,
-            busyDrivers: [] as Array<{id: string; dist: number}>
+            favDriver: [] as Array<{ id: string; dist: number,category:string }>,
+            priorityDrivers: [] as Array<{ id: string; dist: number,category:string }>,
+            newDrivers: [] as Array<{ id: string; dist: number,category:string }>,
+            nonPriorityDrivers: [] as Array<{ id: string; dist: number,category:string }>,
+            remainingDrivers: [] as Array<{ id: string; dist: number,category:string }>,
+            busyDrivers: [] as Array<{ id: string; dist: number,category:string }>
         };
 
+        const pipeline = redis.pipeline();
+        console.log(drivers, "drivers-------->")
         for (const d of drivers) {
-            const obj = {id: d.driverId, dist: d.distance};
+            const obj = { id: d.driverId, dist: d.distance } ;
 
             if (favoriteSet.has(d.driverId)) {
-                categories.favDriver.push(obj);
+                categories.favDriver.push({...obj,category : 'favDriver'});
             } else if (d.priorityScore >= 80 && d.priorityScore <= 100) {
-                categories.priorityDrivers.push(obj);
+                categories.priorityDrivers.push({...obj,category : 'priorityDrivers'});
             } else if (d.isNew) {
-                categories.newDrivers.push(obj);
+                categories.newDrivers.push({...obj,category : 'newDrivers'});
             } else if (d.priorityScore >= 60 && d.priorityScore < 80) {
-                categories.nonPriorityDrivers.push(obj);
-            } else if (d.isBusy) {
-                categories.busyDrivers.push(obj);
+                categories.nonPriorityDrivers.push({...obj,category : 'nonPriorityDrivers'});
             } else {
-                categories.remainingDrivers.push(obj);
+                categories.remainingDrivers.push({...obj,category : 'remainingDrivers'});
             }
         }
 
-        const sortByDist = (arr: Array<{id: string; dist: number}>) =>
-            arr.sort((a, b) => a.dist - b.dist).map(x => x.id);
+        const sortByDist = (arr: Array<{ id: string; dist: number }>) =>
+            arr.sort((a, b) => a.dist - b.dist)
 
-        return {
+        const categorizedDrivers = {
             favDriver: sortByDist(categories.favDriver),
             priorityDrivers: sortByDist(categories.priorityDrivers),
             newDrivers: sortByDist(categories.newDrivers),
@@ -200,13 +206,8 @@ export class DriverMatchingService {
             remainingDrivers: sortByDist(categories.remainingDrivers),
             busyDrivers: sortByDist(categories.busyDrivers)
         };
-    }
-
-    private async storeMatchedDrivers(jobId: string, categorizedDrivers: CategorizedDrivers): Promise<void> {
-        const rankingKey = `job:${jobId}:matched_drivers`;
-        const pipeline = redis.pipeline();
-
-        const allDrivers = [
+        console.log("-------->categrized", categorizedDrivers)
+        const allDrivers:any = [
             ...categorizedDrivers.favDriver,
             ...categorizedDrivers.priorityDrivers,
             ...categorizedDrivers.newDrivers,
@@ -214,27 +215,31 @@ export class DriverMatchingService {
             ...categorizedDrivers.remainingDrivers,
             ...categorizedDrivers.busyDrivers
         ];
+        console.log("-------->",allDrivers)
 
-        const driverKeys = allDrivers.map(id => id);
-        const priorityScores: any = await redis.call('JSON.MGET', ...driverKeys, '$.priorityScore');
+        const driverQueueKey = `job:${jobId}:driver_queue`;
+        pipeline.del(driverQueueKey);
 
-        for (let i = 0; i < allDrivers.length; i++) {
-            const driverId = allDrivers[i];
-            let score = -1;
+        for (const driver of allDrivers) {
+            const driverHashKey = `job:${jobId}:driver:${driver?.id || ''}`;
 
-            if (categorizedDrivers.favDriver.includes(driverId)) {
-                score = 110;
-            } else {
-                const parsed = priorityScores[i] ? JSON.parse(priorityScores[i])?.[0] : null;
-                score = parsed !== undefined && parsed !== null ? parsed : -1;
-            }
+            pipeline.hset(driverHashKey, {
+                driverId: driver.id,
+                // distance: driver.dist.toString(),
+                status: "pending",
+                category: driver.category
+            });
 
-            pipeline.zadd(rankingKey, score, driverId);
+            pipeline.rpush(driverQueueKey, driver.id);
         }
 
-        pipeline.expire(rankingKey, this.MATCHED_DRIVERS_TTL);
+        logger.info(`Total drivers found: ${allDrivers.length} and stored in ${driverQueueKey}`);
+
         await pipeline.exec();
 
-        logger.info(`Stored ${allDrivers.length} matched drivers for job ${jobId}`);
+        return categorizedDrivers;
     }
+
+
+
 }
