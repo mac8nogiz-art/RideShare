@@ -6,6 +6,7 @@ import {ZoneService} from './ZoneService';
 import {SpatialService} from '../infrastructure/spatial';
 import {ObjectId} from 'mongodb';
 import {getMongoDB} from "../infrastructure/mongo";
+import {MapboxService} from './MapboxService';
 
 interface CategorizedDrivers {
     favDriver: string[];
@@ -20,12 +21,14 @@ export class DriverMatchingService {
     private driverLocationService: DriverLocationService;
     private zoneService: ZoneService;
     private spatialService: SpatialService;
+    private mapboxService: MapboxService;
     private readonly MATCHED_DRIVERS_TTL = 900; // 15 min
 
     constructor(driverLocationService: DriverLocationService, zoneService: ZoneService) {
         this.driverLocationService = driverLocationService;
         this.zoneService = zoneService;
         this.spatialService = new SpatialService();
+        this.mapboxService = new MapboxService();
     }
 
     async findBestDrivers(job: Job, customerId: string): Promise<CategorizedDrivers | null> {
@@ -44,10 +47,9 @@ export class DriverMatchingService {
 
             logger.info(`Looking for drivers in zones: ${zoneIds.join(', ')}`);
 
-            const radiusSteps = [3, 6, 9, 12, 15];
+            const radiusSteps = [2, 4, 6];
 
             for (const radius of radiusSteps) {
-
                 const drivers = await this.getNearbyDriversInZone(job.pickupLat, job.pickupLng, zoneIds, radius);
 
                 logger.info(`Found ${drivers.length} drivers within ${radius}km`);
@@ -55,8 +57,15 @@ export class DriverMatchingService {
                 const eligibleDrivers = drivers.filter(d => !blockedSet.has(d.driverId));
 
                 if (eligibleDrivers.length > 0) {
-
-                    const categorizedDrivers = this.categorizeDrivers(eligibleDrivers, favoriteSet, job.id);
+                    // Pass radius to categorization to apply filtering rules
+                    const categorizedDrivers = await this.categorizeDrivers(
+                        eligibleDrivers,
+                        favoriteSet,
+                        job.id,
+                        radius,
+                        job.pickupLat,
+                        job.pickupLng
+                    );
 
                     logger.info(`Matched ${eligibleDrivers.length} driver(s) at ${radius}km in ${Date.now() - startTime}ms`);
 
@@ -160,41 +169,49 @@ export class DriverMatchingService {
             return {favoriteSet: new Set(), blockedSet: new Set()};
         }
     }
+
     private async categorizeDrivers(
         drivers: DriverWithDistance[],
         favoriteSet: Set<string>,
-        jobId: string
+        jobId: string,
+        radius: number,
+        pickupLat: number,
+        pickupLng: number
     ){
-
         const categories = {
-            favDriver: [] as Array<{ id: string; dist: number,category:string }>,
-            priorityDrivers: [] as Array<{ id: string; dist: number,category:string }>,
-            newDrivers: [] as Array<{ id: string; dist: number,category:string }>,
-            nonPriorityDrivers: [] as Array<{ id: string; dist: number,category:string }>,
-            remainingDrivers: [] as Array<{ id: string; dist: number,category:string }>,
-            busyDrivers: [] as Array<{ id: string; dist: number,category:string }>
+            favDriver: [] as Array<{ id: string; dist: number; category: string; lat: number; lng: number }>,
+            priorityDrivers: [] as Array<{ id: string; dist: number; category: string; lat: number; lng: number }>,
+            newDrivers: [] as Array<{ id: string; dist: number; category: string; lat: number; lng: number }>,
+            nonPriorityDrivers: [] as Array<{ id: string; dist: number; category: string; lat: number; lng: number }>,
+            remainingDrivers: [] as Array<{ id: string; dist: number; category: string; lat: number; lng: number }>,
+            busyDrivers: [] as Array<{ id: string; dist: number; category: string; lat: number; lng: number }>
         };
 
-        const pipeline = redis.pipeline();
-        console.log(drivers, "drivers-------->")
+        console.log(drivers, "drivers-------->");
+
         for (const d of drivers) {
-            const obj = { id: d.driverId, dist: d.distance } ;
+            const obj = { id: d.driverId, dist: d.distance, lat: d.lat, lng: d.lng };
 
             if (favoriteSet.has(d.driverId)) {
-                categories.favDriver.push({...obj,category : 'favDriver'});
+                categories.favDriver.push({...obj, category: 'favDriver'});
             } else if (d.priorityScore >= 80 && d.priorityScore <= 100) {
-                categories.priorityDrivers.push({...obj,category : 'priorityDrivers'});
+                categories.priorityDrivers.push({...obj, category: 'priorityDrivers'});
             } else if (d.isNew) {
-                categories.newDrivers.push({...obj,category : 'newDrivers'});
+                categories.newDrivers.push({...obj, category: 'newDrivers'});
             } else if (d.priorityScore >= 60 && d.priorityScore < 80) {
-                categories.nonPriorityDrivers.push({...obj,category : 'nonPriorityDrivers'});
+                categories.nonPriorityDrivers.push({...obj, category: 'nonPriorityDrivers'});
             } else {
-                categories.remainingDrivers.push({...obj,category : 'remainingDrivers'});
+                // Only add to remainingDrivers
+                if (radius === 6) {
+                    categories.remainingDrivers.push({...obj, category: 'remainingDrivers'});
+                }
             }
+
+
         }
 
         const sortByDist = (arr: Array<{ id: string; dist: number }>) =>
-            arr.sort((a, b) => a.dist - b.dist)
+            arr.sort((a, b) => a.dist - b.dist);
 
         const categorizedDrivers = {
             favDriver: sortByDist(categories.favDriver),
@@ -204,8 +221,10 @@ export class DriverMatchingService {
             remainingDrivers: sortByDist(categories.remainingDrivers),
             busyDrivers: sortByDist(categories.busyDrivers)
         };
-        console.log("-------->categrized", categorizedDrivers)
-        const allDrivers:any = [
+
+        console.log("-------->categorized", categorizedDrivers);
+
+        let allDrivers: any = [
             ...categorizedDrivers.favDriver,
             ...categorizedDrivers.priorityDrivers,
             ...categorizedDrivers.newDrivers,
@@ -213,9 +232,51 @@ export class DriverMatchingService {
             ...categorizedDrivers.remainingDrivers,
             ...categorizedDrivers.busyDrivers
         ];
-        console.log("-------->",allDrivers)
+
+        // Sort first 4 drivers using Mapbox API
+        if (allDrivers.length > 0) {
+            const firstFourDrivers = allDrivers.slice(0, Math.min(4, allDrivers.length));
+            const remainingDriversAfterFour = allDrivers.slice(4);
+
+            logger.info(`Sorting first ${firstFourDrivers.length} drivers using Mapbox API`);
+
+            const driversWithMapboxDistance = await Promise.all(
+                firstFourDrivers.map(async (driver: any) => {
+                    try {
+                        const result = await this.mapboxService.getDistanceAndDuration(
+                            pickupLat,
+                            pickupLng,
+                            driver.lat,
+                            driver.lng
+                        );
+                        return {
+                            ...driver,
+                            mapboxDistance: result.distanceKm,
+                            mapboxDuration: result.durationMin
+                        };
+                    } catch (error: any) {
+                        logger.warn(`Failed to get Mapbox distance for driver ${driver.id}: ${error.message}, using straight-line distance`);
+                        return {
+                            ...driver,
+                            mapboxDistance: driver.dist,
+                            mapboxDuration: null
+                        };
+                    }
+                })
+            );
+
+            driversWithMapboxDistance.sort((a, b) => a.mapboxDistance - b.mapboxDistance);
+
+            logger.info(`Sorted first 4 drivers by Mapbox distance`);
+
+            allDrivers = [...driversWithMapboxDistance, ...remainingDriversAfterFour];
+        }
+
+        console.log("-------->final allDrivers after Mapbox sorting", allDrivers);
+
 
         const driverQueueKey = `job:${jobId}:driver_queue`;
+        const pipeline = redis.pipeline();
         pipeline.del(driverQueueKey);
 
         for (const driver of allDrivers) {
@@ -223,9 +284,10 @@ export class DriverMatchingService {
 
             pipeline.hset(driverHashKey, {
                 driverId: driver.id,
-                // distance: driver.dist.toString(),
                 status: "pending",
-                category: driver.category
+                category: driver.category,
+                mapboxDistance: driver.mapboxDistance?.toString() || driver.dist.toString(),
+                mapboxDuration: driver.mapboxDuration?.toString() || ''
             });
 
             pipeline.rpush(driverQueueKey, driver.id);
@@ -237,7 +299,4 @@ export class DriverMatchingService {
 
         return categorizedDrivers;
     }
-
-
-
 }

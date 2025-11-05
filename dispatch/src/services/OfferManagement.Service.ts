@@ -18,7 +18,7 @@ export class OfferManagementService {
         for (const driverId of driverIds) {
             logger.info(` Sending Offer to Driver: ${driverId}`);
             try {
-                await this.sendSingleOffer(job, driverId, job.id, job.customerId);
+                await this.sendSingleOffer(job, driverId);
                 successful++;
 
                 await this.updateDriverQueueStatus(job.id, driverId, 'offered');
@@ -57,7 +57,7 @@ export class OfferManagementService {
         return { successful, failed };
     }
 
-    private async sendSingleOffer(job: Job, driverId: string, jobId: string, customerId: string): Promise<void> {
+    private async sendSingleOffer(job: Job, driverId: string): Promise<void> {
         const expiryTime = this.OFFER_EXPIRY_SECONDS + Math.floor(Math.random() * 3);
         const driverObjectId = driverId.startsWith('driver:') ? driverId.split(':')[1] : driverId;
 
@@ -103,7 +103,6 @@ export class OfferManagementService {
             pipeline.hset(driverHashKey, 'status', status);
 
             pipeline.hset(driverHashKey, `${status}At`, new Date().toISOString());
-
             pipeline.hset(driverHashKey, 'lastUpdated', new Date().toISOString());
 
             await pipeline.exec();
@@ -256,7 +255,7 @@ export class OfferManagementService {
                     pipeline.del(`offer:${jobId}:${driverId}`);
                     pipeline.srem(`driver:${driverId}:offers`, jobId);
 
-                    // Update driver queue status to cancelled
+
                     this.updateDriverQueueStatus(jobId, driverId, 'cancelled').catch(err =>
                         logger.error(`Update Queue Status Error - Driver: ${driverId}, Error: ${err}`)
                     );

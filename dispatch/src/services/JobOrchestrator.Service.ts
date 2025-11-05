@@ -67,6 +67,7 @@ export class JobOrchestratorService {
             }
 
             logger.info('Refreshing driver cache...');
+
             const refreshPromise = this.driverLocationService.refreshDriverCache();
             const timeoutPromise = new Promise((_, reject) =>
                 setTimeout(() => reject(new Error('Driver cache refresh timed out after 10s')), 10_000)
@@ -111,6 +112,7 @@ export class JobOrchestratorService {
     }
 
     async handleRPCRequest(data: any): Promise<any> {
+
         if (!this.isInitialized) {
             logger.error('Job Orchestrator not initialized - rejecting request');
             return {
@@ -121,8 +123,11 @@ export class JobOrchestratorService {
         }
 
         const requestId = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
         const eventType = data.type;
+
         logger.info(`RPC Request Received - Type: ${eventType}, RequestId: ${requestId}`);
+
         this.metrics.rpcRequests++;
 
         try {
