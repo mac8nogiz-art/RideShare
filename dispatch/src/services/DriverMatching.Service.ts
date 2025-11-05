@@ -58,8 +58,6 @@ export class DriverMatchingService {
 
                     const categorizedDrivers = this.categorizeDrivers(eligibleDrivers, favoriteSet, job.id);
 
-
-
                     logger.info(`Matched ${eligibleDrivers.length} driver(s) at ${radius}km in ${Date.now() - startTime}ms`);
 
                     // @ts-ignore

@@ -15,31 +15,34 @@ export class OfferManagementService {
         let successful = 0;
         let failed = 0;
 
-        const currentAskDrivers = await this.getAskDriversFromBooking(job.id, job.customerId);
-
         for (const driverId of driverIds) {
             logger.info(` Sending Offer to Driver: ${driverId}`);
             try {
-                await this.sendSingleOffer(job, driverId, currentAskDrivers);
+                await this.sendSingleOffer(job, driverId, job.id, job.customerId);
                 successful++;
+
+                await this.updateDriverQueueStatus(job.id, driverId, 'offered');
 
                 logger.info(`Offer Sent - JobId: ${job.id}, Driver: ${driverId}`);
                 const accepted = await this.waitForDriverResponseOrTimeout(job.id, driverId, this.OFFER_EXPIRY_SECONDS * 1000);
 
                 if (accepted) {
                     logger.info(` Driver ${driverId} accepted Job ${job.id}. Stopping offer cycle.`);
+                    await this.updateDriverQueueStatus(job.id, driverId, 'accepted');
                     this.cancelOtherOffers(job.id, driverId).catch(err => {
                         logger.error(`Cancel Other Offers Error - JobId: ${job.id}, Error: ${err}`);
                     });
                     break;
                 } else {
                     logger.warn(` Driver ${driverId} did not respond in time for Job ${job.id}. Auto-rejecting.`);
+                    await this.updateDriverQueueStatus(job.id, driverId, 'timeout');
                     await this.handleDriverRejection(job.id, job.customerId, driverId, 'Offer timed out');
                 }
 
                 await new Promise(res => setTimeout(res, 200));
             } catch (error: any) {
                 failed++;
+                await this.updateDriverQueueStatus(job.id, driverId, 'failed').catch(() => {});
                 logger.error(`Failed to send offer to Driver ${driverId}: ${error?.message || error}`);
             }
 
@@ -54,7 +57,7 @@ export class OfferManagementService {
         return { successful, failed };
     }
 
-    private async sendSingleOffer(job: Job, driverId: string, currentAskDrivers: string[]): Promise<void> {
+    private async sendSingleOffer(job: Job, driverId: string, jobId: string, customerId: string): Promise<void> {
         const expiryTime = this.OFFER_EXPIRY_SECONDS + Math.floor(Math.random() * 3);
         const driverObjectId = driverId.startsWith('driver:') ? driverId.split(':')[1] : driverId;
 
@@ -74,29 +77,59 @@ export class OfferManagementService {
             customer: {
                 fullName: (job as any).customer?.fullName || "",
                 avatar: (job as any).customer?.avatar || "",
-                distance: (job as any).customer?.distance || "",
+                distance: (job as any).customer?.distance ,
                 time: (job as any).customer?.time || "",
             }
         };
 
         await redis.setex(`offer:${job.id}:${driverId}`, this.OFFER_EXPIRY_SECONDS, JSON.stringify(offerData));
-        await this.updateBookingInRedis(job.id, job.customerId, driverObjectId, expiryTime, currentAskDrivers);
-
-        // Save job notification for driver
         await this.saveJobNotification(job, driverObjectId, expiryTime);
-
         await this.publishAssignmentEventWithRetry('new_job.offer_sent', this.KAFKA_TOPIC_OFFERS, job.id, driverId, offerData);
+
     }
 
-    /**
-     * Saves job notification to Redis using JSON data type
-     * Key format: jobnotification:{driverId}
-     */
+    private async updateDriverQueueStatus(jobId: string, driverId: string, status: string): Promise<void> {
+        try {
+            const driverHashKey = `job:${jobId}:driver:${driverId}`;
+
+            const exists = await redis.exists(driverHashKey);
+            if (!exists) {
+                logger.warn(`Driver hash key not found - JobId: ${jobId}, Driver: ${driverId}`);
+                return;
+            }
+
+            const pipeline = redis.pipeline();
+
+            pipeline.hset(driverHashKey, 'status', status);
+
+            pipeline.hset(driverHashKey, `${status}At`, new Date().toISOString());
+
+            pipeline.hset(driverHashKey, 'lastUpdated', new Date().toISOString());
+
+            await pipeline.exec();
+
+            // const statusEvent = {
+            //     jobId,
+            //     driverId,
+            //     status,
+            //     timestamp: new Date().toISOString()
+            // };
+
+            // await redis.publish(
+            //     `job:${jobId}:driver_status_updates`,
+            //     JSON.stringify(statusEvent)
+            // // );
+
+            logger.debug(`Driver Queue Status Updated - JobId: ${jobId}, Driver: ${driverId}, Status: ${status}`);
+        } catch (error) {
+            logger.error(`Update Driver Queue Status Error - JobId: ${jobId}, Driver: ${driverId}, Status: ${status}, Error: ${error}`);
+            throw error;
+        }
+    }
     private async saveJobNotification(job: Job, driverId: string, expiryTime: number): Promise<void> {
         try {
             const notificationKey = `jobnotification:${driverId}`;
 
-            // Calculate expiry timestamp
             const expiryTimestamp = new Date();
             expiryTimestamp.setSeconds(expiryTimestamp.getSeconds() + expiryTime);
 
@@ -119,22 +152,15 @@ export class OfferManagementService {
                 }
             };
 
-            // Use JSON.SET to store the notification
             await redis.call('JSON.SET', notificationKey, '$', JSON.stringify(notificationData));
-
-            // Set TTL for the notification (slightly longer than offer expiry)
             await redis.expire(notificationKey, this.OFFER_EXPIRY_SECONDS + 5);
 
             logger.info(`Job Notification Saved - Driver: ${driverId}, JobId: ${job.id}, TTL: ${this.OFFER_EXPIRY_SECONDS + 5}s`);
         } catch (error) {
             logger.error(`Save Job Notification Error - Driver: ${driverId}, JobId: ${job.id}, Error: ${error}`);
-            // Don't throw - notification failure shouldn't block the offer
         }
     }
 
-    /**
-     * Deletes job notification when offer is accepted, rejected, or cancelled
-     */
     private async deleteJobNotification(driverId: string): Promise<void> {
         try {
             const notificationKey = `jobnotification:${driverId}`;
@@ -142,70 +168,6 @@ export class OfferManagementService {
             logger.debug(`Job Notification Deleted - Driver: ${driverId}`);
         } catch (error) {
             logger.error(`Delete Job Notification Error - Driver: ${driverId}, Error: ${error}`);
-        }
-    }
-
-    /**
-     * Finds booking key using pattern: booking:{jobId}-{customerId}-*
-     * Returns the askDrivers array from the booking (stored as JSON)
-     */
-    private async getAskDriversFromBooking(jobId: string, customerId: string): Promise<string[]> {
-        try {
-            const pattern = `booking:${jobId}-${customerId}-*`;
-            const bookingKeys = await redis.keys(pattern);
-
-            if (bookingKeys.length === 0) {
-                logger.warn(`No booking found for JobId: ${jobId}, CustomerId: ${customerId}`);
-                return [];
-            }
-
-            const bookingKey = bookingKeys[0];
-
-            // Use JSON.GET to retrieve the askDrivers field
-            const askDrivers = await redis.call('JSON.GET', bookingKey, '$.askDrivers') as any;
-
-            // JSON.GET with JSONPath returns an array with the result
-            if (askDrivers && typeof askDrivers === 'string') {
-                const parsed = JSON.parse(askDrivers);
-                const driversArray = Array.isArray(parsed) ? parsed[0] : parsed;
-                logger.debug(`Found ${driversArray?.length || 0} drivers already asked for Job ${jobId}`);
-                return Array.isArray(driversArray) ? driversArray : [];
-            }
-
-            return [];
-        } catch (error) {
-            logger.error(`Get AskDrivers Error - JobId: ${jobId}, CustomerId: ${customerId}, Error: ${error}`);
-            return [];
-        }
-    }
-
-    /**
-     * Updates booking in Redis using pattern: booking:{jobId}-{customerId}-*
-     * Adds driver to askDrivers array and updates booking metadata using JSON.SET
-     */
-    private async updateBookingInRedis(jobId: string, customerId: string, driverId: string, expiryTime: number, currentAskDrivers: string[]): Promise<void> {
-        try {
-            const pattern = `booking:${jobId}-${customerId}-*`;
-            const bookingKeys = await redis.keys(pattern);
-
-            if (bookingKeys.length === 0) {
-                logger.warn(`No booking found for JobId: ${jobId}, CustomerId: ${customerId}`);
-                return;
-            }
-
-            const bookingKey = bookingKeys[0];
-
-            // Add new driver to askDrivers array (avoid duplicates)
-            const updatedAskDrivers = [...new Set([...currentAskDrivers, driverId])];
-
-            // Update multiple fields using JSON.SET
-            await redis.call('JSON.SET', bookingKey, '$.askDrivers', JSON.stringify(updatedAskDrivers));
-            await redis.call('JSON.SET', bookingKey, '$.askDriver', JSON.stringify({ driver: driverId, expTime: expiryTime }));
-            // await redis.expire(bookingKey, this.OFFER_EXPIRY_SECONDS);
-
-            logger.info(`Booking Updated - JobId: ${jobId}, Driver: ${driverId}, AskDrivers: ${updatedAskDrivers.length}`);
-        } catch (error) {
-            logger.error(`Update Booking Error - JobId: ${jobId}, CustomerId: ${customerId}, Driver: ${driverId}, Error: ${error}`);
         }
     }
 
@@ -253,7 +215,8 @@ export class OfferManagementService {
         pipeline.srem(`driver:${driverId}:offers`, jobId);
         await pipeline.exec();
 
-        // Delete job notification after assignment
+        await this.updateDriverQueueStatus(jobId, driverId, 'accepted');
+
         await this.deleteJobNotification(driverId);
 
         await this.publishAssignmentEventWithRetry('new_job.assigned', this.KAFKA_TOPIC_ASSIGNMENTS, jobId, driverId);
@@ -274,7 +237,9 @@ export class OfferManagementService {
         pipeline.sadd(`job:${jobId}:rejected_drivers`, driverId);
         await pipeline.exec();
 
-        // Delete job notification after rejection
+        // Update driver queue status to rejected
+        await this.updateDriverQueueStatus(jobId, driverId, 'rejected');
+
         await this.deleteJobNotification(driverId);
 
         logger.debug(`Driver Rejection Processed - JobId: ${jobId}, Driver: ${driverId}`);
@@ -290,7 +255,12 @@ export class OfferManagementService {
                 if (driverId !== acceptedDriverId) {
                     pipeline.del(`offer:${jobId}:${driverId}`);
                     pipeline.srem(`driver:${driverId}:offers`, jobId);
-                    // Delete notifications for cancelled offers
+
+                    // Update driver queue status to cancelled
+                    this.updateDriverQueueStatus(jobId, driverId, 'cancelled').catch(err =>
+                        logger.error(`Update Queue Status Error - Driver: ${driverId}, Error: ${err}`)
+                    );
+
                     this.deleteJobNotification(driverId).catch(err =>
                         logger.error(`Delete Notification Error - Driver: ${driverId}, Error: ${err}`)
                     );

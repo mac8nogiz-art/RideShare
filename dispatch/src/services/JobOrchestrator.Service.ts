@@ -363,7 +363,7 @@ export class JobOrchestratorService {
         };
 
         try {
-            // Calculate trip ETA (pickup to drop)
+            // Calculate trip ETA (pickup to drop) - Store in rideDetails
             if (drop) {
                 const tripEta = await this.mapboxService.getDistanceAndDuration(
                     pickup.latitude,
@@ -374,25 +374,20 @@ export class JobOrchestratorService {
 
                 job.dropLat = drop.latitude;
                 job.dropLng = drop.longitude;
-                job.customer = {
-                    time: tripEta.durationText,
-                    distance: tripEta.distanceKm,
-                    fullName: customer.fullName || 'Unknown',
-                    avatar: customer.avatar || '',
+                job.rideDetails = {
+                    estimatedTime: tripEta.durationText,
+                    estimatedDistance: tripEta.distanceKm,
                 };
 
                 logger.info(`Trip ETA Calculated for Job ${job.id} — Distance: ${tripEta.distanceText}, Duration: ${tripEta.durationText}`);
             } else {
                 logger.warn(`Drop location missing — Skipping trip ETA calculation for Job ${job.id}`);
-                job.customer = {
-                    time: 'N/A',
-                    distance: 0,
-                    fullName: customer.fullName || 'Unknown',
-                    avatar: customer.avatar || '',
+                job.rideDetails = {
+                    estimatedTime: 'N/A',
+                    estimatedDistance: 0,
                 };
             }
 
-            // Find available drivers
             const categorizedDrivers = await this.driverMatchingService.findBestDrivers(job, job.customerId);
             const searchTime = Date.now() - startTime;
 
@@ -417,13 +412,13 @@ export class JobOrchestratorService {
                 ...categorizedDrivers.nonPriorityDrivers,
                 ...categorizedDrivers.remainingDrivers,
                 ...categorizedDrivers.busyDrivers
-            ];
+            ].map((d: any) => d.id);
 
             // Calculate driver-to-pickup ETAs
             const driversWithEta = await Promise.all(
                 matchedDrivers.map(async (driverId) => {
                     try {
-                        const driverDataJson = await redis.call('JSON.GET', `${driverId}`);
+                        const driverDataJson = await redis.call('JSON.GET', `driver:${driverId}`);
                         if (!driverDataJson) {
                             logger.warn(`Driver data not found in Redis - ${driverId}`);
                             return null;
@@ -450,7 +445,7 @@ export class JobOrchestratorService {
 
                         return {
                             driverId,
-                            distanceToPickup: driverToPickupEta.distanceText,
+                            distanceToPickup: driverToPickupEta.distanceKm,
                             etaToPickup: driverToPickupEta.durationText,
                         };
                     } catch (error: any) {
@@ -481,11 +476,14 @@ export class JobOrchestratorService {
             const offerResults = await Promise.all(
                 validDriverEtas.map(async (driverEta) => {
                     try {
+                        // Store driver-to-pickup ETA in customer array
                         const jobWithDriverEta = {
                             ...job,
-                            rideDetails: {
-                                estimatedTime: driverEta.etaToPickup,
-                                estimatedDistance: parseFloat(driverEta.distanceToPickup) || 0,
+                            customer: {
+                                time: driverEta.etaToPickup,
+                                distance: driverEta.distanceToPickup,
+                                fullName: customer.fullName || 'Unknown',
+                                avatar: customer.avatar || '',
                             }
                         };
 
