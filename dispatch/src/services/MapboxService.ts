@@ -48,6 +48,7 @@ export class MapboxService {
         dropLat: number,
         dropLng: number
     ): Promise<DistanceDurationResult> {
+
         if (!this.mapboxToken) {
             throw new Error("Mapbox token is not configured");
         }

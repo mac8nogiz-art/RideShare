@@ -30,22 +30,13 @@ export class ZoneService {
         }
     }
 
-    /**
-     * Check if ZoneService is ready to use
-     */
+
     private ensureInitialized(): void {
         if (!this.isInitialized || !this.db) {
             throw new Error("ZoneService not initialized - call init() first");
         }
     }
 
-    /**
-     * STEP 1: Get zone for customer's pickup location
-     * Uses MongoDB geospatial query for efficient polygon matching
-     *
-     * @param job - The job/booking request with pickup coordinates
-     * @returns Zone object or null if no zones configured
-     */
     public async getZoneForJob(job: Job): Promise<string[]> {
         logger.info(`Finding zone for pickup location: [${job.pickupLat}, ${job.pickupLng}]`);
 
@@ -53,7 +44,7 @@ export class ZoneService {
             this.ensureInitialized();
 
             const cursor = await this.db!
-                .collection('geoareas')
+                .collection('drivergeoareas')
                 .find(
                     {
                         status: true,
@@ -82,64 +73,18 @@ export class ZoneService {
     }
 
 
-    /**
-     * STEP 2: Check if driver is approved for the zone
-     * Called after finding nearby drivers to filter by zone approval
-     *
-     * Logic:
-     * - If approved_zones is empty [] → Driver approved for ALL zones
-     * - If approved_zones has values → Check if zone is in the list
-     * - If no zone (null) → All drivers approved (no zone restrictions)
-     *
-     * @param driverId - The driver ID to check
-     * @param zoneId - The zone ID (or null if no zones configured)
-     * @returns true if driver can accept rides in this zone
-     */
-    // public async isDriverApprovedForZone(driverId: string, zoneId: string | null): Promise<boolean> {
-    //     try {
-    //         if (!zoneId) {
-    //             logger.info(`No zone restrictions - Driver ${driverId} approved`);
-    //             return true;
-    //         }
-    //
-    //         const approvedZones = await redis.smembers(`driver:${driverId}:approved_zones`);
-    //
-    //         if (approvedZones.length === 0) {
-    //             logger.info(`Driver ${driverId} has empty approved_zones - approved for ALL zones including ${zoneId}`);
-    //             return true;
-    //         }
-    //
-    //         const isApproved = approvedZones.includes(zoneId);
-    //
-    //         if (isApproved) {
-    //             logger.info(`✅ Driver ${driverId} is approved for zone ${zoneId}`);
-    //         } else {
-    //             logger.warn(`⚠️ Driver ${driverId} is NOT approved for zone ${zoneId} (approved for: ${approvedZones.join(', ')})`);
-    //         }
-    //
-    //         return isApproved;
-    //     } catch (error: any) {
-    //         logger.error(`❌ Error checking driver ${driverId} approval for zone ${zoneId}: ${error.message}`);
-    //         return false;
-    //     }
-    // }
 
 
-    /**
-     * Ensure 2dsphere index exists for geospatial queries
-     * FIXED: Now creates index on the correct 'geoareas' collection
-     */
     private async ensureGeospatialIndex(): Promise<void> {
         try {
             if (!this.db) {
                 throw new Error("Cannot create index - db is null");
             }
 
-            // Create index on 'geoareas' collection (not 'drivergeoareas')
-            await this.db.collection('geoareas').createIndex({location: "2dsphere"});
+            await this.db.collection('drivergeoareas').createIndex({location: "2dsphere"});
             logger.info(" Geospatial index verified on geoareas.location");
         } catch (error: any) {
-            // Index might already exist - this is not a critical error
+
             if (error.code === 85 || error.message.includes('already exists')) {
                 logger.info("Geospatial index already exists on geoareas.location");
             } else {
@@ -148,9 +93,6 @@ export class ZoneService {
         }
     }
 
-    /**
-     * Get initialization status
-     */
     public isReady(): boolean {
         return this.isInitialized && this.db !== null;
     }

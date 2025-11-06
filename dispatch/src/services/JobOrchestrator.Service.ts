@@ -286,7 +286,7 @@ export class JobOrchestratorService {
                     ...categorizedDrivers.newDrivers,
                     ...categorizedDrivers.nonPriorityDrivers,
                     ...categorizedDrivers.remainingDrivers,
-                    ...categorizedDrivers.busyDrivers
+
                 ];
 
                 const alternativeDrivers = await this.offerManagementService.findAlternativeDrivers(jobId, allDrivers);
@@ -395,6 +395,7 @@ export class JobOrchestratorService {
 
             const categorizedDrivers = await this.driverMatchingService.findBestDrivers(job, job.customerId);
             const searchTime = Date.now() - startTime;
+            console.log("categorizedDrivers are here--->", categorizedDrivers)
 
             if (!categorizedDrivers) {
                 logger.warn(`No Drivers Found - JobId: ${job.id}`);
@@ -410,14 +411,16 @@ export class JobOrchestratorService {
                 };
             }
 
+
             const matchedDrivers = [
                 ...categorizedDrivers.favDriver,
                 ...categorizedDrivers.priorityDrivers,
                 ...categorizedDrivers.newDrivers,
                 ...categorizedDrivers.nonPriorityDrivers,
                 ...categorizedDrivers.remainingDrivers,
-                ...categorizedDrivers.busyDrivers
-            ].map((d: any) => d.id);
+
+            ]
+            console.log(matchedDrivers, " matchedDrivers are here--->")
 
             // Calculate driver-to-pickup ETAs
             const driversWithEta = await Promise.all(

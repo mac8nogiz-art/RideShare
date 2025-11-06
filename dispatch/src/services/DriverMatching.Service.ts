@@ -14,7 +14,7 @@ interface CategorizedDrivers {
     newDrivers: string[];
     nonPriorityDrivers: string[];
     remainingDrivers: string[];
-    busyDrivers: string[];
+
 }
 
 export class DriverMatchingService {
@@ -39,6 +39,7 @@ export class DriverMatchingService {
                 this.zoneService.getZoneForJob(job),
                 this.getCustomerFavoritesAndBlocked(customerId)
             ]);
+            console.log(zoneIds, " --------->zoneids her")
 
             if (!zoneIds || zoneIds.length === 0) {
                 logger.warn(`No zone found for job ${job.id}`);
@@ -47,31 +48,19 @@ export class DriverMatchingService {
 
             logger.info(`Looking for drivers in zones: ${zoneIds.join(', ')}`);
 
-            const radiusSteps = [2, 4, 6];
+            const categorizedDrivers = await this.categorizeDrivers(
+                favoriteSet,
+                blockedSet,
+                job.id,
+                job.pickupLat,
+                job.pickupLng,
+                zoneIds
+            );
 
-            for (const radius of radiusSteps) {
-                const drivers = await this.getNearbyDriversInZone(job.pickupLat, job.pickupLng, zoneIds, radius);
-
-                logger.info(`Found ${drivers.length} drivers within ${radius}km`);
-
-                const eligibleDrivers = drivers.filter(d => !blockedSet.has(d.driverId));
-
-                if (eligibleDrivers.length > 0) {
-                    // Pass radius to categorization to apply filtering rules
-                    const categorizedDrivers = await this.categorizeDrivers(
-                        eligibleDrivers,
-                        favoriteSet,
-                        job.id,
-                        radius,
-                        job.pickupLat,
-                        job.pickupLng
-                    );
-
-                    logger.info(`Matched ${eligibleDrivers.length} driver(s) at ${radius}km in ${Date.now() - startTime}ms`);
-
-                    // @ts-ignore
-                    return categorizedDrivers;
-                }
+            if (categorizedDrivers) {
+                logger.info(`Driver matching completed in ${Date.now() - startTime}ms`);
+                // @ts-ignore
+                return categorizedDrivers;
             }
 
             logger.info(`No drivers found for job ${job.id} in ${Date.now() - startTime}ms`);
@@ -171,74 +160,87 @@ export class DriverMatchingService {
     }
 
     private async categorizeDrivers(
-        drivers: DriverWithDistance[],
         favoriteSet: Set<string>,
+        blockedSet: Set<string>,
         jobId: string,
-        radius: number,
         pickupLat: number,
-        pickupLng: number
-    ){
-        const categories = {
-            favDriver: [] as Array<{ id: string; dist: number; category: string; lat: number; lng: number }>,
-            priorityDrivers: [] as Array<{ id: string; dist: number; category: string; lat: number; lng: number }>,
-            newDrivers: [] as Array<{ id: string; dist: number; category: string; lat: number; lng: number }>,
-            nonPriorityDrivers: [] as Array<{ id: string; dist: number; category: string; lat: number; lng: number }>,
-            remainingDrivers: [] as Array<{ id: string; dist: number; category: string; lat: number; lng: number }>,
-            busyDrivers: [] as Array<{ id: string; dist: number; category: string; lat: number; lng: number }>
-        };
+        pickupLng: number,
+        zoneIds: string[]
+    ) {
+        const radiusSteps = [2, 4, 6];
+        let allDrivers: any[] = [];
+        const processedDrivers = new Set<string>();
 
-        console.log(drivers, "drivers-------->");
+        for (const radius of radiusSteps) {
+            const drivers = await this.getNearbyDriversInZone(pickupLat, pickupLng, zoneIds, radius);
 
-        for (const d of drivers) {
-            const obj = { id: d.driverId, dist: d.distance, lat: d.lat, lng: d.lng };
+            logger.info(`Found ${drivers.length} drivers within ${radius}km`);
 
-            if (favoriteSet.has(d.driverId)) {
-                categories.favDriver.push({...obj, category: 'favDriver'});
-            } else if (d.priorityScore >= 80 && d.priorityScore <= 100) {
-                categories.priorityDrivers.push({...obj, category: 'priorityDrivers'});
-            } else if (d.isNew) {
-                categories.newDrivers.push({...obj, category: 'newDrivers'});
-            } else if (d.priorityScore >= 60 && d.priorityScore < 80) {
-                categories.nonPriorityDrivers.push({...obj, category: 'nonPriorityDrivers'});
-            } else {
-                // Only add to remainingDrivers
-                if (radius === 6) {
-                    categories.remainingDrivers.push({...obj, category: 'remainingDrivers'});
+            const eligibleDrivers = drivers.filter(d =>
+                !blockedSet.has(d.driverId) && !processedDrivers.has(d.driverId)
+            );
+
+            if (eligibleDrivers.length > 0) {
+                logger.info(`Processing ${eligibleDrivers.length} eligible drivers at ${radius}km`);
+
+                const categories = {
+                    favDriver: [] as Array<{ id: string; dist: number; category: string; lat: number; lng: number }>,
+                    priorityDrivers: [] as Array<{ id: string; dist: number; category: string; lat: number; lng: number }>,
+                    newDrivers: [] as Array<{ id: string; dist: number; category: string; lat: number; lng: number }>,
+                    nonPriorityDrivers: [] as Array<{ id: string; dist: number; category: string; lat: number; lng: number }>,
+                    remainingDrivers: [] as Array<{ id: string; dist: number; category: string; lat: number; lng: number }>,
+                };
+
+                console.log(`drivers at ${radius}km ----->`, eligibleDrivers);
+
+                for (const d of eligibleDrivers) {
+                    const obj = { id: d.driverId, dist: d.distance, lat: d.lat, lng: d.lng };
+
+                    // Mark this driver as processed
+                    processedDrivers.add(d.driverId);
+
+                    if (favoriteSet.has(d.driverId)) {
+                        categories.favDriver.push({...obj, category: 'favDriver'});
+                    } else if (d.priorityScore >= 80 && d.priorityScore <= 100) {
+                        categories.priorityDrivers.push({...obj, category: 'priorityDrivers'});
+                    } else if (d.isNew) {
+                        categories.newDrivers.push({...obj, category: 'newDrivers'});
+                    } else if (d.priorityScore >= 60 && d.priorityScore < 80) {
+                        categories.nonPriorityDrivers.push({...obj, category: 'nonPriorityDrivers'});
+                    } else {
+                        if (radius === 6) {
+                            categories.remainingDrivers.push({...obj, category: 'remainingDrivers'});
+                        }
+                    }
                 }
+
+                const sortByDist = (arr: Array<{ id: string; dist: number }>) =>
+                    arr.sort((a, b) => a.dist - b.dist);
+
+                const categorizedDrivers = {
+                    favDriver: sortByDist(categories.favDriver),
+                    priorityDrivers: sortByDist(categories.priorityDrivers),
+                    newDrivers: sortByDist(categories.newDrivers),
+                    nonPriorityDrivers: sortByDist(categories.nonPriorityDrivers),
+                    remainingDrivers: sortByDist(categories.remainingDrivers),
+                };
+
+                allDrivers = [
+                    ...allDrivers,
+                    ...(categorizedDrivers.favDriver || []),
+                    ...(categorizedDrivers.priorityDrivers || []),
+                    ...(categorizedDrivers.newDrivers || []),
+                    ...(categorizedDrivers.nonPriorityDrivers || []),
+                    ...(categorizedDrivers.remainingDrivers || []),
+                ];
             }
-
-
         }
 
-        const sortByDist = (arr: Array<{ id: string; dist: number }>) =>
-            arr.sort((a, b) => a.dist - b.dist);
+        console.log(allDrivers, "alldrivers");
 
-        const categorizedDrivers = {
-            favDriver: sortByDist(categories.favDriver),
-            priorityDrivers: sortByDist(categories.priorityDrivers),
-            newDrivers: sortByDist(categories.newDrivers),
-            nonPriorityDrivers: sortByDist(categories.nonPriorityDrivers),
-            remainingDrivers: sortByDist(categories.remainingDrivers),
-            busyDrivers: sortByDist(categories.busyDrivers)
-        };
-
-        console.log("-------->categorized", categorizedDrivers);
-
-        let allDrivers: any = [
-            ...categorizedDrivers.favDriver,
-            ...categorizedDrivers.priorityDrivers,
-            ...categorizedDrivers.newDrivers,
-            ...categorizedDrivers.nonPriorityDrivers,
-            ...categorizedDrivers.remainingDrivers,
-            ...categorizedDrivers.busyDrivers
-        ];
-
-        // Sort first 4 drivers using Mapbox API
         if (allDrivers.length > 0) {
             const firstFourDrivers = allDrivers.slice(0, Math.min(4, allDrivers.length));
             const remainingDriversAfterFour = allDrivers.slice(4);
-
-            logger.info(`Sorting first ${firstFourDrivers.length} drivers using Mapbox API`);
 
             const driversWithMapboxDistance = await Promise.all(
                 firstFourDrivers.map(async (driver: any) => {
@@ -249,31 +251,36 @@ export class DriverMatchingService {
                             driver.lat,
                             driver.lng
                         );
+                        console.log("result", result);
                         return {
                             ...driver,
-                            mapboxDistance: result.distanceKm,
-                            mapboxDuration: result.durationMin
+                            dist: result.distanceKm,
+                            duration: result.durationMin
                         };
                     } catch (error: any) {
                         logger.warn(`Failed to get Mapbox distance for driver ${driver.id}: ${error.message}, using straight-line distance`);
                         return {
                             ...driver,
-                            mapboxDistance: driver.dist,
-                            mapboxDuration: null
+                            duration: driver.duration || '-'
                         };
                     }
                 })
             );
 
-            driversWithMapboxDistance.sort((a, b) => a.mapboxDistance - b.mapboxDistance);
+            driversWithMapboxDistance.sort((a, b) => a.dist - b.dist);
+            console.log("driversWithMapboxDistance----->", driversWithMapboxDistance);
 
-            logger.info(`Sorted first 4 drivers by Mapbox distance`);
-
-            allDrivers = [...driversWithMapboxDistance, ...remainingDriversAfterFour];
+            allDrivers = [
+                ...driversWithMapboxDistance,
+                ...remainingDriversAfterFour.map(d => ({
+                    ...d,
+                    duration: d.duration ?? '-',
+                    dist: d.dist ?? 0
+                }))
+            ];
         }
 
-        console.log("-------->final allDrivers after Mapbox sorting", allDrivers);
-
+        console.log("allDrivers----->", allDrivers);
 
         const driverQueueKey = `job:${jobId}:driver_queue`;
         const pipeline = redis.pipeline();
@@ -286,17 +293,25 @@ export class DriverMatchingService {
                 driverId: driver.id,
                 status: "pending",
                 category: driver.category,
-                mapboxDistance: driver.mapboxDistance?.toString() || driver.dist.toString(),
-                mapboxDuration: driver.mapboxDuration?.toString() || ''
+                dist: driver.dist?.toString() || '0',
+                duration: driver.duration?.toString() || '-',
             });
 
+            console.log("driverHashKey", driver, driver.duration);
             pipeline.rpush(driverQueueKey, driver.id);
         }
 
-        logger.info(`Total drivers found: ${allDrivers.length} and stored in ${driverQueueKey}`);
-
         await pipeline.exec();
 
-        return categorizedDrivers;
+
+        const categorizedResult: CategorizedDrivers = {
+            favDriver: allDrivers.filter(d => d.category === 'favDriver').map(d => d.id),
+            priorityDrivers: allDrivers.filter(d => d.category === 'priorityDrivers').map(d => d.id),
+            newDrivers: allDrivers.filter(d => d.category === 'newDrivers').map(d => d.id),
+            nonPriorityDrivers: allDrivers.filter(d => d.category === 'nonPriorityDrivers').map(d => d.id),
+            remainingDrivers: allDrivers.filter(d => d.category === 'remainingDrivers').map(d => d.id),
+        };
+
+        return categorizedResult;
     }
 }

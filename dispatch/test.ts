@@ -18,7 +18,7 @@ const producer = kafka.producer();
 const eventPayload = {
     "type": "newBookingPlaced",
     "payload": {
-        "_id": "6900561da9ea6f1301d29aba",
+        "_id": "6900561da9ea6f1301d29a",
         "orderNo": "17616297252927556",
         "serviceType": "rideBooking",
         "estimatedDirection": "",
