@@ -124,7 +124,7 @@ export class JobOrchestratorService {
 
         const requestId = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
-        const eventType = data.type;
+        const eventType = data.type || data.headers?.['event-type'];
 
         logger.info(`RPC Request Received - Type: ${eventType}, RequestId: ${requestId}`);
 

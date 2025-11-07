@@ -5,7 +5,7 @@ const KAFKA_BROKER = '172.105.61.99:9093';
 const TOPIC_NAME = 'newBooking.response';
 
 // Test Data
-const TEST_DRIVER_ID = '"68b920ac35e816497cf07994"';
+const TEST_DRIVER_ID = '68cbf8763cdfa2b2b69eeb5a';
 const TEST_JOB_ID = '6900561da9ea6f1301d29aba';
 
 // Initialize Kafka

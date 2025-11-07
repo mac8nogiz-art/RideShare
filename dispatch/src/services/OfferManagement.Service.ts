@@ -1,121 +1,173 @@
-// import { redis } from '../infrastructure/redis';
 import { logger } from '../logger';
 import { Job } from '../types';
-import { producer, isKafkaConnected, checkProducerHealth, reconnectKafka } from '../infrastructure/kafka';
-import { redis, redisSubscriber } from '../infrastructure/redis';
+import { producer, isKafkaConnected, reconnectKafka, checkProducerHealth } from '../infrastructure/kafka';
+import { redis } from '../infrastructure/redis';
+import RedisSubscriber from "../redisConnection/subscriber";
 
 export class OfferManagementService {
     private readonly OFFER_EXPIRY_SECONDS = 15;
-    private readonly KAFKA_TOPIC_ASSIGNMENTS = 'driver-assignments';
     private readonly KAFKA_TOPIC_OFFERS = 'driver-offers';
+    private readonly KAFKA_TOPIC_ASSIGNMENTS = 'driver-assignments';
     private readonly MAX_KAFKA_RETRIES = 2;
+    private processedOffers = new Set<string>();
 
-    async sendOffers(job: Job, driverIds: string[]): Promise<{ successful: number; failed: number }> {
-        logger.info(`Event-Based Offer Dispatch Started — JobId: ${job.id}, Total Drivers: ${driverIds.length}`);
 
-        return new Promise(async (resolve) => {
-            let successful = 0;
-            let failed = 0;
-            let currentDriverIndex = 0;
-            let jobAssigned = false;
 
-            const processNextDriver = async (): Promise<void> => {
-                if (jobAssigned || currentDriverIndex >= driverIds.length) {
-                    logger.info(`Offer Dispatch Complete — JobId: ${job.id}, Successful: ${successful}, Failed: ${failed}`);
-                    resolve({ successful, failed });
-                    return;
-                }
+    // ---------------- Expiry Listener Setup ----------------
 
-                const driverId = driverIds[currentDriverIndex];
-                currentDriverIndex++;
 
-                try {
-                    await this.sendSingleOffer(job, driverId);
-                    successful++;
-                    await this.updateDriverQueueStatus(job.id, driverId, 'offered');
-                    logger.info(`Offer Sent - JobId: ${job.id}, Driver: ${driverId}`);
+    // ---------------- Core Offer Flow ----------------
+    async sendOffers(job: Job, driverIds: string[]) {
+        logger.info(`Event-driven Offer Flow Started — Job ${job.id}`);
+        if (!driverIds.length) return logger.warn(`No drivers available for Job ${job.id}`);
 
-                    // Wait for driver response or expiry
-                    const accepted = await this.waitForDriverResponseOrExpiry(job.id, driverId);
+        let index = 0;
+        let jobAssigned = false;
+
+        const processNextDriver = (driverId: string) => {
+            this.updateDriverQueueStatus(job.id, driverId, "sent").catch(err =>
+                logger.error(`Queue Status Error (sent) - ${driverId}`, err)
+            );
+
+            this.sendSingleOffer(job, driverId)
+                .then(() => this.waitForDriverResponseOrExpiry(job.id, driverId, async (accepted) => {
+                    if (jobAssigned) return;
 
                     if (accepted) {
-                        logger.info(`Driver ${driverId} accepted Job ${job.id}. Stopping offer cycle.`);
                         jobAssigned = true;
-                        await this.updateDriverQueueStatus(job.id, driverId, 'accepted');
+                        await this.updateDriverQueueStatus(job.id, driverId, "accepted");
+                        logger.info(`Driver ${driverId} accepted Job ${job.id}`);
                         await this.assignDriverToJob(job.id, driverId, job.customerId);
-                        this.cancelOtherOffers(job.id, driverId).catch(err => {
-                            logger.error(`Cancel Other Offers Error - JobId: ${job.id}, Error: ${err}`);
-                        });
-                    } else {
-                        logger.warn(`Driver ${driverId} did not respond in time for Job ${job.id}. Auto-rejecting.`);
-                        await this.updateDriverQueueStatus(job.id, driverId, 'timeout');
-                        await this.handleDriverRejection(job.id, job.customerId, driverId, 'Offer timed out');
-                        setTimeout(processNextDriver, 200);
+                        return;
                     }
 
-                } catch (error: any) {
-                    failed++;
-                    await this.updateDriverQueueStatus(job.id, driverId, 'failed').catch(() => {});
-                    logger.error(`Failed to send offer to Driver ${driverId}: ${error?.message || error}`);
-                    setTimeout(processNextDriver, 200);
-                }
-            };
+                    await this.updateDriverQueueStatus(job.id, driverId, "expired");
 
-            // Set up Redis event listeners
-            await this.setupEventListeners(job.id, driverIds);
-
-            // Start processing drivers
-            processNextDriver();
-        });
-    }
-
-    private async setupEventListeners(jobId: string, driverIds: string[]): Promise<void> {
-        // Subscribe to driver response channels
-        const subscribePromises = driverIds.map(driverId =>
-            redisSubscriber.subscribe(`driver_response:${jobId}:${driverId}`)
-        );
-        await Promise.all(subscribePromises);
-
-        // Subscribe to key expiry events for auto-rejection
-        await redisSubscriber.subscribe('__keyevent@0__:expired');
-    }
-
-    private async waitForDriverResponseOrExpiry(jobId: string, driverId: string): Promise<boolean> {
-        return new Promise((resolve) => {
-            const responseChannel = `driver_response:${jobId}:${driverId}`;
-            const offerKey = `offer:${jobId}:${driverId}`;
-
-            const onMessage = (channel: string, message: string) => {
-                try {
-                    if (channel === responseChannel) {
-                        const data = JSON.parse(message);
-                        cleanup();
-                        resolve(data.action === 'accept');
-                    } else if (channel === '__keyevent@0__:expired' && message === offerKey) {
-                        cleanup();
-                        resolve(false);
+                    if (index < driverIds.length) {
+                        const nextDriver = driverIds[index++];
+                        this.updateDriverQueueStatus(job.id, nextDriver, "waiting")
+                            .catch(err => logger.error(`Queue Status Error (waiting)`, err));
+                        processNextDriver(nextDriver);
                     }
-                } catch (error) {
-                    logger.error(`Parse event error: ${error}`);
-                    cleanup();
-                    resolve(false);
-                }
-            };
+                }))
+                .catch(async () => {
+                    logger.error(`Offer sending failed to driver ${driverId}`);
+                    await this.updateDriverQueueStatus(job.id, driverId, "failed");
 
-            const cleanup = () => {
-                redisSubscriber.off('message', onMessage);
-                redisSubscriber.unsubscribe(responseChannel);
-            };
+                    if (index < driverIds.length) {
+                        const nextDriver = driverIds[index++];
+                        this.updateDriverQueueStatus(job.id, nextDriver, "waiting")
+                            .catch(err => logger.error(`Queue Status Error (waiting)`, err));
+                        processNextDriver(nextDriver);
+                    }
+                });
+        };
 
-            // Set timeout as fallback
-            const timeoutId = setTimeout(() => {
-                cleanup();
-                resolve(false);
-            }, this.OFFER_EXPIRY_SECONDS * 1000);
-
-            redisSubscriber.on('message', onMessage);
-        });
+        await this.updateDriverQueueStatus(job.id, driverIds[0], "waiting");
+        processNextDriver(driverIds[index++]);
     }
+
+    // ---------------- Expiry Handler ----------------
+    // private async handleOfferExpired(jobId: string, driverId: string) {
+    //     const offerKey = `offer:${jobId}:${driverId}`;
+    //     if (this.processedOffers.has(offerKey)) return;
+    //     this.processedOffers.add(offerKey);
+    //
+    //     try {
+    //         logger.info(`Handling expired offer — Job ${jobId}, Driver ${driverId}`);
+    //
+    //         await redis.del(offerKey);
+    //         await redis.srem(`driver:${driverId}:offers`, jobId);
+    //         await redis.srem(`job:${jobId}:pending_drivers`, driverId);
+    //         await redis.sadd(`job:${jobId}:rejected_drivers`, driverId);
+    //         await this.updateDriverQueueStatus(jobId, driverId, 'expired');
+    //         await this.deleteJobNotification(driverId);
+    //
+    //         const pendingDrivers = await redis.smembers(`job:${jobId}:pending_drivers`);
+    //         if (pendingDrivers.length > 0) {
+    //             const nextDriver = pendingDrivers[0];
+    //             await this.updateDriverQueueStatus(jobId, nextDriver, 'waiting');
+    //             this.sendSingleOffer({ id: jobId } as Job, nextDriver)
+    //                 .catch(err => logger.error(`Failed to send offer to next driver ${nextDriver}`, err));
+    //         }
+    //
+    //         logger.info(`Expired offer processed — Job ${jobId}, Driver ${driverId}`);
+    //     } catch (err) {
+    //         logger.error(`Error handling expired offer — Job ${jobId}, Driver ${driverId}`, err);
+    //     } finally {
+    //         setTimeout(() => this.processedOffers.delete(offerKey), 5000);
+    //     }
+    // }
+
+    // ---------------- Driver Response ----------------
+    // private async waitForDriverResponseOrExpiry(jobId: string, driverId: string, cb: (accepted: boolean) => void) {
+    //     const responseChannel = `offer.response.${jobId}.${driverId}`;
+    //     const offerKey = `offer:${jobId}:${driverId}`;
+    //     let resolved = false;
+    //
+    //     const cleanup = async () => {
+    //         await this.subscriber.unsubscribe(responseChannel);
+    //     };
+    //
+    //     await this.subscriber.subscribe(responseChannel, async (msg) => {
+    //         if (resolved) return;
+    //         if (msg?.action === "accept") {
+    //             resolved = true;
+    //             await cleanup();
+    //             cb(true);
+    //         }
+    //     });
+    //
+    //     this.subscriber.addExpiryHandler(async (expiredKey: string) => {
+    //         if (resolved) return;
+    //         if (expiredKey !== offerKey) return;
+    //
+    //         resolved = true;
+    //         logger.info(`⏳ Offer expired — Job ${jobId}, Driver ${driverId}`);
+    //         await cleanup();
+    //         cb(false);
+    //     });
+    // }
+
+    private async handleOfferExpired(jobId: string, driverId: string): Promise<void> {
+        const offerKey = `offer:${jobId}:${driverId}`;
+        if (this.processedOffers.has(offerKey)) return; // Already handled
+        this.processedOffers.add(offerKey);
+
+        try {
+            logger.info(`Handling expired offer — Job ${jobId}, Driver ${driverId}`);
+
+            // Remove offer key
+            await redis.del(offerKey);
+            await redis.srem(`driver:${driverId}:offers`, jobId);
+            await redis.srem(`job:${jobId}:pending_drivers`, driverId);
+            await redis.sadd(`job:${jobId}:rejected_drivers`, driverId);
+
+            // Update queue status
+            await this.updateDriverQueueStatus(jobId, driverId, 'expired');
+
+            // Delete job notification
+            await this.deleteJobNotification(driverId);
+
+            // Optionally trigger next driver
+            const pendingDrivers = await redis.smembers(`job:${jobId}:pending_drivers`);
+            if (pendingDrivers.length > 0) {
+                const nextDriver = pendingDrivers[0];
+                await this.updateDriverQueueStatus(jobId, nextDriver, 'waiting');
+                this.sendSingleOffer({ id: jobId } as Job, nextDriver).catch(err =>
+                    logger.error(`Failed to send offer to next driver ${nextDriver}`, err)
+                );
+            }
+
+            logger.info(`Expired offer processed — Job ${jobId}, Driver ${driverId}`);
+        } catch (err) {
+            logger.error(`Error handling expired offer — Job ${jobId}, Driver ${driverId}`, err);
+        } finally {
+            // Remove from processedOffers after a short delay if you want retries possible
+            setTimeout(() => this.processedOffers.delete(offerKey), 5000);
+        }
+    }
+
 
     private async sendSingleOffer(job: Job, driverId: string): Promise<void> {
         const expiryTime = this.OFFER_EXPIRY_SECONDS + Math.floor(Math.random() * 3);
@@ -137,53 +189,78 @@ export class OfferManagementService {
             customer: {
                 fullName: (job as any).customer?.fullName || "",
                 avatar: (job as any).customer?.avatar || "",
-                distance: (job as any).customer?.distance ,
+                distance: (job as any).customer?.distance,
                 time: (job as any).customer?.time || "",
             }
         };
 
         await redis.setex(`offer:${job.id}:${driverId}`, this.OFFER_EXPIRY_SECONDS, JSON.stringify(offerData));
-        await this.saveJobNotification(job, driverObjectId, expiryTime);
-        await this.publishAssignmentEventWithRetry('new_job.offer_sent', this.KAFKA_TOPIC_OFFERS, job.id, driverId, offerData);
 
+        await this.saveJobNotification(job, driverObjectId, expiryTime);
+
+        await this.publishAssignmentEventWithRetry(
+            'new_job.offer_sent',
+            this.KAFKA_TOPIC_OFFERS,
+            job.id,
+            driverId,
+            offerData
+        );
+
+        logger.info(`Offer sent to driver ${driverId} for Job ${job.id}`);
+    }
+
+    private async waitForDriverResponseOrExpiry(
+        jobId: string,
+        driverId: string,
+        cb: (accepted: boolean) => void,
+    ) {
+
+
+        const responseChannel = `offer.response.${jobId}.${driverId}`;
+        const offerKey = `offer:${jobId}:${driverId}`;
+        let resolved = false;
+
+        const cleanup = async () => {
+            await this.subscriber.unsubscribe(responseChannel);
+        };
+
+        await this.subscriber.subscribe(responseChannel, async (msg) => {
+            if (resolved) return;
+
+            if (msg?.action === "accept") {
+                resolved = true;
+                await cleanup();
+                cb(true);
+            }
+        });
+
+
+        this.subscriber.addExpiryHandler(async (expiredKey: string) => {
+            if (resolved) return;
+            if (expiredKey !== offerKey) return;
+
+            resolved = true;
+            logger.info(`⏳ Offer expired — Job ${jobId}, Driver ${driverId}`);
+            await cleanup();
+            cb(false);
+        });
     }
 
     private async updateDriverQueueStatus(jobId: string, driverId: string, status: string): Promise<void> {
         try {
             const driverHashKey = `job:${jobId}:driver:${driverId}`;
-
             const exists = await redis.exists(driverHashKey);
-            if (!exists) {
-                logger.warn(`Driver hash key not found - JobId: ${jobId}, Driver: ${driverId}`);
-                return;
-            }
+            if (!exists) return;
 
-            const pipeline = redis.pipeline();
-
-            pipeline.hset(driverHashKey, 'status', status);
-
-            pipeline.hset(driverHashKey, `${status}At`, new Date().toISOString());
-
-            await pipeline.exec();
-
-            // const statusEvent = {
-            //     jobId,
-            //     driverId,
-            //     status,
-            //     timestamp: new Date().toISOString()
-            // };
-
-            // await redis.publish(
-            //     `job:${jobId}:driver_status_updates`,
-            //     JSON.stringify(statusEvent)
-            // // );
-
-            logger.debug(`Driver Queue Status Updated - JobId: ${jobId}, Driver: ${driverId}, Status: ${status}`);
+            await redis.hset(driverHashKey, {
+                status,
+                [`${status}At`]: new Date().toISOString(),
+            });
         } catch (error) {
-            logger.error(`Update Driver Queue Status Error - JobId: ${jobId}, Driver: ${driverId}, Status: ${status}, Error: ${error}`);
-            throw error;
+            logger.error(`Update Driver Queue Status Error`, error);
         }
     }
+
     private async saveJobNotification(job: Job, driverId: string, expiryTime: number): Promise<void> {
         try {
             const notificationKey = `jobnotification:${driverId}`;
@@ -194,13 +271,8 @@ export class OfferManagementService {
             const notificationData = {
                 _id: job.id,
                 tripAddress: job.tripAddress || [],
-                rideDetails: job.rideDetails || {
-                    estimatedTime: "",
-                    estimatedDistance: 0,
-                },
-                askDriver: {
-                    expTime: expiryTimestamp.toISOString()
-                },
+                rideDetails: job.rideDetails || { estimatedTime: "", estimatedDistance: 0 },
+                askDriver: { expTime: expiryTimestamp.toISOString() },
                 driverEarning: job.fare || 0,
                 customer: {
                     fullName: (job as any).customer?.fullName || "",
@@ -212,51 +284,17 @@ export class OfferManagementService {
 
             await redis.call('JSON.SET', notificationKey, '$', JSON.stringify(notificationData));
             await redis.expire(notificationKey, this.OFFER_EXPIRY_SECONDS + 5);
-
-            logger.info(`Job Notification Saved - Driver: ${driverId}, JobId: ${job.id}, TTL: ${this.OFFER_EXPIRY_SECONDS + 5}s`);
         } catch (error) {
-            logger.error(`Save Job Notification Error - Driver: ${driverId}, JobId: ${job.id}, Error: ${error}`);
+            logger.error(`Save Job Notification Error`, error);
         }
     }
 
     private async deleteJobNotification(driverId: string): Promise<void> {
         try {
-            const notificationKey = `jobnotification:${driverId}`;
-            await redis.del(notificationKey);
-            logger.debug(`Job Notification Deleted - Driver: ${driverId}`);
-        } catch (error) {
-            logger.error(`Delete Job Notification Error - Driver: ${driverId}, Error: ${error}`);
+            await redis.del(`jobnotification:${driverId}`);
+        } catch (err) {
+            logger.error(`Delete Job Notification Error`, err);
         }
-    }
-
-    private async waitForDriverResponseOrTimeout(jobId: string, driverId: string, timeoutMs: number): Promise<boolean> {
-        return new Promise(async (resolve) => {
-            const channel = `driver_response:${jobId}:${driverId}`;
-
-            const onMessage = (channelName: string, message: string) => {
-                if (channelName === channel) {
-                    try {
-                        const data = JSON.parse(message);
-                        redisSubscriber.off("message", onMessage);
-                        redisSubscriber.unsubscribe(channel);
-                        clearTimeout(timeoutId);
-                        resolve(data.type === "accepted");
-                    } catch (error) {
-                        logger.error(`Parse driver response error: ${error}`);
-                        resolve(false);
-                    }
-                }
-            };
-
-            redisSubscriber.on("message", onMessage);
-            await redisSubscriber.subscribe(channel);
-
-            const timeoutId = setTimeout(() => {
-                redisSubscriber.off("message", onMessage);
-                redisSubscriber.unsubscribe(channel);
-                resolve(false);
-            }, timeoutMs);
-        });
     }
 
     async assignDriverToJob(jobId: string, driverId: string, customerId?: string): Promise<void> {
@@ -285,23 +323,6 @@ export class OfferManagementService {
         logger.info(`Job Assigned - JobId: ${jobId}, Driver: ${driverId}`);
     }
 
-    async handleDriverRejection(jobId: string, customerId: string, driverId: string, reason?: string): Promise<void> {
-        logger.info(`Driver Rejected - JobId: ${jobId}, Driver: ${driverId}, Reason: ${reason}`);
-
-        const pipeline = redis.pipeline();
-        pipeline.del(`offer:${jobId}:${driverId}`);
-        pipeline.srem(`driver:${driverId}:offers`, jobId);
-        pipeline.srem(`job:${jobId}:pending_drivers`, driverId);
-        pipeline.sadd(`job:${jobId}:rejected_drivers`, driverId);
-        await pipeline.exec();
-
-        // Update driver queue status to rejected
-        await this.updateDriverQueueStatus(jobId, driverId, 'rejected');
-
-        await this.deleteJobNotification(driverId);
-
-        logger.debug(`Driver Rejection Processed - JobId: ${jobId}, Driver: ${driverId}`);
-    }
 
     private async cancelOtherOffers(jobId: string, acceptedDriverId: string): Promise<void> {
         try {
@@ -333,6 +354,25 @@ export class OfferManagementService {
         }
     }
 
+    async handleDriverRejection(jobId: string, customerId: string, driverId: string, reason?: string): Promise<void> {
+        logger.info(`Driver Rejected - JobId: ${jobId}, Driver: ${driverId}, Reason: ${reason}`);
+
+        const pipeline = redis.pipeline();
+        pipeline.del(`offer:${jobId}:${driverId}`);
+        pipeline.srem(`driver:${driverId}:offers`, jobId);
+        pipeline.srem(`job:${jobId}:pending_drivers`, driverId);
+        pipeline.sadd(`job:${jobId}:rejected_drivers`, driverId);
+        await pipeline.exec();
+
+
+        await this.updateDriverQueueStatus(jobId, driverId, 'rejected');
+
+        await this.deleteJobNotification(driverId);
+
+        logger.debug(`Driver Rejection Processed - JobId: ${jobId}, Driver: ${driverId}`);
+    }
+
+
     async findAlternativeDrivers(jobId: string, nearbyDrivers: string[]): Promise<string[]> {
         try {
             const rejectedDrivers = await redis.smembers(`job:${jobId}:rejected_drivers`);
@@ -345,7 +385,6 @@ export class OfferManagementService {
             return [];
         }
     }
-
     private async publishAssignmentEventWithRetry(eventType: string, topic: string, jobId: string, driverId: string, payload?: any): Promise<void> {
         for (let attempt = 1; attempt <= this.MAX_KAFKA_RETRIES; attempt++) {
             try {
