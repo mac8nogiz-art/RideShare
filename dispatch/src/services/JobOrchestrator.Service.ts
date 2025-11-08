@@ -395,7 +395,6 @@ export class JobOrchestratorService {
 
             const categorizedDrivers = await this.driverMatchingService.findBestDrivers(job, job.customerId);
             const searchTime = Date.now() - startTime;
-            console.log("categorizedDrivers are here--->", categorizedDrivers)
 
             if (!categorizedDrivers) {
                 logger.warn(`No Drivers Found - JobId: ${job.id}`);
@@ -411,18 +410,17 @@ export class JobOrchestratorService {
                 };
             }
 
-
             const matchedDrivers = [
                 ...categorizedDrivers.favDriver,
                 ...categorizedDrivers.priorityDrivers,
                 ...categorizedDrivers.newDrivers,
                 ...categorizedDrivers.nonPriorityDrivers,
                 ...categorizedDrivers.remainingDrivers,
+            ];
 
-            ]
-            console.log(matchedDrivers, " matchedDrivers are here--->")
+            logger.info(`Matched ${matchedDrivers.length} drivers for Job ${job.id}`);
 
-            // Calculate driver-to-pickup ETAs
+
             const driversWithEta = await Promise.all(
                 matchedDrivers.map(async (driverId) => {
                     try {
@@ -463,65 +461,31 @@ export class JobOrchestratorService {
                 })
             );
 
-            const validDriverEtas = driversWithEta.filter((d) => d !== null);
+            const offerETA = driversWithEta.find((eta) => eta !== null);
 
-            logger.info(`Driver ETAs calculated - Job: ${job.id}, Valid: ${validDriverEtas.length}, Invalid: ${matchedDrivers.length - validDriverEtas.length}`);
+            job.customer = {
+                fullName: customer.fullName || 'Unknown',
+                avatar: customer.avatar || '',
+                distance: offerETA?.distanceToPickup || 0,
+                time: offerETA?.etaToPickup || '',
+            };
 
-            if (validDriverEtas.length === 0) {
-                logger.warn(`No valid driver ETA data for Job ${job.id}`);
-                return {
-                    success: false,
-                    message: 'No drivers with valid location data',
-                    jobId: job.id,
-                    orderNo: payload.orderNo,
-                    driversFound: matchedDrivers.length,
-                    driverIds: matchedDrivers,
-                    searchTimeMs: searchTime,
-                    timestamp: new Date().toISOString(),
-                };
-            }
 
-            const offerResults = await Promise.all(
-                validDriverEtas.map(async (driverEta) => {
-                    try {
-                        // Store driver-to-pickup ETA in customer array
-                        const jobWithDriverEta = {
-                            ...job,
-                            customer: {
-                                time: driverEta.etaToPickup,
-                                distance: driverEta.distanceToPickup,
-                                fullName: customer.fullName || 'Unknown',
-                                avatar: customer.avatar || '',
-                            }
-                        };
-
-                        await this.offerManagementService.sendOffers(jobWithDriverEta, [driverEta.driverId]);
-                        logger.info(`Offer sent to driver ${driverEta.driverId} - ETA: ${driverEta.etaToPickup}`);
-                        return true;
-                    } catch (error: any) {
-                        logger.error(`Failed to send offer to driver ${driverEta.driverId}: ${error.message}`);
-                        return false;
-                    }
-                })
-            );
-
-            const successful = offerResults.filter(r => r).length;
-            const failed = offerResults.length - successful;
+            await this.offerManagementService.sendOffers(job, matchedDrivers);
 
             this.metrics.driversMatched += matchedDrivers.length;
-            this.metrics.offersSent += successful;
+            this.metrics.offersSent += 1; // Only first driver gets offer initially
 
-            logger.info(`Job Matched - JobId: ${job.id}, Drivers: ${matchedDrivers.length}, Offers Sent: ${successful}, Failed: ${failed}, Search Time: ${searchTime}ms`);
+            logger.info(`Job Matched - JobId: ${job.id}, Drivers: ${matchedDrivers.length}, Queue-based flow started, Search Time: ${searchTime}ms`);
 
             return {
                 success: true,
-                message: 'Drivers found and offers sent',
+                message: 'Drivers found and queue-based offer flow started',
                 jobId: job.id,
                 orderNo: payload.orderNo,
                 driversFound: matchedDrivers.length,
                 driverIds: matchedDrivers,
-                offersSent: successful,
-                offersFailed: failed,
+                offersSent: 1,
                 searchTimeMs: searchTime,
                 timestamp: new Date().toISOString(),
             };
