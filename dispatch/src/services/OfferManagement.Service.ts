@@ -190,17 +190,6 @@ export class OfferManagementService {
         }
     }
 
-    // ---------------- Handle Driver Acceptance (called from orchestrator) ----------------
-    // public async handleDriverAcceptance(jobId: string, driverId: string): Promise<void> {
-    //     const responseKey = `offer:response:${jobId}:${driverId}`;
-    //
-    //     // Store acceptance in Redis with short TTL
-    //     await redis.setex(responseKey, 10, JSON.stringify({ action: 'accept', timestamp: Date.now() }));
-    //
-    //     logger.info(`Driver acceptance stored — Job ${jobId}, Driver ${driverId}`);
-    // }
-
-    // ---------------- Update Driver Queue Status ----------------
     private async updateDriverQueueStatus(jobId: string, driverId: string, status: string): Promise<void> {
         try {
             const driverHashKey = `job:${jobId}:driver:${driverId}`;
