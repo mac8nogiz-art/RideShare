@@ -14,7 +14,6 @@
         newDrivers: string[];
         nonPriorityDrivers: string[];
         remainingDrivers: string[];
-
     }
 
     export class DriverMatchingService {
@@ -98,17 +97,26 @@
                 const drivers = jsonStrings
                     .map((item: any, i: number) => {
                         const driverData = JSON.parse(item)?.[0];
+                        console.log(driverData, "------>driverdata")
                         if (!driverData) return null;
 
                         const driverApprovedZones = Array.isArray(driverData.approved_zones)
-                            ? driverData.approved_zones.map(String)
-                            : [];
+                            ? driverData.approved_zones.map(String): [];
 
-                        if (driverApprovedZones.length > 0 &&
-                            !jobZoneIds.some(zoneId => driverApprovedZones.includes(zoneId))) {
+                        console.log(driverApprovedZones, "------>driverApprovedZones")
+
+                        if (driverApprovedZones.length === 0) {
+
                             return null;
-                        }
+                        } else {
 
+                            const hasMatchingZone = jobZoneIds.some(zoneId =>
+                                driverApprovedZones.includes(zoneId)
+                            );
+                            if (!hasMatchingZone) {
+                                return null;
+                            }
+                        }
                         const [lng, lat] = driverData.location?.coordinates || [];
 
                         return {

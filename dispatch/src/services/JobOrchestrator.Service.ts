@@ -4,6 +4,9 @@ import {Job, ProcessingMetrics} from '../types';
 import {DriverLocationService} from './DriverLocation.Service';
 import {DriverMatchingService} from './DriverMatching.Service';
 import {OfferManagementService} from './OfferManagement.Service';
+import {MatchedDriverService} from './MatchedDriver.services';
+import {BusyDriverService} from "./busyDriver.services";
+import {FreeDriverService} from "./freeDriverService";
 import {ZoneService} from './ZoneService';
 import {MapboxService} from './MapboxService'
 import {
@@ -14,9 +17,13 @@ export class JobOrchestratorService {
     private driverLocationService: DriverLocationService;
     private driverMatchingService: DriverMatchingService;
     private offerManagementService: OfferManagementService;
+    private matchedDriverService: MatchedDriverService;
     private zoneService: ZoneService;
+    private busyDriverService: BusyDriverService;
+    private freeDriverService: FreeDriverService;
     private mapboxService: MapboxService;
     private isInitialized: boolean = false;
+    private queueMonitorInterval: NodeJS.Timeout | null = null;
 
     private metrics: ProcessingMetrics = {
         rpcRequests: 0,
@@ -40,6 +47,23 @@ export class JobOrchestratorService {
         this.driverMatchingService = new DriverMatchingService(this.driverLocationService, this.zoneService);
         this.offerManagementService = new OfferManagementService();
         this.mapboxService = new MapboxService();
+
+
+        this.busyDriverService = new BusyDriverService(
+            this.driverLocationService,
+            this.zoneService
+        );
+
+        this.freeDriverService = new FreeDriverService(
+            this.driverLocationService,
+            this.zoneService
+        );
+
+        this.matchedDriverService = new MatchedDriverService(
+            this.busyDriverService,
+            this.freeDriverService,
+            this.offerManagementService
+        );
     }
 
     async start(): Promise<void> {
@@ -91,6 +115,9 @@ export class JobOrchestratorService {
                 (this as any)._cacheIntervalSet = true;
             }
 
+            // Start monitoring for queue exhaustion
+            this.startQueueExhaustionMonitor();
+
             this.isInitialized = true;
             logger.info('Job Orchestrator started successfully');
         } catch (error: any) {
@@ -102,8 +129,143 @@ export class JobOrchestratorService {
         }
     }
 
+    /**
+     * Monitor jobs for queue exhaustion and trigger matched drivers
+     */
+    private startQueueExhaustionMonitor(): void {
+        if (this.queueMonitorInterval) {
+            logger.info('Queue exhaustion monitor already running');
+            return;
+        }
+
+        this.queueMonitorInterval = setInterval(async () => {
+            try {
+                // Find jobs that need matched driver flow
+                const keys = await redis.keys('job:*:queue_exhausted');
+
+                for (const key of keys) {
+                    const jobId = key.split(':')[1];
+                    const flag = await redis.get(key);
+
+                    if (flag === '1') {
+                        logger.info(`Detected queue exhaustion for Job ${jobId} - Triggering matched driver flow`);
+
+                        // Get job data from Redis
+                        const bookingPattern = `booking:${jobId}-*`;
+                        const bookingKeys = await redis.keys(bookingPattern);
+
+                        if (bookingKeys.length > 0) {
+                            const bookingDataJson = await redis.call('JSON.GET', bookingKeys[0]) as any;
+
+                            if (bookingDataJson) {
+                                const bookingData = typeof bookingDataJson === 'string'
+                                    ? JSON.parse(bookingDataJson)
+                                    : bookingDataJson;
+
+                                // Reconstruct Job object
+                                const job = await this.reconstructJobFromBooking(jobId, bookingData, bookingKeys[0]);
+
+                                if (job) {
+                                    // Clear the flag before processing
+                                    await redis.del(key);
+                                    await redis.del(`job:${jobId}:trigger_matched_drivers`);
+
+                                    // Trigger matched driver flow
+                                    await this.triggerMatchedDriverFlow(job);
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (error: any) {
+                logger.error(`Queue exhaustion monitor error: ${error.message}`);
+            }
+        }, 5000); // Check every 5 seconds
+
+        logger.info('Queue exhaustion monitor started');
+    }
+
+    /**
+     * Trigger matched driver flow for a job
+     */
+    private async triggerMatchedDriverFlow(job: Job): Promise<void> {
+        try {
+            logger.info(`Starting matched driver flow for Job ${job.id}`);
+
+            // Get matched drivers in 500m distance buckets
+            const distanceBuckets = await this.matchedDriverService.getMatchedDriversForJob(job, job.customerId);
+
+            if (!distanceBuckets.length) {
+                logger.warn(`No matched drivers available for Job ${job.id}`);
+                return;
+            }
+
+            logger.info(`Found ${distanceBuckets.length} distance buckets for matched driver flow - Job ${job.id}`);
+
+            // Start sending offers to matched drivers
+            await this.offerManagementService.sendMatchedDriverOffers(job, distanceBuckets);
+
+        } catch (error: any) {
+            logger.error(`Failed to trigger matched driver flow for Job ${job.id}: ${error.message}`);
+        }
+    }
+
+    /**
+     * Reconstruct Job object from booking data
+     */
+    private async reconstructJobFromBooking(jobId: string, bookingData: any, bookingKey: string): Promise<Job | null> {
+        try {
+            const pickupData = bookingData.tripAddress?.[0];
+            const dropData = bookingData.tripAddress?.[bookingData.tripAddress.length - 1];
+
+            if (!pickupData?.location) {
+                logger.error(`Invalid pickup data for Job ${jobId}`);
+                return null;
+            }
+
+            const customerId = bookingData.customer?._id || bookingKey.split('-')[1];
+
+            const job: Job = {
+                id: jobId,
+                customerId: customerId,
+                pickupLat: pickupData.location.latitude,
+                pickupLng: pickupData.location.longitude,
+                dropLat: dropData?.location?.latitude,
+                dropLng: dropData?.location?.longitude,
+                fare: bookingData.grandTotal || 0,
+                vehicleType: bookingData.selectedVehicle?.name || 'Unknown',
+                tripAddress: bookingData.tripAddress || [],
+                timestamp: bookingData.createdAt
+                    ? new Date(bookingData.createdAt).getTime()
+                    : Date.now(),
+                customer: {
+                    fullName: bookingData.customer?.fullName || 'Unknown',
+                    avatar: bookingData.customer?.avatar || '',
+                    distance: bookingData.expectedBilling?.kmText || 'N/A',
+                    time: bookingData.expectedBilling?.durationText || 'N/A'
+                },
+                rideDetails: bookingData.rideDetails || {
+                    estimatedTime: bookingData.expectedBilling?.durationText || 'N/A',
+                    estimatedDistance: bookingData.expectedBilling?.km || 0
+                }
+            };
+
+            return job;
+        } catch (error: any) {
+            logger.error(`Failed to reconstruct job ${jobId}: ${error.message}`);
+            return null;
+        }
+    }
+
     stop(): void {
         this.isInitialized = false;
+
+        if (this.queueMonitorInterval) {
+            clearInterval(this.queueMonitorInterval);
+            this.queueMonitorInterval = null;
+            logger.info('Queue exhaustion monitor stopped');
+        }
+
         logger.info('Job Orchestrator stopped');
     }
 
@@ -228,45 +390,33 @@ export class JobOrchestratorService {
                     ? JSON.parse(bookingDataJson)
                     : bookingDataJson;
 
-                // Extract customer ID from booking pattern or data
                 const customerId = bookingData.customer?._id || bookingKey.split('-')[1];
 
                 // Handle rejection in Redis
                 await this.offerManagementService.handleDriverRejection(jobId, customerId, driverId, reason);
 
-                // Reconstruct Job object from booking data
-                const pickupData = bookingData.tripAddress?.[0];
-                const dropData = bookingData.tripAddress?.[bookingData.tripAddress.length - 1];
-
-                if (!pickupData?.location) {
-                    logger.error(`Invalid pickup data for Job: ${jobId}`);
+                // Check if matched driver flow is active
+                const matchedFlowActive = await redis.get(`job:${jobId}:matched_flow_active`);
+                if (matchedFlowActive === '1') {
+                    logger.info(`Driver rejected during matched flow - Job: ${jobId}, continuing with remaining buckets`);
                     return {
-                        success: false,
-                        message: 'Invalid job data',
-                        jobId
+                        success: true,
+                        message: 'Driver rejection processed, matched flow continues',
+                        jobId,
+                        driverId
                     };
                 }
 
-                const job: Job = {
-                    id: jobId,
-                    customerId: customerId,
-                    pickupLat: pickupData.location.latitude,
-                    pickupLng: pickupData.location.longitude,
-                    dropLat: dropData?.location?.latitude,
-                    dropLng: dropData?.location?.longitude,
-                    fare: bookingData.grandTotal || 0,
-                    vehicleType: bookingData.selectedVehicle?.name || 'Unknown',
-                    tripAddress: bookingData.tripAddress || [],
-                    timestamp: bookingData.createdAt
-                        ? new Date(bookingData.createdAt).getTime()
-                        : Date.now(),
-                    customer: {
-                        fullName: bookingData.customer?.fullName || 'Unknown',
-                        avatar: bookingData.customer?.avatar || '',
-                        distance: bookingData.expectedBilling?.kmText || 'N/A',
-                        time: bookingData.expectedBilling?.durationText || 'N/A'
-                    }
-                };
+                // Reconstruct Job object from booking data
+                const job = await this.reconstructJobFromBooking(jobId, bookingData, bookingKey);
+
+                if (!job) {
+                    return {
+                        success: false,
+                        message: 'Failed to reconstruct job data',
+                        jobId
+                    };
+                }
 
                 // Find alternative drivers
                 const categorizedDrivers = await this.driverMatchingService.findBestDrivers(job, customerId);
@@ -286,7 +436,6 @@ export class JobOrchestratorService {
                     ...categorizedDrivers.newDrivers,
                     ...categorizedDrivers.nonPriorityDrivers,
                     ...categorizedDrivers.remainingDrivers,
-
                 ];
 
                 const alternativeDrivers = await this.offerManagementService.findAlternativeDrivers(jobId, allDrivers);
@@ -368,7 +517,7 @@ export class JobOrchestratorService {
         };
 
         try {
-            // Calculate trip ETA (pickup to drop) - Store in rideDetails
+            // Calculate trip ETA
             if (drop) {
                 const tripEta = await this.mapboxService.getDistanceAndDuration(
                     pickup.latitude,
@@ -420,7 +569,6 @@ export class JobOrchestratorService {
 
             logger.info(`Matched ${matchedDrivers.length} drivers for Job ${job.id}`);
 
-
             const driversWithEta = await Promise.all(
                 matchedDrivers.map(async (driverId) => {
                     try {
@@ -470,11 +618,10 @@ export class JobOrchestratorService {
                 time: offerETA?.etaToPickup || '',
             };
 
-
             await this.offerManagementService.sendOffers(job, matchedDrivers);
 
             this.metrics.driversMatched += matchedDrivers.length;
-            this.metrics.offersSent += 1; // Only first driver gets offer initially
+            this.metrics.offersSent += 1;
 
             logger.info(`Job Matched - JobId: ${job.id}, Drivers: ${matchedDrivers.length}, Queue-based flow started, Search Time: ${searchTime}ms`);
 
