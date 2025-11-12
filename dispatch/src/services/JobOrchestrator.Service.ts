@@ -48,7 +48,6 @@ export class JobOrchestratorService {
         this.offerManagementService = new OfferManagementService();
         this.mapboxService = new MapboxService();
 
-
         this.busyDriverService = new BusyDriverService(
             this.driverLocationService,
             this.zoneService
@@ -129,9 +128,6 @@ export class JobOrchestratorService {
         }
     }
 
-    /**
-     * Monitor jobs for queue exhaustion and trigger matched drivers
-     */
     private startQueueExhaustionMonitor(): void {
         if (this.queueMonitorInterval) {
             logger.info('Queue exhaustion monitor already running');
@@ -140,7 +136,6 @@ export class JobOrchestratorService {
 
         this.queueMonitorInterval = setInterval(async () => {
             try {
-                // Find jobs that need matched driver flow
                 const keys = await redis.keys('job:*:queue_exhausted');
 
                 for (const key of keys) {
@@ -148,71 +143,66 @@ export class JobOrchestratorService {
                     const flag = await redis.get(key);
 
                     if (flag === '1') {
-                        logger.info(`Detected queue exhaustion for Job ${jobId} - Triggering matched driver flow`);
+                        logger.info(` Queue Exhaustion Detected for Job ${jobId}`);
 
-                        // Get job data from Redis
-                        const bookingPattern = `booking:${jobId}-*`;
-                        const bookingKeys = await redis.keys(bookingPattern);
+                        await redis.del(key);
 
-                        if (bookingKeys.length > 0) {
-                            const bookingDataJson = await redis.call('JSON.GET', bookingKeys[0]) as any;
-
-                            if (bookingDataJson) {
-                                const bookingData = typeof bookingDataJson === 'string'
-                                    ? JSON.parse(bookingDataJson)
-                                    : bookingDataJson;
-
-                                // Reconstruct Job object
-                                const job = await this.reconstructJobFromBooking(jobId, bookingData, bookingKeys[0]);
-
-                                if (job) {
-                                    // Clear the flag before processing
-                                    await redis.del(key);
-                                    await redis.del(`job:${jobId}:trigger_matched_drivers`);
-
-                                    // Trigger matched driver flow
-                                    await this.triggerMatchedDriverFlow(job);
-                                }
-                            }
+                        const matchedFlowActive = await redis.get(`job:${jobId}:matched_flow_activez`);
+                        if (matchedFlowActive === '1') {
+                            logger.debug(`Matched flow already active for Job ${jobId} - Skipping`);
+                            continue;
                         }
+
+                        const job = await this.getJobFromBooking(jobId);
+
+                        this.matchedDriverService.triggerMatchedDriverFlow(job, jobId).catch((error: any) => {
+                            logger.error(`Matched driver flow failed for Job ${jobId}: ${error.message}`);
+                        });
                     }
                 }
             } catch (error: any) {
                 logger.error(`Queue exhaustion monitor error: ${error.message}`);
             }
-        }, 5000); // Check every 5 seconds
+        }, 5000);
 
         logger.info('Queue exhaustion monitor started');
     }
 
-    /**
-     * Trigger matched driver flow for a job
-     */
-    private async triggerMatchedDriverFlow(job: Job): Promise<void> {
+    private async getJobFromBooking(jobId: string): Promise<Job | null> {
         try {
-            logger.info(`Starting matched driver flow for Job ${job.id}`);
 
-            // Get matched drivers in 500m distance buckets
-            const distanceBuckets = await this.matchedDriverService.getMatchedDriversForJob(job, job.customerId);
+            const bookingPattern = `booking:${jobId}-*`;
+            let bookingKeys = await redis.keys(bookingPattern);
 
-            if (!distanceBuckets.length) {
-                logger.warn(`No matched drivers available for Job ${job.id}`);
-                return;
+            if (bookingKeys.length === 0) {
+                const exactKey = `booking:${jobId}`;
+                const exists = await redis.exists(exactKey);
+                if (exists) {
+                    bookingKeys = [exactKey];
+                } else {
+                    const altPattern = `booking-${jobId}*`;
+                    bookingKeys = await redis.keys(altPattern);
+                    if (bookingKeys.length === 0) {
+                        logger.warn(`No booking found for Job ${jobId}`);
+                        return null;
+                    }
+                }
             }
 
-            logger.info(`Found ${distanceBuckets.length} distance buckets for matched driver flow - Job ${job.id}`);
+            const bookingDataJson = await redis.call('JSON.GET', bookingKeys[0]) as any;
+            if (!bookingDataJson) return null;
 
-            // Start sending offers to matched drivers
-            await this.offerManagementService.sendMatchedDriverOffers(job, distanceBuckets);
+            const bookingData = typeof bookingDataJson === 'string'
+                ? JSON.parse(bookingDataJson)
+                : bookingDataJson;
 
+            return await this.reconstructJobFromBooking(jobId, bookingData, bookingKeys[0]);
         } catch (error: any) {
-            logger.error(`Failed to trigger matched driver flow for Job ${job.id}: ${error.message}`);
+            logger.error(`Failed to get job from booking for ${jobId}: ${error.message}`);
+            return null;
         }
     }
 
-    /**
-     * Reconstruct Job object from booking data
-     */
     private async reconstructJobFromBooking(jobId: string, bookingData: any, bookingKey: string): Promise<Job | null> {
         try {
             const pickupData = bookingData.tripAddress?.[0];
@@ -266,6 +256,7 @@ export class JobOrchestratorService {
             logger.info('Queue exhaustion monitor stopped');
         }
 
+        this.matchedDriverService.cleanup();
         logger.info('Job Orchestrator stopped');
     }
 
@@ -274,7 +265,6 @@ export class JobOrchestratorService {
     }
 
     async handleRPCRequest(data: any): Promise<any> {
-
         if (!this.isInitialized) {
             logger.error('Job Orchestrator not initialized - rejecting request');
             return {
@@ -285,11 +275,9 @@ export class JobOrchestratorService {
         }
 
         const requestId = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-
         const eventType = data.type || data.headers?.['event-type'];
 
         logger.info(`RPC Request Received - Type: ${eventType}, RequestId: ${requestId}`);
-
         this.metrics.rpcRequests++;
 
         try {
@@ -337,7 +325,8 @@ export class JobOrchestratorService {
 
         try {
             if (action === 'accept') {
-                // Get customerId from Redis before assigning
+                this.matchedDriverService.stopBatchProcessing(jobId);
+
                 const bookingPattern = `booking:${jobId}-*`;
                 const bookingKeys = await redis.keys(bookingPattern);
 
@@ -361,7 +350,6 @@ export class JobOrchestratorService {
                 };
 
             } else if (action === 'reject') {
-                // Get booking data from Redis to reconstruct job
                 const bookingPattern = `booking:${jobId}-*`;
                 const bookingKeys = await redis.keys(bookingPattern);
 
@@ -392,13 +380,11 @@ export class JobOrchestratorService {
 
                 const customerId = bookingData.customer?._id || bookingKey.split('-')[1];
 
-                // Handle rejection in Redis
                 await this.offerManagementService.handleDriverRejection(jobId, customerId, driverId, reason);
 
-                // Check if matched driver flow is active
                 const matchedFlowActive = await redis.get(`job:${jobId}:matched_flow_active`);
                 if (matchedFlowActive === '1') {
-                    logger.info(`Driver rejected during matched flow - Job: ${jobId}, continuing with remaining buckets`);
+                    logger.info(`Driver rejected during matched flow - Job: ${jobId}, continuing with remaining batches`);
                     return {
                         success: true,
                         message: 'Driver rejection processed, matched flow continues',
@@ -407,7 +393,6 @@ export class JobOrchestratorService {
                     };
                 }
 
-                // Reconstruct Job object from booking data
                 const job = await this.reconstructJobFromBooking(jobId, bookingData, bookingKey);
 
                 if (!job) {
@@ -418,7 +403,6 @@ export class JobOrchestratorService {
                     };
                 }
 
-                // Find alternative drivers
                 const categorizedDrivers = await this.driverMatchingService.findBestDrivers(job, customerId);
 
                 if (!categorizedDrivers) {
@@ -478,6 +462,8 @@ export class JobOrchestratorService {
         }
     }
 
+
+
     private async handleNewJobEvent(data: any, bookingId: string | null): Promise<any> {
         const startTime = Date.now();
         const payload = data.payload;
@@ -517,7 +503,10 @@ export class JobOrchestratorService {
         };
 
         try {
-            // Calculate trip ETA
+            // Store booking data first
+            await this.storeBookingData(jobId, customer._id, payload);
+
+            // Calculate trip ETA if drop location exists
             if (drop) {
                 const tripEta = await this.mapboxService.getDistanceAndDuration(
                     pickup.latitude,
@@ -542,18 +531,34 @@ export class JobOrchestratorService {
                 };
             }
 
+            // Try to find drivers using normal matching
             const categorizedDrivers = await this.driverMatchingService.findBestDrivers(job, job.customerId);
             const searchTime = Date.now() - startTime;
 
             if (!categorizedDrivers) {
-                logger.warn(`No Drivers Found - JobId: ${job.id}`);
+                logger.warn(`No Drivers Found - JobId: ${job.id} - Triggering Matched Driver Flow`);
+
+                // Set customer info with placeholder values for matched driver flow
+                job.customer = {
+                    fullName: customer.fullName || 'Unknown',
+                    avatar: customer.avatar || '',
+                    distance: 0,
+                    time: 'Calculating...',
+                };
+
+                // Trigger matched driver flow as fallback
+                this.matchedDriverService.triggerMatchedDriverFlow(job, job.id).catch((error: any) => {
+                    logger.error(`Failed to trigger matched driver flow for Job ${job.id}: ${error.message}`);
+                });
+
                 return {
-                    success: false,
-                    message: 'No drivers available',
+                    success: true,
+                    message: 'No drivers in initial search - Matched driver flow triggered',
                     jobId: job.id,
                     orderNo: payload.orderNo,
                     driversFound: 0,
                     driverIds: [],
+                    flowType: 'matched',
                     searchTimeMs: searchTime,
                     timestamp: new Date().toISOString(),
                 };
@@ -567,10 +572,41 @@ export class JobOrchestratorService {
                 ...categorizedDrivers.remainingDrivers,
             ];
 
+            // Check if we actually got any drivers
+            if (matchedDrivers.length === 0) {
+                logger.warn(`Found 0 drivers for Job ${job.id} - Triggering Matched Driver Flow`);
+
+                // Set customer info with placeholder values
+                job.customer = {
+                    fullName: customer.fullName || 'Unknown',
+                    avatar: customer.avatar || '',
+                    distance: 0,
+                    time: 'Calculating...',
+                };
+
+                // Trigger matched driver flow as fallback
+                this.matchedDriverService.triggerMatchedDriverFlow(job, job.id).catch((error: any) => {
+                    logger.error(`Failed to trigger matched driver flow for Job ${job.id}: ${error.message}`);
+                });
+
+                return {
+                    success: true,
+                    message: 'No drivers found - Matched driver flow triggered',
+                    jobId: job.id,
+                    orderNo: payload.orderNo,
+                    driversFound: 0,
+                    driverIds: [],
+                    flowType: 'matched',
+                    searchTimeMs: searchTime,
+                    timestamp: new Date().toISOString(),
+                };
+            }
+
             logger.info(`Matched ${matchedDrivers.length} drivers for Job ${job.id}`);
 
+            // Calculate ETA for first available driver
             const driversWithEta = await Promise.all(
-                matchedDrivers.map(async (driverId) => {
+                matchedDrivers.slice(0, 3).map(async (driverId) => { // Only check first 3 for performance
                     try {
                         const driverDataJson = await redis.call('JSON.GET', `driver:${driverId}`);
                         if (!driverDataJson) {
@@ -618,6 +654,7 @@ export class JobOrchestratorService {
                 time: offerETA?.etaToPickup || '',
             };
 
+            // Send offers to matched drivers
             await this.offerManagementService.sendOffers(job, matchedDrivers);
 
             this.metrics.driversMatched += matchedDrivers.length;
@@ -632,6 +669,7 @@ export class JobOrchestratorService {
                 orderNo: payload.orderNo,
                 driversFound: matchedDrivers.length,
                 driverIds: matchedDrivers,
+                flowType: 'regular',
                 offersSent: 1,
                 searchTimeMs: searchTime,
                 timestamp: new Date().toISOString(),
@@ -643,17 +681,63 @@ export class JobOrchestratorService {
 
             logger.error(`Driver Search Failed - JobId: ${job.id}, Error: ${error.message}, Search Time: ${searchTime}ms`);
 
-            return {
-                success: false,
-                message: 'Driver search failed',
-                error: error.message,
-                jobId: job.id,
-                orderNo: payload.orderNo,
-                driversFound: 0,
-                driverIds: [],
-                searchTimeMs: searchTime,
-                timestamp: new Date().toISOString(),
-            };
+            // On error, still try matched driver flow as last resort
+            try {
+                job.customer = {
+                    fullName: customer.fullName || 'Unknown',
+                    avatar: customer.avatar || '',
+                    distance: 0,
+                    time: 'Calculating...',
+                };
+
+                this.matchedDriverService.triggerMatchedDriverFlow(job, job.id).catch((err: any) => {
+                    logger.error(`Failed to trigger matched driver flow after error for Job ${job.id}: ${err.message}`);
+                });
+
+                return {
+                    success: true,
+                    message: 'Driver search failed - Matched driver flow triggered as fallback',
+                    error: error.message,
+                    jobId: job.id,
+                    orderNo: payload.orderNo,
+                    driversFound: 0,
+                    driverIds: [],
+                    flowType: 'matched_fallback',
+                    searchTimeMs: searchTime,
+                    timestamp: new Date().toISOString(),
+                };
+            } catch (fallbackError: any) {
+                logger.error(`All fallback mechanisms failed for Job ${job.id}: ${fallbackError.message}`);
+
+                return {
+                    success: false,
+                    message: 'Driver search failed and fallback failed',
+                    error: error.message,
+                    fallbackError: fallbackError.message,
+                    jobId: job.id,
+                    orderNo: payload.orderNo,
+                    driversFound: 0,
+                    driverIds: [],
+                    searchTimeMs: searchTime,
+                    timestamp: new Date().toISOString(),
+                };
+            }
+        }
+    }
+
+
+    private async storeBookingData(jobId: string, customerId: string, payload: any): Promise<void> {
+        try {
+            const bookingKey = `booking:${jobId}-${customerId}`;
+
+
+            await redis.call('JSON.SET', bookingKey, '$', JSON.stringify(payload));
+
+            await redis.expire(bookingKey, 7200);
+
+            logger.info(`Stored booking data for Job ${jobId} at key: ${bookingKey}`);
+        } catch (error: any) {
+            logger.error(`Failed to store booking data for Job ${jobId}: ${error.message}`);
         }
     }
 }

@@ -18,22 +18,125 @@ export class OfferManagementService {
     private processedOffers = new Set<string>();
 
     async sendOffers(job: Job, driverIds: string[]) {
-        logger.info(`Queue-based Offer Flow Started — Job ${job.id}`);
+        try {
 
-        const driverQueueKey = `job:${job.id}:driver_queue`;
-        const queueLength = await redis.llen(driverQueueKey);
+            const isMatchedFlow = await redis.get(`job:${job.id}:matched_flow_active`);
+            const flowType = isMatchedFlow === '1' ? 'matched' : 'regular';
 
-        if (queueLength === 0) {
-            logger.warn(`No drivers in queue for Job ${job.id}`);
-            return;
+            logger.info(`Offer Flow Started — Job ${job.id} (${flowType.toUpperCase()} FLOW)`);
+
+            if (flowType === 'matched') {
+
+                await this.sendBatchOffers(job, driverIds);
+                return;
+            }
+
+
+            const driverQueueKey = `job:${job.id}:driver_queue`;
+            const queueLength = await redis.llen(driverQueueKey);
+
+            if (queueLength === 0) {
+                logger.warn(`No drivers in queue for Job ${job.id}`);
+                return;
+            }
+
+            logger.info(`Found ${queueLength} drivers in queue for Job ${job.id}`);
+
+            this.sendOfferToDriver(job.id, job).catch((error) => {
+                logger.error(`Error sending next driver offer for Job ${job.id}: ${error.message}`);
+            });
+        } catch (error: any) {
+            logger.error(`Failed to start offer flow for Job ${job.id}: ${error.message}`);
+        }
+    }
+
+    private async sendBatchOffers(job: Job, driverIds: string[]): Promise<void> {
+        const offerPromises = driverIds.map(driverId =>
+            this.sendSingleOffer(job, driverId)
+        );
+
+        const results = await Promise.allSettled(offerPromises);
+
+        const successful = results.filter(r => r.status === 'fulfilled').length;
+        const failed = results.filter(r => r.status === 'rejected').length;
+
+        logger.info(` Batch offers sent for Job ${job.id}: ${successful} successful, ${failed} failed`);
+
+        this.monitorBatchOffers(job, driverIds);
+    }
+
+    private monitorBatchOffers(job: Job, driverIds: string[]) {
+        const checkInterval = 1000;
+        const maxWaitTime = this.OFFER_EXPIRY_SECONDS * 1000 + 5000;
+        let elapsedTime = 0;
+        let resolved = false;
+
+        const checker = setInterval(async () => {
+            if (resolved) {
+                clearInterval(checker);
+                return;
+            }
+
+            elapsedTime += checkInterval;
+
+            try {
+
+                for (const driverId of driverIds) {
+                    const responseKey = `offer:response:${job.id}:${driverId}`;
+                    const responseData = await redis.get(responseKey);
+
+                    if (responseData) {
+                        const response = JSON.parse(responseData);
+                        if (response.action === 'accept') {
+                            resolved = true;
+                            clearInterval(checker);
+
+                            logger.info(` Matched driver ${driverId} accepted Job ${job.id}`);
+
+                            await redis.del(responseKey);
+                            await this.assignDriverToJob(job.id, driverId, job.customerId);
+                            await this.cancelBatchOffers(job.id, driverIds, driverId);
+                            return;
+                        }
+                    }
+                }
+
+                if (elapsedTime >= maxWaitTime) {
+                    resolved = true;
+                    clearInterval(checker);
+
+                    logger.info(` Batch offers expired for Job ${job.id}`);
+
+
+                    for (const driverId of driverIds) {
+                        await this.handleOfferExpired(job.id, driverId);
+                    }
+
+                    return;
+                }
+
+            } catch (err: any) {
+                logger.error(`Error monitoring batch offers: ${err.message}`);
+            }
+        }, checkInterval);
+    }
+
+    private async cancelBatchOffers(jobId: string, driverIds: string[], acceptedDriverId: string): Promise<void> {
+        const pipeline = redis.pipeline();
+
+        for (const driverId of driverIds) {
+            if (driverId !== acceptedDriverId) {
+                pipeline.del(`offer:${jobId}:${driverId}`);
+                pipeline.del(`offer:response:${jobId}:${driverId}`);
+                this.deleteJobNotification(driverId).catch(() => {});
+            }
         }
 
-        logger.info(`Found ${queueLength} drivers in queue for Job ${job.id}`);
-
-        this.sendOfferToDriver(job.id, job).catch(error => {
-            logger.error(`Error in sendOfferToNextDriver for Job ${job.id}: ${error.message}`);
-        });
+        await pipeline.exec();
+        logger.info(`Cancelled ${driverIds.length - 1} other batch offers for Job ${jobId}`);
     }
+
+
 
     private async sendOfferToDriver(jobId: string, job: Job): Promise<boolean> {
         const driverQueueKey = `job:${jobId}:driver_queue`;

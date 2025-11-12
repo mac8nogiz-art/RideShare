@@ -96,10 +96,11 @@ export class FreeDriverService {
                     const [lng, lat] = driverData.location?.coordinates || [];
 
                     return {
-                        driverId: driverIds[i].replaceAll('driver:',''),
+                        driverId: driverIds[i].replace('driver:', ''),
                         lat,
                         lng,
-                        iAmBusy: driverData.iAmBusy,
+                        // Handle both field names for busy status
+                        isBusy: driverData.iAmBusy || driverData.isBusy || false,
                         isNew: driverData.isNew || false,
                         distance: distances[i],
                         priorityScore: driverData.priorityScore
@@ -107,7 +108,7 @@ export class FreeDriverService {
                 })
                 .filter((item: any) => item !== null);
 
-            console.log(`Found ${drivers.length} drivers within ${radiusKm}km`);
+            logger.debug(`Found ${drivers.length} drivers within ${radiusKm}km in zone search`);
             return drivers;
         } catch (error: any) {
             logger.error(`GEOSEARCH failed - Radius: ${radiusKm}km, Error: ${error.message}`);
@@ -131,14 +132,17 @@ export class FreeDriverService {
                 this.FREE_DRIVERS_RADIUS
             );
 
-
+            // Filter to only free (not busy) and not blocked drivers
             const freeDrivers = drivers
                 .filter(d => !d.isBusy && !blockedSet.has(d.driverId))
                 .sort((a, b) => a.distance - b.distance)
                 .map(d => d.driverId);
 
             logger.info(`Found ${freeDrivers.length} free drivers within ${this.FREE_DRIVERS_RADIUS}km`);
-            console.log('Free drivers (sorted by distance):', freeDrivers);
+
+            if (freeDrivers.length > 0) {
+                logger.debug(`Free drivers (sorted by distance): ${freeDrivers.slice(0, 5).join(', ')}${freeDrivers.length > 5 ? '...' : ''}`);
+            }
 
             return freeDrivers;
         } catch (error: any) {
@@ -160,6 +164,10 @@ export class FreeDriverService {
             }
 
             const blocked = Array.isArray(user?.blockDrivers) ? user.blockDrivers.map(String) : [];
+
+            if (blocked.length > 0) {
+                logger.debug(`Customer ${customerId} has ${blocked.length} blocked drivers`);
+            }
 
             return new Set(blocked);
         } catch (error: any) {
