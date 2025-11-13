@@ -28,16 +28,17 @@ interface RedisDriverData {
     location?: { coordinates: number[] };
 }
 
+interface FlowData {
+    job: Job;
+    batches: DriverBatch[];
+    nextBatchIndex: number;
+}
+
 export class MatchedDriverService {
-    private readonly BATCH_TIME_INTERVAL = 45_000;
+    private readonly BATCH_TIME_INTERVAL = 45_000; // 45 seconds
     private readonly BUCKET_DISTANCE_STEP_METERS = 500;
-    private readonly MIN_BATCH_SIZE = 1;
     private readonly MAX_BATCH_SIZE = 5;
     private readonly MAX_DISTANCE_KM = 15;
-
-
-
-    private activeBatchJobs = new Map<string, NodeJS.Timeout>();
 
     constructor(
         private readonly busyDriverService: BusyDriverService,
@@ -46,126 +47,188 @@ export class MatchedDriverService {
         private readonly spatialService: SpatialService = new SpatialService()
     ) {}
 
-    async triggerMatchedDriverFlow(job: Job | null, jobId: string): Promise<void> {
+    async triggerMatchedDriverFlow(job: Job, jobId: string): Promise<void> {
         try {
-            if (!job) {
-                await this.triggerFallbackFlow(jobId);
+            logger.info(`Triggering MATCHED DRIVER FLOW for Job ${jobId}`);
+
+
+            const alreadyActive = await redis.get(`job:${jobId}:matched_flow_active`);
+
+            if (alreadyActive === '1') {
+                logger.info(` Matched flow already active for Job ${jobId} - skipping duplicate trigger`);
                 return;
             }
 
-            logger.info(`Starting MATCHED DRIVER FLOW for Job ${job.id}`);
+
+            if (!job.pickupLat || !job.pickupLng || !job.customerId) {
+                logger.error(` Invalid job data for ${jobId} - missing required fields`);
+                return;
+            }
 
             const distanceBuckets = await this.getMatchedDriversForJob(job, job.customerId);
 
             if (!distanceBuckets.length) {
-                logger.warn(`No matched drivers for Job ${job.id}`);
-                await redis.del(`job:${job.id}:matched_flow_active`);
+                logger.warn(`No matched drivers found for Job ${jobId}`);
                 return;
             }
 
-            // Process batches from distance buckets
-            await this.processBatchedOffers(job, distanceBuckets);
+            logger.info(`Found ${distanceBuckets.flatMap(b => b.drivers).length} drivers across ${distanceBuckets.length} buckets for Job ${jobId}`);
+
+
+            await this.startEventBasedBatchFlow(job, distanceBuckets);
+
         } catch (error: any) {
-            logger.error(`Matched driver flow failed for Job ${jobId}: ${error.message}`);
+            logger.error(` Matched driver flow failed for Job ${jobId}: ${error.message}`);
+            await this.cleanupMatchedFlow(jobId);
             throw error;
         }
     }
 
-    private async triggerFallbackFlow(jobId: string): Promise<void> {
-        logger.warn(` No booking data - Using FREE DRIVERS fallback for Job ${jobId}`);
+    private async startEventBasedBatchFlow(job: Job, buckets: DistanceBucket[]): Promise<void> {
+        if (!buckets.length) return;
 
-        try {
-            const freeDrivers = await this.getFreeDriversWithinRadius(jobId);
-            if (!freeDrivers.length) {
-                await redis.del(`job:${jobId}:matched_flow_active`);
-                return;
-            }
 
-            const minimalJob: Job = {
-                id: jobId,
-                customerId: 'unknown',
-                pickupLat: 0,
-                pickupLng: 0,
-                fare: 0,
-                vehicleType: 'Unknown',
-                timestamp: Date.now(),
-                customer: { fullName: 'Customer', avatar: '', distance: 0, time: 'N/A' },
-                rideDetails: { estimatedTime: 'N/A', estimatedDistance: 0 }
-            };
+        await redis.setex(`job:${job.id}:matched_flow_active`, 360, '1');
 
-            await this.sendBatchedOffersFallback(jobId, minimalJob, freeDrivers);
-        } catch (error: any) {
-            logger.error(`Fallback flow failed for Job ${jobId}: ${error.message}`);
-            await redis.del(`job:${jobId}:matched_flow_active`);
-        }
+        const allDrivers = buckets.flatMap(bucket => bucket.drivers);
+        logger.info(` Starting event-based batch flow for Job ${job.id}: ${allDrivers.length} drivers`);
+
+        const batches = this.createBatches(allDrivers, buckets);
+
+        await this.updateFlowData(job.id, { job, batches, nextBatchIndex: 0 });
+
+        logger.info(` Created ${batches.length} batches for Job ${job.id}`);
+
+        await this.sendBatchWithTTLTrigger(job.id, 0);
     }
 
-    private async getFreeDriversWithinRadius(jobId: string): Promise<string[]> {
-        try {
-            const result = await redis.geosearch(
-                'drivers:locations',
-                'FROMLONLAT',
-                76.6973,
-                30.7178,
-                'BYRADIUS',
-                15,
-                'km',
-                'WITHDIST',
-                'ASC'
-            ) as any;
-
-            if (!result?.length) return [];
-
-            return result.map((item: any) => item[0]);
-        } catch (error: any) {
-            logger.error(`Failed to get free drivers: ${error.message}`);
-            return [];
-        }
-    }
-
-    private async sendBatchedOffersFallback(jobId: string, job: Job, drivers: string[]): Promise<void> {
+    private createBatches(allDrivers: string[], buckets: DistanceBucket[]): DriverBatch[] {
+        const batches: DriverBatch[] = [];
         let currentIndex = 0;
         let batchNumber = 0;
 
-        const sendNext = async () => {
-            try {
-                const jobStatus = await redis.get(`job:${jobId}:status`);
-                if (jobStatus === 'assigned' || jobStatus === 'cancelled') {
-                    await redis.del(`job:${jobId}:matched_flow_active`);
-                    return;
-                }
+        while (currentIndex < allDrivers.length) {
+            batchNumber++;
+            const endIndex = Math.min(currentIndex + this.MAX_BATCH_SIZE, allDrivers.length);
+            const batchDrivers = allDrivers.slice(currentIndex, endIndex);
+            const distanceRange = this.getDistanceRangeForDrivers(buckets, currentIndex, endIndex);
 
-                if (currentIndex >= drivers.length) {
-                    await redis.del(`job:${jobId}:matched_flow_active`);
-                    return;
-                }
+            batches.push({
+                batchNumber,
+                drivers: batchDrivers,
+                distanceRange,
+                sendTime: Date.now(),
+            });
 
-                batchNumber++;
-                const batchSize = Math.min(this.MAX_BATCH_SIZE, drivers.length - currentIndex);
-                const batch = drivers.slice(currentIndex, currentIndex + batchSize);
-                currentIndex += batchSize;
+            currentIndex = endIndex;
+        }
 
-                logger.info(`Sending fallback batch ${batchNumber} with ${batch.length} drivers for Job ${jobId}`);
-                await this.offerManagementService.sendOffers(job, batch);
-
-                if (currentIndex < drivers.length) {
-                    const timeout = setTimeout(sendNext, this.BATCH_TIME_INTERVAL);
-                    this.activeBatchJobs.set(jobId, timeout);
-                } else {
-                    await redis.del(`job:${jobId}:matched_flow_active`);
-                }
-            } catch (error: any) {
-                logger.error(`Fallback batch error for Job ${jobId}: ${error.message}`);
-                await redis.del(`job:${jobId}:matched_flow_active`);
-            }
-        };
-
-        await sendNext();
+        return batches;
     }
+
+    private async sendBatchWithTTLTrigger(jobId: string, batchIndex: number): Promise<void> {
+        try {
+            const status = await redis.get(`job:${jobId}:status`);
+            if (status === 'assigned' || status === 'cancelled') {
+                logger.info(` Job ${jobId} already ${status} - stopping batch flow`);
+                await this.cleanupMatchedFlow(jobId);
+                return;
+            }
+
+            const flowData = await this.getFlowData(jobId);
+            if (!flowData || !flowData.batches.length) {
+                logger.warn(`No flow data found for Job ${jobId}`);
+                await this.cleanupMatchedFlow(jobId);
+                return;
+            }
+
+            if (batchIndex >= flowData.batches.length) {
+                logger.info(`All ${flowData.batches.length} batches sent for Job ${jobId}`);
+                await this.cleanupMatchedFlow(jobId);
+                return;
+            }
+
+            const currentBatch = flowData.batches[batchIndex];
+            const isLastBatch = batchIndex === flowData.batches.length - 1;
+
+            logger.info(`Sending Batch ${currentBatch.batchNumber}/${flowData.batches.length} for Job ${jobId}: ${currentBatch.drivers.length} drivers (${currentBatch.distanceRange})`);
+
+            // Send offers to all drivers in current batch
+            await this.offerManagementService.sendOffers(flowData.job, currentBatch.drivers);
+
+            if (!isLastBatch) {
+                const nextBatchIndex = batchIndex + 1;
+
+                // Update flow data with next batch index
+                flowData.nextBatchIndex = nextBatchIndex;
+                await this.updateFlowData(jobId, flowData);
+
+
+                const batchTriggerKey = `job:${jobId}:batch_trigger:${currentBatch.batchNumber}`;
+                const batchTTL = Math.ceil(this.BATCH_TIME_INTERVAL / 1000); // 45 seconds
+
+                await redis.setex(
+                    batchTriggerKey,
+                    batchTTL,
+                    JSON.stringify({
+                        batchNumber: currentBatch.batchNumber,
+                        nextBatchIndex: nextBatchIndex,
+                        drivers: currentBatch.drivers,
+                        sentAt: Date.now()
+                    })
+                );
+
+                logger.info(` Batch ${currentBatch.batchNumber} TTL set - expires in ${batchTTL}s, will trigger Batch ${nextBatchIndex}`);
+            } else {
+                logger.info(` Last batch sent for Job ${jobId} - matched flow complete`);
+                await this.cleanupMatchedFlow(jobId);
+            }
+
+        } catch (error: any) {
+            logger.error(`Batch sending error for Job ${jobId}: ${error.message}`);
+            await this.cleanupMatchedFlow(jobId);
+        }
+    }
+
+
+    async handleBatchTriggerExpiry(jobId: string, batchNumber: number): Promise<void> {
+        try {
+            logger.info(` Batch ${batchNumber} expired for Job ${jobId} - triggering next batch`);
+
+            const status = await redis.get(`job:${jobId}:status`);
+            if (status === 'assigned' || status === 'cancelled') {
+                logger.info(` Job ${jobId} already ${status} - ignoring batch expiry`);
+                await this.cleanupMatchedFlow(jobId);
+                return;
+            }
+
+            const flowActive = await redis.get(`job:${jobId}:matched_flow_active`);
+
+            if (flowActive !== '1') {
+                logger.info(`Matched flow not active for Job ${jobId} - ignoring trigger`);
+                return;
+            }
+
+            const flowData = await this.getFlowData(jobId);
+            if (!flowData) {
+                logger.warn(` No flow data found for Job ${jobId} - cannot proceed`);
+                await this.cleanupMatchedFlow(jobId);
+                return;
+            }
+            logger.info(` Proceeding to send Batch ${flowData.nextBatchIndex} for Job ${jobId}`);
+            await this.sendBatchWithTTLTrigger(jobId, flowData.nextBatchIndex);
+
+        } catch (error: any) {
+            logger.error(` Batch trigger handling error for Job ${jobId}: ${error.message}`);
+            await this.cleanupMatchedFlow(jobId);
+        }
+    }
+
+
 
     async getMatchedDriversForJob(job: Job, customerId: string): Promise<DistanceBucket[]> {
         try {
-            // Get all potential drivers (free + busy)
+
             const allDriverIds = await this.getAllPotentialDrivers(job, customerId);
             if (!allDriverIds.length) {
                 logger.warn(`No drivers available for Job ${job.id}`);
@@ -174,7 +237,6 @@ export class MatchedDriverService {
 
             logger.info(`Found ${allDriverIds.length} potential drivers for Job ${job.id}`);
 
-            // Enrich with distances
             const enrichedDrivers = await this.enrichDriversWithDistance(
                 allDriverIds,
                 job.pickupLat,
@@ -186,9 +248,8 @@ export class MatchedDriverService {
                 return [];
             }
 
-            // Create distance buckets (500m intervals)
-            const buckets = this.createDistanceBuckets(enrichedDrivers);
 
+            const buckets = this.createDistanceBuckets(enrichedDrivers);
             logger.info(`Created ${buckets.length} distance buckets for Job ${job.id}`);
 
             return buckets;
@@ -198,104 +259,6 @@ export class MatchedDriverService {
         }
     }
 
-    async processBatchedOffers(job: Job, buckets: DistanceBucket[]): Promise<void> {
-        if (!buckets.length) {
-            await redis.del(`job:${job.id}:matched_flow_active`);
-            return;
-        }
-
-        await redis.setex(`job:${job.id}:matched_flow_active`, 3600, '1');
-
-        let batchNumber = 0;
-        let currentBucketIndex = 0;
-        let usedFromBucket = 0;
-
-        const processBatch = async () => {
-            try {
-                const status = await redis.get(`job:${job.id}:status`);
-                if (status === 'assigned' || status === 'cancelled') {
-                    logger.info(`Job ${job.id} ${status} - stopping matched flow`);
-                    await this.cleanupMatchedFlow(job.id);
-                    return;
-                }
-
-                if (currentBucketIndex >= buckets.length) {
-                    logger.info(`All batches sent for Job ${job.id}`);
-                    await this.cleanupMatchedFlow(job.id);
-                    return;
-                }
-
-                batchNumber++;
-                const batchDrivers: string[] = [];
-                let remaining = this.MAX_BATCH_SIZE;
-
-                while (remaining > 0 && currentBucketIndex < buckets.length) {
-                    const bucket = buckets[currentBucketIndex];
-                    const available = bucket.drivers.length - usedFromBucket;
-                    const take = Math.min(remaining, available);
-
-                    batchDrivers.push(...bucket.drivers.slice(usedFromBucket, usedFromBucket + take));
-
-                    usedFromBucket += take;
-                    remaining -= take;
-
-                    if (usedFromBucket >= bucket.drivers.length) {
-                        currentBucketIndex++;
-                        usedFromBucket = 0;
-                    }
-                }
-
-                if (!batchDrivers.length) {
-                    await this.cleanupMatchedFlow(job.id);
-                    return;
-                }
-
-                const currentBucket = buckets[Math.min(currentBucketIndex, buckets.length - 1)];
-                const batch: DriverBatch = {
-                    batchNumber,
-                    drivers: batchDrivers,
-                    distanceRange: `${currentBucket.rangeStart}-${currentBucket.rangeEnd}m`,
-                    sendTime: Date.now(),
-                };
-
-                // --- Prepare tabular data ---
-                const tableData = batch.drivers.map((driverId, idx) => ({
-                    Row: idx + 1,
-                    DriverID: driverId,
-                    Batch: batch.batchNumber,
-                    DistanceRange: batch.distanceRange,
-                    JobID: job.id,
-                    SentAt: new Date(batch.sendTime).toISOString(),
-                }));
-
-
-                console.table(tableData);
-
-
-                const redisKey = `job:${job.id}:batch_table`;
-                for (const row of tableData) {
-                    await redis.rpush(redisKey, JSON.stringify(row));
-                }
-                await redis.expire(redisKey, 3600);
-                await this.offerManagementService.sendOffers(job, batchDrivers);
-
-                if (currentBucketIndex < buckets.length) {
-                    const timeout = setTimeout(processBatch, this.BATCH_TIME_INTERVAL);
-                    this.activeBatchJobs.set(job.id, timeout);
-                } else {
-                    await this.cleanupMatchedFlow(job.id);
-                }
-            } catch (error: any) {
-                logger.error(`Batch processing error for Job ${job.id}: ${error.message}`);
-                await this.cleanupMatchedFlow(job.id);
-            }
-        };
-
-        await processBatch();
-    }
-
-
-
     private async getAllPotentialDrivers(job: Job, customerId: string): Promise<string[]> {
         const [freeDrivers, busyDrivers] = await Promise.all([
             this.freeDriverService.getFreeDriversForJob(job, customerId),
@@ -303,38 +266,40 @@ export class MatchedDriverService {
         ]);
 
         const allDrivers = [...(freeDrivers || []), ...(busyDrivers || [])];
-
-        logger.info(`Found ${freeDrivers?.length || 0} free drivers and ${busyDrivers?.length || 0} busy drivers for Job ${job.id}`);
+        logger.info(`Found ${freeDrivers?.length || 0} free + ${busyDrivers?.length || 0} busy = ${allDrivers.length} total drivers`);
 
         return allDrivers;
     }
 
-    private async enrichDriversWithDistance(driverIds: string[], jobLat: number, jobLng: number): Promise<DriverWithDistance[]> {
-        const results = await Promise.all(driverIds.map(async (driverId) => {
-            const distance = await this.calculateDriverDistance(driverId, jobLat, jobLng);
-            return distance !== null ? { driverId, distance } : null;
-        }));
+    private async enrichDriversWithDistance(
+        driverIds: string[],
+        jobLat: number,
+        jobLng: number
+    ): Promise<DriverWithDistance[]> {
+        const results = await Promise.all(
+            driverIds.map(async (driverId) => {
+                try {
+
+                    const data = await redis.call('JSON.GET', `driver:${driverId}`, '$');
+                    if (!data) return null;
+                    const parsed = JSON.parse(data as string) as RedisDriverData[];
+                    const driverData = parsed?.[0];
+                    if (!driverData?.location?.coordinates?.length) return null;
+                    const [lng, lat] = driverData.location.coordinates;
+                    const distance = this.spatialService.calculateDistance(lat, lng, jobLat, jobLng);
+                    return { driverId, distance };
+                } catch {
+                    return null;
+                }
+            })
+        );
+
 
         return results
             .filter((d): d is DriverWithDistance => d !== null)
             .sort((a, b) => a.distance - b.distance);
     }
 
-    private async calculateDriverDistance(driverId: string, jobLat: number, jobLng: number): Promise<number | null> {
-        try {
-            const data = await redis.call('JSON.GET', `driver:${driverId}`, '$');
-            if (!data) return null;
-
-            const parsed = JSON.parse(data as string) as RedisDriverData[];
-            const driverData = parsed?.[0];
-            if (!driverData?.location?.coordinates?.length) return null;
-
-            const [lng, lat] = driverData.location.coordinates;
-            return this.spatialService.calculateDistance(lat, lng, jobLat, jobLng);
-        } catch {
-            return null;
-        }
-    }
 
     private createDistanceBuckets(drivers: DriverWithDistance[]): DistanceBucket[] {
         if (!drivers.length) return [];
@@ -342,31 +307,16 @@ export class MatchedDriverService {
         const buckets: DistanceBucket[] = [];
         const maxDist = this.MAX_DISTANCE_KM * 1000;
 
-
         for (let start = 0; start <= maxDist; start += this.BUCKET_DISTANCE_STEP_METERS) {
             const end = start + this.BUCKET_DISTANCE_STEP_METERS;
             const inBucket = drivers
-                .filter(d => {
-                    const dist = d.distance * 1000;
-                    return dist >= start && dist < end;
-                })
+                .filter(d => d.distance * 1000 >= start && d.distance * 1000 < end)
                 .map(d => d.driverId);
 
             if (inBucket.length) {
                 buckets.push({ rangeStart: start, rangeEnd: end, drivers: inBucket });
             }
         }
-
-        // Add drivers beyond max distance
-        const farDrivers = drivers
-            .filter(d => d.distance * 1000 >= maxDist)
-            .map(d => d.driverId);
-
-        if (farDrivers.length) {
-            buckets.push({ rangeStart: maxDist, rangeEnd: Infinity, drivers: farDrivers });
-        }
-
-        // Log bucket distribution
         buckets.forEach((bucket, idx) => {
             logger.info(`Bucket ${idx + 1}: ${bucket.rangeStart}-${bucket.rangeEnd}m (${bucket.drivers.length} drivers)`);
         });
@@ -374,26 +324,71 @@ export class MatchedDriverService {
         return buckets;
     }
 
+    private getDistanceRangeForDrivers(
+        buckets: DistanceBucket[],
+        startIdx: number,
+        endIdx: number
+    ): string {
+        let driverCount = 0;
+        let firstBucket: DistanceBucket | null = null;
+        let lastBucket: DistanceBucket | null = null;
+
+        for (const bucket of buckets) {
+            const bucketStart = driverCount;
+            const bucketEnd = driverCount + bucket.drivers.length;
+
+            if (bucketEnd > startIdx && bucketStart < endIdx) {
+                if (!firstBucket) firstBucket = bucket;
+                lastBucket = bucket;
+            }
+
+            driverCount += bucket.drivers.length;
+            if (driverCount >= endIdx) break;
+        }
+
+        if (!firstBucket || !lastBucket) return '0-500m';
+        if (firstBucket === lastBucket) {
+            return `${firstBucket.rangeStart}-${firstBucket.rangeEnd}m`;
+        }
+        return `${firstBucket.rangeStart}-${lastBucket.rangeEnd}m`;
+    }
+
+
+    private async getFlowData(jobId: string): Promise<FlowData | null> {
+        try {
+            const jobKey = `job:${jobId}:flow_data`;
+            const data = await redis.get(jobKey);
+            if (!data) return null;
+            return JSON.parse(data);
+        } catch (error: any) {
+            logger.error(`Failed to retrieve flow data: ${error.message}`);
+            return null;
+        }
+    }
+
+    private async updateFlowData(jobId: string, flowData: FlowData): Promise<void> {
+        try {
+            const jobKey = `job:${jobId}:flow_data`;
+            await redis.setex(jobKey, 3600, JSON.stringify(flowData));
+        } catch (error: any) {
+            logger.error(`Failed to update flow data: ${error.message}`);
+        }
+    }
+
+
     private async cleanupMatchedFlow(jobId: string): Promise<void> {
-        await redis.del(`job:${jobId}:matched_flow_active`);
-        this.stopBatchProcessing(jobId);
-        logger.info(`Cleaned up matched flow for Job ${jobId}`);
-    }
+        try {
 
-    stopBatchProcessing(jobId: string): void {
-        const timeout = this.activeBatchJobs.get(jobId);
-        if (timeout) {
-            clearTimeout(timeout);
-            this.activeBatchJobs.delete(jobId);
-            logger.info(`Stopped batch processing for Job ${jobId}`);
-        }
-    }
+            await redis.del(`job:${jobId}:matched_flow_active`);
+            await redis.del(`job:${jobId}:flow_data`);
 
-    cleanup(): void {
-        for (const [jobId, timeout] of this.activeBatchJobs.entries()) {
-            clearTimeout(timeout);
-            logger.info(`Cleaned up batch processing for Job ${jobId}`);
+            const triggerKeys = await redis.keys(`job:${jobId}:batch_trigger:*`);
+            if (triggerKeys.length > 0) {
+                await redis.del(...triggerKeys);
+            }
+            logger.info(`Cleaned up matched flow for Job ${jobId}`);
+        } catch (error: any) {
+            logger.error(`Failed to cleanup matched flow: ${error.message}`);
         }
-        this.activeBatchJobs.clear();
     }
 }

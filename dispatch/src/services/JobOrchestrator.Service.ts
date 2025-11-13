@@ -143,11 +143,10 @@ export class JobOrchestratorService {
                     const flag = await redis.get(key);
 
                     if (flag === '1') {
-                        logger.info(` Queue Exhaustion Detected for Job ${jobId}`);
-
+                        logger.info(`Queue Exhaustion Detected for Job ${jobId}`);
                         await redis.del(key);
 
-                        const matchedFlowActive = await redis.get(`job:${jobId}:matched_flow_activez`);
+                        const matchedFlowActive = await redis.get(`job:${jobId}:matched_flow_active`);
                         if (matchedFlowActive === '1') {
                             logger.debug(`Matched flow already active for Job ${jobId} - Skipping`);
                             continue;
@@ -155,9 +154,11 @@ export class JobOrchestratorService {
 
                         const job = await this.getJobFromBooking(jobId);
 
-                        this.matchedDriverService.triggerMatchedDriverFlow(job, jobId).catch((error: any) => {
-                            logger.error(`Matched driver flow failed for Job ${jobId}: ${error.message}`);
-                        });
+                        if (job) {
+                            this.matchedDriverService.triggerMatchedDriverFlow(job, jobId).catch((error: any) => {
+                                logger.error(`Matched driver flow failed for Job ${jobId}: ${error.message}`);
+                            });
+                        }
                     }
                 }
             } catch (error: any) {
@@ -168,81 +169,82 @@ export class JobOrchestratorService {
         logger.info('Queue exhaustion monitor started');
     }
 
-    private async getJobFromBooking(jobId: string): Promise<Job | null> {
+
+    private buildJobFromPayload(payload: any, jobId?: string): Job | null {
         try {
+            const id = jobId || payload._id;
+            const customer = payload.customer;
+            const pickupData = payload.tripAddress?.[0];
+            const dropData = payload.tripAddress?.[payload.tripAddress.length - 1];
 
-            const bookingPattern = `booking:${jobId}-*`;
-            let bookingKeys = await redis.keys(bookingPattern);
-
-            if (bookingKeys.length === 0) {
-                const exactKey = `booking:${jobId}`;
-                const exists = await redis.exists(exactKey);
-                if (exists) {
-                    bookingKeys = [exactKey];
-                } else {
-                    const altPattern = `booking-${jobId}*`;
-                    bookingKeys = await redis.keys(altPattern);
-                    if (bookingKeys.length === 0) {
-                        logger.warn(`No booking found for Job ${jobId}`);
-                        return null;
-                    }
-                }
-            }
-
-            const bookingDataJson = await redis.call('JSON.GET', bookingKeys[0]) as any;
-            if (!bookingDataJson) return null;
-
-            const bookingData = typeof bookingDataJson === 'string'
-                ? JSON.parse(bookingDataJson)
-                : bookingDataJson;
-
-            return await this.reconstructJobFromBooking(jobId, bookingData, bookingKeys[0]);
-        } catch (error: any) {
-            logger.error(`Failed to get job from booking for ${jobId}: ${error.message}`);
-            return null;
-        }
-    }
-
-    private async reconstructJobFromBooking(jobId: string, bookingData: any, bookingKey: string): Promise<Job | null> {
-        try {
-            const pickupData = bookingData.tripAddress?.[0];
-            const dropData = bookingData.tripAddress?.[bookingData.tripAddress.length - 1];
-
-            if (!pickupData?.location) {
-                logger.error(`Invalid pickup data for Job ${jobId}`);
+            if (!pickupData?.location || !customer?._id) {
+                logger.error(`Invalid payload data for Job ${id}`);
                 return null;
             }
 
-            const customerId = bookingData.customer?._id || bookingKey.split('-')[1];
-
-            const job: Job = {
-                id: jobId,
-                customerId: customerId,
+            return {
+                id,
+                customerId: customer._id,
                 pickupLat: pickupData.location.latitude,
                 pickupLng: pickupData.location.longitude,
                 dropLat: dropData?.location?.latitude,
                 dropLng: dropData?.location?.longitude,
-                fare: bookingData.grandTotal || 0,
-                vehicleType: bookingData.selectedVehicle?.name || 'Unknown',
-                tripAddress: bookingData.tripAddress || [],
-                timestamp: bookingData.createdAt
-                    ? new Date(bookingData.createdAt).getTime()
-                    : Date.now(),
+                fare: payload.grandTotal || 0,
+                vehicleType: payload.selectedVehicle?.name || 'Unknown',
+                tripAddress: payload.tripAddress || [],
+                timestamp: payload.createdAt ? new Date(payload.createdAt).getTime() : Date.now(),
                 customer: {
-                    fullName: bookingData.customer?.fullName || 'Unknown',
-                    avatar: bookingData.customer?.avatar || '',
-                    distance: bookingData.expectedBilling?.kmText || 'N/A',
-                    time: bookingData.expectedBilling?.durationText || 'N/A'
+                    fullName: customer.fullName || 'Unknown',
+                    avatar: customer.avatar || '',
+                    distance: payload.expectedBilling?.kmText || 0,
+                    time: payload.expectedBilling?.durationText || 'N/A'
                 },
-                rideDetails: bookingData.rideDetails || {
-                    estimatedTime: bookingData.expectedBilling?.durationText || 'N/A',
-                    estimatedDistance: bookingData.expectedBilling?.km || 0
+                rideDetails: payload.rideDetails || {
+                    estimatedTime: payload.expectedBilling?.durationText || 'N/A',
+                    estimatedDistance: payload.expectedBilling?.km || 0
                 }
             };
-
-            return job;
         } catch (error: any) {
-            logger.error(`Failed to reconstruct job ${jobId}: ${error.message}`);
+            logger.error(`Failed to build job from payload: ${error.message}`);
+            return null;
+        }
+    }
+
+
+    private async getJobFromBooking(jobId: string): Promise<Job | null> {
+        try {
+
+            const patterns = [
+                `booking:${jobId}-*`,
+                `booking:${jobId}`,
+                `booking-${jobId}*`
+            ];
+
+            let bookingKey: string | null = null;
+            for (const pattern of patterns) {
+                const keys = await redis.keys(pattern);
+                if (keys.length > 0) {
+                    bookingKey = keys[0];
+                    break;
+                }
+            }
+
+            if (!bookingKey) {
+                logger.warn(`No booking found for Job ${jobId}`);
+                return null;
+            }
+
+            const bookingDataJson = await redis.call('JSON.GET', bookingKey) as any;
+            if (!bookingDataJson) return null;
+
+            const payload = typeof bookingDataJson === 'string'
+                ? JSON.parse(bookingDataJson)
+                : bookingDataJson;
+
+            // REUSE the same builder function!
+            return this.buildJobFromPayload(payload, jobId);
+        } catch (error: any) {
+            logger.error(`Failed to get job from booking for ${jobId}: ${error.message}`);
             return null;
         }
     }
@@ -256,8 +258,8 @@ export class JobOrchestratorService {
             logger.info('Queue exhaustion monitor stopped');
         }
 
-        this.matchedDriverService.cleanup();
-        logger.info('Job Orchestrator stopped');
+        // this.matchedDriverService.cleanupMatchedFlow();
+        // logger.info('Job Orchestrator stopped');
     }
 
     isReady(): boolean {
@@ -318,6 +320,14 @@ export class JobOrchestratorService {
             };
         }
     }
+    async handleBatchTriggerExpiry(jobId: string, batchNumber: number): Promise<void> {
+        try {
+            logger.info(`Handling batch trigger expiry - Job: ${jobId}, Batch: ${batchNumber}`);
+            await this.matchedDriverService.handleBatchTriggerExpiry(jobId, batchNumber);
+        } catch (error: any) {
+            logger.error(`Failed to handle batch trigger expiry: ${error.message}`);
+        }
+    }
 
     async handleDriverResponse(data: any): Promise<any> {
         const {driverId, jobId, action, reason} = data;
@@ -325,7 +335,7 @@ export class JobOrchestratorService {
 
         try {
             if (action === 'accept') {
-                this.matchedDriverService.stopBatchProcessing(jobId);
+                // this.matchedDriverService.stopBatchProcessing(jobId);
 
                 const bookingPattern = `booking:${jobId}-*`;
                 const bookingKeys = await redis.keys(bookingPattern);
@@ -350,10 +360,9 @@ export class JobOrchestratorService {
                 };
 
             } else if (action === 'reject') {
-                const bookingPattern = `booking:${jobId}-*`;
-                const bookingKeys = await redis.keys(bookingPattern);
+                const job = await this.getJobFromBooking(jobId);
 
-                if (bookingKeys.length === 0) {
+                if (!job) {
                     logger.warn(`No booking found for Job: ${jobId}`);
                     return {
                         success: false,
@@ -362,25 +371,7 @@ export class JobOrchestratorService {
                     };
                 }
 
-                const bookingKey = bookingKeys[0];
-                const bookingDataJson = await redis.call('JSON.GET', bookingKey) as any;
-
-                if (!bookingDataJson) {
-                    logger.warn(`Job data not found - Job: ${jobId}`);
-                    return {
-                        success: false,
-                        message: 'Job data not found',
-                        jobId
-                    };
-                }
-
-                const bookingData = typeof bookingDataJson === 'string'
-                    ? JSON.parse(bookingDataJson)
-                    : bookingDataJson;
-
-                const customerId = bookingData.customer?._id || bookingKey.split('-')[1];
-
-                await this.offerManagementService.handleDriverRejection(jobId, customerId, driverId, reason);
+                await this.offerManagementService.handleDriverRejection(jobId, job.customerId, driverId, reason);
 
                 const matchedFlowActive = await redis.get(`job:${jobId}:matched_flow_active`);
                 if (matchedFlowActive === '1') {
@@ -393,17 +384,7 @@ export class JobOrchestratorService {
                     };
                 }
 
-                const job = await this.reconstructJobFromBooking(jobId, bookingData, bookingKey);
-
-                if (!job) {
-                    return {
-                        success: false,
-                        message: 'Failed to reconstruct job data',
-                        jobId
-                    };
-                }
-
-                const categorizedDrivers = await this.driverMatchingService.findBestDrivers(job, customerId);
+                const categorizedDrivers = await this.driverMatchingService.findBestDrivers(job, job.customerId);
 
                 if (!categorizedDrivers) {
                     logger.warn(`No drivers available - Job: ${jobId}`);
@@ -463,12 +444,12 @@ export class JobOrchestratorService {
     }
 
 
-
     private async handleNewJobEvent(data: any, bookingId: string | null): Promise<any> {
         const startTime = Date.now();
         const payload = data.payload;
         const jobId = payload._id;
 
+        // Extract coordinates
         const pickupData = payload.tripAddress?.[0];
         const dropData = payload.tripAddress?.[payload.tripAddress.length - 1];
         const pickup = pickupData?.location ? {
@@ -480,6 +461,7 @@ export class JobOrchestratorService {
             longitude: dropData.location.longitude
         } : null;
 
+        // Validate required fields
         if (!pickup) {
             logger.error(`Missing pickup coordinates for Job ${jobId}`);
             return {success: false, error: 'Pickup coordinates missing', jobId};
@@ -491,6 +473,7 @@ export class JobOrchestratorService {
             return {success: false, error: 'Invalid customer data', jobId};
         }
 
+        // Build initial job object
         const job: Job = {
             id: jobId,
             customerId: customer._id,
@@ -503,10 +486,9 @@ export class JobOrchestratorService {
         };
 
         try {
-            // Store booking data first
+
             await this.storeBookingData(jobId, customer._id, payload);
 
-            // Calculate trip ETA if drop location exists
             if (drop) {
                 const tripEta = await this.mapboxService.getDistanceAndDuration(
                     pickup.latitude,
@@ -522,61 +504,28 @@ export class JobOrchestratorService {
                     estimatedDistance: tripEta.distanceKm,
                 };
 
-                logger.info(`Trip ETA Calculated for Job ${job.id} — Distance: ${tripEta.distanceText}, Duration: ${tripEta.durationText}`);
+                logger.info(`Trip ETA: ${tripEta.durationText}, ${tripEta.distanceText} for Job ${job.id}`);
             } else {
-                logger.warn(`Drop location missing — Skipping trip ETA calculation for Job ${job.id}`);
-                job.rideDetails = {
-                    estimatedTime: 'N/A',
-                    estimatedDistance: 0,
-                };
+                job.rideDetails = {estimatedTime: 'N/A', estimatedDistance: 0};
             }
 
-            // Try to find drivers using normal matching
+
             const categorizedDrivers = await this.driverMatchingService.findBestDrivers(job, job.customerId);
             const searchTime = Date.now() - startTime;
 
-            if (!categorizedDrivers) {
-                logger.warn(`No Drivers Found - JobId: ${job.id} - Triggering Matched Driver Flow`);
 
-                // Set customer info with placeholder values for matched driver flow
-                job.customer = {
-                    fullName: customer.fullName || 'Unknown',
-                    avatar: customer.avatar || '',
-                    distance: 0,
-                    time: 'Calculating...',
-                };
-
-                // Trigger matched driver flow as fallback
-                this.matchedDriverService.triggerMatchedDriverFlow(job, job.id).catch((error: any) => {
-                    logger.error(`Failed to trigger matched driver flow for Job ${job.id}: ${error.message}`);
-                });
-
-                return {
-                    success: true,
-                    message: 'No drivers in initial search - Matched driver flow triggered',
-                    jobId: job.id,
-                    orderNo: payload.orderNo,
-                    driversFound: 0,
-                    driverIds: [],
-                    flowType: 'matched',
-                    searchTimeMs: searchTime,
-                    timestamp: new Date().toISOString(),
-                };
-            }
-
-            const matchedDrivers = [
+            const matchedDrivers = categorizedDrivers ? [
                 ...categorizedDrivers.favDriver,
                 ...categorizedDrivers.priorityDrivers,
                 ...categorizedDrivers.newDrivers,
                 ...categorizedDrivers.nonPriorityDrivers,
                 ...categorizedDrivers.remainingDrivers,
-            ];
+            ] : [];
 
-            // Check if we actually got any drivers
             if (matchedDrivers.length === 0) {
-                logger.warn(`Found 0 drivers for Job ${job.id} - Triggering Matched Driver Flow`);
+                logger.warn(`No drivers found for Job ${job.id} - Triggering matched flow`);
 
-                // Set customer info with placeholder values
+
                 job.customer = {
                     fullName: customer.fullName || 'Unknown',
                     avatar: customer.avatar || '',
@@ -584,93 +533,68 @@ export class JobOrchestratorService {
                     time: 'Calculating...',
                 };
 
-                // Trigger matched driver flow as fallback
+
                 this.matchedDriverService.triggerMatchedDriverFlow(job, job.id).catch((error: any) => {
-                    logger.error(`Failed to trigger matched driver flow for Job ${job.id}: ${error.message}`);
+                    logger.error(`Matched flow trigger failed: ${error.message}`);
                 });
 
                 return {
                     success: true,
-                    message: 'No drivers found - Matched driver flow triggered',
+                    message: 'No drivers - matched flow triggered',
                     jobId: job.id,
                     orderNo: payload.orderNo,
                     driversFound: 0,
-                    driverIds: [],
                     flowType: 'matched',
                     searchTimeMs: searchTime,
                     timestamp: new Date().toISOString(),
                 };
             }
 
-            logger.info(`Matched ${matchedDrivers.length} drivers for Job ${job.id}`);
+            logger.info(`Found ${matchedDrivers.length} drivers for Job ${job.id}`);
 
-            // Calculate ETA for first available driver
-            const driversWithEta = await Promise.all(
-                matchedDrivers.slice(0, 3).map(async (driverId) => { // Only check first 3 for performance
-                    try {
-                        const driverDataJson = await redis.call('JSON.GET', `driver:${driverId}`);
-                        if (!driverDataJson) {
-                            logger.warn(`Driver data not found in Redis - ${driverId}`);
-                            return null;
-                        }
 
-                        const driverData = typeof driverDataJson === 'string'
-                            ? JSON.parse(driverDataJson)
-                            : driverDataJson;
+            let offerETA = null;
+            try {
+                const firstDriverId = matchedDrivers[0];
+                const driverDataJson = await redis.call('JSON.GET', `driver:${firstDriverId}`);
 
-                        const lat = driverData?.location?.coordinates?.[1];
-                        const lng = driverData?.location?.coordinates?.[0];
+                if (driverDataJson) {
+                    const driverData = typeof driverDataJson === 'string' ? JSON.parse(driverDataJson) : driverDataJson;
+                    const [lng, lat] = driverData?.location?.coordinates || [];
 
-                        if (!lat || !lng) {
-                            logger.warn(`Invalid driver coordinates - ${driverId}`);
-                            return null;
-                        }
-
-                        const driverToPickupEta = await this.mapboxService.getDistanceAndDuration(
-                            lat,
-                            lng,
-                            pickup.latitude,
-                            pickup.longitude
-                        );
-
-                        return {
-                            driverId,
-                            distanceToPickup: driverToPickupEta.distanceKm,
-                            etaToPickup: driverToPickupEta.durationText,
-                        };
-                    } catch (error: any) {
-                        logger.error(`ETA calculation failed for driver ${driverId}: ${error.message}`);
-                        return null;
+                    if (lat && lng) {
+                        const eta = await this.mapboxService.getDistanceAndDuration(lat, lng, pickup.latitude, pickup.longitude);
+                        offerETA = {distanceToPickup: eta.distanceKm, etaToPickup: eta.durationText};
                     }
-                })
-            );
+                }
+            } catch (error: any) {
+                logger.warn(`ETA calculation failed, using defaults: ${error.message}`);
+            }
 
-            const offerETA = driversWithEta.find((eta) => eta !== null);
-
+            // Set customer info with ETA
             job.customer = {
                 fullName: customer.fullName || 'Unknown',
                 avatar: customer.avatar || '',
                 distance: offerETA?.distanceToPickup || 0,
-                time: offerETA?.etaToPickup || '',
+                time: offerETA?.etaToPickup || 'N/A',
             };
 
-            // Send offers to matched drivers
+            // Send offers to drivers (queue-based flow)
             await this.offerManagementService.sendOffers(job, matchedDrivers);
 
             this.metrics.driversMatched += matchedDrivers.length;
             this.metrics.offersSent += 1;
 
-            logger.info(`Job Matched - JobId: ${job.id}, Drivers: ${matchedDrivers.length}, Queue-based flow started, Search Time: ${searchTime}ms`);
+            logger.info(`Job ${job.id}: ${matchedDrivers.length} drivers, queue flow started (${searchTime}ms)`);
 
             return {
                 success: true,
-                message: 'Drivers found and queue-based offer flow started',
+                message: 'Drivers found - queue flow started',
                 jobId: job.id,
                 orderNo: payload.orderNo,
                 driversFound: matchedDrivers.length,
                 driverIds: matchedDrivers,
                 flowType: 'regular',
-                offersSent: 1,
                 searchTimeMs: searchTime,
                 timestamp: new Date().toISOString(),
             };
@@ -679,9 +603,8 @@ export class JobOrchestratorService {
             this.metrics.errors++;
             const searchTime = Date.now() - startTime;
 
-            logger.error(`Driver Search Failed - JobId: ${job.id}, Error: ${error.message}, Search Time: ${searchTime}ms`);
+            logger.error(`Driver search failed for Job ${job.id}: ${error.message} (${searchTime}ms)`);
 
-            // On error, still try matched driver flow as last resort
             try {
                 job.customer = {
                     fullName: customer.fullName || 'Unknown',
@@ -691,33 +614,31 @@ export class JobOrchestratorService {
                 };
 
                 this.matchedDriverService.triggerMatchedDriverFlow(job, job.id).catch((err: any) => {
-                    logger.error(`Failed to trigger matched driver flow after error for Job ${job.id}: ${err.message}`);
+                    logger.error(`Matched flow fallback failed: ${err.message}`);
                 });
 
                 return {
                     success: true,
-                    message: 'Driver search failed - Matched driver flow triggered as fallback',
+                    message: 'Driver search failed - matched flow triggered',
                     error: error.message,
                     jobId: job.id,
                     orderNo: payload.orderNo,
                     driversFound: 0,
-                    driverIds: [],
                     flowType: 'matched_fallback',
                     searchTimeMs: searchTime,
                     timestamp: new Date().toISOString(),
                 };
             } catch (fallbackError: any) {
-                logger.error(`All fallback mechanisms failed for Job ${job.id}: ${fallbackError.message}`);
+                logger.error(`All fallback failed for Job ${job.id}: ${fallbackError.message}`);
 
                 return {
                     success: false,
-                    message: 'Driver search failed and fallback failed',
+                    message: 'Driver search and fallback failed',
                     error: error.message,
                     fallbackError: fallbackError.message,
                     jobId: job.id,
                     orderNo: payload.orderNo,
                     driversFound: 0,
-                    driverIds: [],
                     searchTimeMs: searchTime,
                     timestamp: new Date().toISOString(),
                 };
@@ -725,16 +646,11 @@ export class JobOrchestratorService {
         }
     }
 
-
     private async storeBookingData(jobId: string, customerId: string, payload: any): Promise<void> {
         try {
-            const bookingKey = `booking:${jobId}-${customerId}`;
-
-
+            const bookingKey = `booking:${jobId}-${customerId}-*`;
             await redis.call('JSON.SET', bookingKey, '$', JSON.stringify(payload));
-
             await redis.expire(bookingKey, 7200);
-
             logger.info(`Stored booking data for Job ${jobId} at key: ${bookingKey}`);
         } catch (error: any) {
             logger.error(`Failed to store booking data for Job ${jobId}: ${error.message}`);

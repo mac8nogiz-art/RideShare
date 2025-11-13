@@ -1,4 +1,5 @@
-// index.ts
+// index.ts - Enhanced with proper event handling
+
 import { Elysia } from 'elysia';
 import { connectKafka, consumer } from './infrastructure/kafka';
 import { connectRedisSubscriber, redisSubscriber } from './redisConnection/subscriber';
@@ -11,7 +12,10 @@ const orchestrator = jobOrchestratorService;
 
 async function start() {
     logger.info("Starting Dispatch Service...");
+
+
     await orchestrator.start();
+
     await connectRedisSubscriber();
     setupRedisEventHandlers();
 
@@ -19,77 +23,91 @@ async function start() {
     await consumer.subscribe({ topic: "newJob.request" });
     await consumer.run({
         eachMessage: async ({ topic, partition, message }) => {
-            logger.info("========== onMessage TRIGGERED ==========");
+            logger.info("========== Kafka Message RECEIVED ==========");
             logger.info(`Topic: ${topic}, Partition: ${partition}`);
             try {
-                await orchestrator.handleRPCRequest(JSON.parse(message.value?.toString() || '{}'));
+                const data = JSON.parse(message.value?.toString() || '{}');
+                await orchestrator.handleRPCRequest(data);
             } catch (err: any) {
                 logger.error(`Kafka message handling failed: ${err.message}`);
             }
         },
     });
 
-    logger.info("✅ Kafka consumer started successfully");
+    logger.info("Kafka consumer started successfully");
+
 }
 
-
 function setupRedisEventHandlers() {
-    // Subscribe to all offer response patterns globally
-    // redisSubscriber.subscribePattern('offer.response.*', async (message, channel) => {
-    //     try {
-    //         logger.debug(`Offer response received on channel: ${channel}`, message);
-    //
-    //         const parts = channel.split('.');
-    //         if (parts.length !== 4) {
-    //             logger.warn(`Invalid channel format: ${channel}`);
-    //             return;
-    //         }
-    //
-    //         const [, , jobId, driverId] = parts;
-    //
-    //         if (message?.action === 'accept') {
-    //             logger.info(` Driver ${driverId} accepted Job ${jobId} via Redis`);
-    //
-    //             // Publish to Redis for the waiting handler
-    //             await redis.publish(channel, JSON.stringify(message));
-    //
-    //         } else if (message?.action === 'reject') {
-    //             logger.info(` Driver ${driverId} rejected Job ${jobId} via Redis`);
-    //
-    //             // Handle rejection through orchestrator
-    //             await orchestrator.handleRPCRequest({
-    //                 type: 'newBooking.response',
-    //                 driverId,
-    //                 jobId,
-    //                 action: 'reject',
-    //                 reason: message.reason || 'Not specified'
-    //             });
-    //         }
-    //     } catch (err: any) {
-    //         logger.error(`Error handling offer response: ${err.message}`);
-    //     }
-    // });
+    logger.info("️ Setting up Redis event handlers...");
 
     redisSubscriber.addExpiryHandler(async (expiredKey: string) => {
         try {
-            logger.debug(`Redis key expired: ${expiredKey}`);
+            logger.debug(` Redis key expired: ${expiredKey}`);
 
-            // Handle offer expiry pattern: offer:jobId:driverId
-            if (expiredKey.startsWith('offer:')) {
-                const parts = expiredKey.split(':');
-                if (parts.length === 3) {
-                    const [, jobId, driverId] = parts;
-                    logger.info(` Offer expired  - Job: ${jobId}, Driver: ${driverId}`);
-
-                }
+            if (expiredKey.includes(':batch_trigger:')) {
+                await handleBatchTriggerExpiry(expiredKey);
+                return;
             }
+
+            if (expiredKey.startsWith('offer:')) {
+                await handleOfferExpiry(expiredKey);
+                return;
+            }
+
+
+            logger.debug(`Unhandled expiry event for key: ${expiredKey}`);
+
         } catch (err: any) {
-            logger.error(`Error handling expired key: ${err.message}`);
+            logger.error(`Error handling expired key ${expiredKey}: ${err.message}`);
         }
     });
 
-    logger.info('Redis global event handlers configured');
+    logger.info(' Redis event handlers configured');
 }
+
+async function handleBatchTriggerExpiry(expiredKey: string): Promise<void> {
+    try {
+
+        const match = expiredKey.match(/job:([^:]+):batch_trigger:(\d+)/);
+
+        if (!match) {
+            logger.warn(`Invalid batch trigger key format: ${expiredKey}`);
+            return;
+        }
+
+        const [, jobId, batchNumberStr] = match;
+        const batchNumber = parseInt(batchNumberStr, 10);
+
+        logger.info(` Batch trigger expired - Job: ${jobId}, Batch: ${batchNumber}`);
+
+
+        await orchestrator.handleBatchTriggerExpiry(jobId, batchNumber);
+
+    } catch (error: any) {
+        logger.error(`Error handling batch trigger expiry: ${error.message}`);
+    }
+}
+
+async function handleOfferExpiry(expiredKey: string): Promise<void> {
+    try {
+
+        const parts = expiredKey.split(':');
+
+        if (parts.length !== 3) {
+            logger.warn(`Invalid offer key format: ${expiredKey}`);
+            return;
+        }
+
+        const [, jobId, driverId] = parts;
+        logger.info(` Offer expired - Job: ${jobId}, Driver: ${driverId}`);
+
+
+    } catch (error: any) {
+        logger.error(`Error handling offer expiry: ${error.message}`);
+    }
+}
+
 
 const app = new Elysia()
     .use(
@@ -112,40 +130,65 @@ const app = new Elysia()
             },
         })
     )
-    .get('/', () => 'Dispatch Service Running')
+    .get('/', () => ({
+        service: 'Dispatch Service',
+        status: 'running',
+        version: '2.0.0'
+    }))
     .get('/health', () => ({
         status: 'ok',
         redis: redisSubscriber.isConnected(),
+        orchestrator: orchestrator.isReady(),
         timestamp: new Date().toISOString()
     }))
+    .get('/metrics', async () => {
+        try {
+            // Get some basic metrics
+            const flowKeys = await redis.keys('job:*:matched_flow_active');
+            const offerKeys = await redis.keys('offer:*');
+
+            return {
+                activeFlows: flowKeys.length,
+                activeOffers: offerKeys.length,
+                timestamp: new Date().toISOString()
+            };
+        } catch (error: any) {
+            return {
+                error: error.message,
+                timestamp: new Date().toISOString()
+            };
+        }
+    })
     .listen(4005);
 
-logger.info(`HTTP server running at http://localhost:4005`);
+logger.info(` HTTP server running at http://localhost:4005`);
 
 
 process.on('unhandledRejection', (reason: any) => {
-    logger.error(`Unhandled Rejection: ${reason?.message || reason}`);
+    logger.error(` Unhandled Rejection: ${reason?.message || reason}`);
 });
 
 process.on('uncaughtException', (err: any) => {
-    logger.error(`Uncaught Exception: ${err.message}`, err.stack);
+    logger.error(` Uncaught Exception: ${err.message}`, err.stack);
 });
 
 process.on('SIGTERM', async () => {
-    logger.info('SIGTERM received, shutting down gracefully...');
+    logger.info(' SIGTERM received, shutting down gracefully...');
+    orchestrator.stop();
     await redisSubscriber.disconnect();
     await consumer.disconnect();
     process.exit(0);
 });
 
 process.on('SIGINT', async () => {
-    logger.info('SIGINT received, shutting down gracefully...');
+    logger.info(' SIGINT received, shutting down gracefully...');
+    orchestrator.stop();
     await redisSubscriber.disconnect();
     await consumer.disconnect();
     process.exit(0);
 });
 
 start().catch((err) => {
-    logger.error(`Fatal error during startup: ${err.message}`);
+    logger.error(` Fatal error during startup: ${err.message}`);
     process.exit(1);
 });

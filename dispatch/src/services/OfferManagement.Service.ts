@@ -51,19 +51,41 @@ export class OfferManagementService {
     }
 
     private async sendBatchOffers(job: Job, driverIds: string[]): Promise<void> {
-        const offerPromises = driverIds.map(driverId =>
-            this.sendSingleOffer(job, driverId)
-        );
+        try {
+            if (!driverIds || driverIds.length === 0) {
+                logger.warn(`No drivers available for batch offers — Job ${job.id}`);
+                return;
+            }
 
-        const results = await Promise.allSettled(offerPromises);
+            logger.info(`Fetching matched driver buckets for Job ${job.id}`);
 
-        const successful = results.filter(r => r.status === 'fulfilled').length;
-        const failed = results.filter(r => r.status === 'rejected').length;
+            const distanceBucketsData = await redis.get(`job:${job.id}:matched_buckets`);
+            let distanceBuckets: DistanceBucket[] = [];
 
-        logger.info(` Batch offers sent for Job ${job.id}: ${successful} successful, ${failed} failed`);
+            if (distanceBucketsData) {
+                distanceBuckets = JSON.parse(distanceBucketsData);
+                logger.info(`Using matched buckets for Job ${job.id} — ${distanceBuckets.length} buckets`);
+            } else {
+                logger.warn(`No precomputed matched buckets found for Job ${job.id}, using all drivers in one bucket`);
+                distanceBuckets = [
+                    {
+                        rangeStart: 0,
+                        rangeEnd: 9999,
+                        drivers: driverIds
+                    }
+                ];
+            }
 
-        this.monitorBatchOffers(job, driverIds);
+
+            await this.sendMatchedDriverOffers(job, distanceBuckets);
+
+        } catch (error: any) {
+            logger.error(`Failed to send batch offers for Job ${job.id}: ${error.message}`);
+        }
     }
+
+
+
 
     private monitorBatchOffers(job: Job, driverIds: string[]) {
         const checkInterval = 1000;
@@ -201,12 +223,11 @@ export class OfferManagementService {
                         resolved = true;
                         clearInterval(checker);
                         await redis.del(responseKey);
-                        logger.info(`✅ Driver ${driverId} accepted Job ${jobId}`);
+                        logger.info(`Driver ${driverId} accepted Job ${jobId}`);
 
                         await this.updateDriverQueueStatus(jobId, driverId, "accepted");
                         await this.assignDriverToJob(jobId, driverId, job.customerId);
 
-                        // Clear matched driver trigger flags
                         await redis.del(`job:${jobId}:trigger_matched_drivers`);
                         await redis.del(`job:${jobId}:last_driver_triggered`);
                         await redis.del(`job:${jobId}:queue_exhausted`);
@@ -219,7 +240,7 @@ export class OfferManagementService {
                 if (!exists) {
                     resolved = true;
                     clearInterval(checker);
-                    logger.info(`⏱️ Offer expired — Job ${jobId}, Driver ${driverId}`);
+                    logger.info(`Offer expired — Job ${jobId}, Driver ${driverId}`);
 
                     await this.handleOfferExpired(jobId, driverId);
 
@@ -242,7 +263,7 @@ export class OfferManagementService {
                 if (checkCount >= maxChecks) {
                     resolved = true;
                     clearInterval(checker);
-                    logger.warn(`⚠️ Timeout waiting for response — Job ${jobId}, Driver ${driverId}`);
+                    logger.warn(`Timeout waiting for response — Job ${jobId}, Driver ${driverId}`);
 
                     await this.handleOfferExpired(jobId, driverId);
 
@@ -268,9 +289,7 @@ export class OfferManagementService {
         }, checkInterval);
     }
 
-    /**
-     * Send offers to matched drivers in distance-based buckets
-     */
+
     async sendMatchedDriverOffers(job: Job, distanceBuckets: DistanceBucket[]): Promise<void> {
         if (!distanceBuckets.length) {
             logger.warn(`No matched driver buckets available for Job ${job.id}`);
@@ -279,9 +298,9 @@ export class OfferManagementService {
 
         logger.info(`Starting matched driver offers for Job ${job.id} - ${distanceBuckets.length} buckets`);
 
-        // Store matched driver buckets in Redis
+
         await redis.set(
-            `job:${job.id}:matched_buckets`,
+            `job:${job.id}:matched_driver_queue`,
             JSON.stringify(distanceBuckets),
             'EX',
             3600
@@ -289,11 +308,42 @@ export class OfferManagementService {
         await redis.set(`job:${job.id}:current_bucket_index`, '0', 'EX', 3600);
         await redis.set(`job:${job.id}:matched_flow_active`, '1', 'EX', 3600);
 
-        // Start sending offers from the first bucket
+
+        try {
+            const matchedQueuePayload = {
+                jobId: job.id,
+                totalBuckets: distanceBuckets.length,
+                totalDrivers: distanceBuckets.reduce((sum, b) => sum + b.drivers.length, 0),
+                buckets: distanceBuckets.map((b, i) => ({
+                    index: i + 1,
+                    range: `${b.rangeStart}-${b.rangeEnd}m`,
+                    driverCount: b.drivers.length,
+                    drivers: b.drivers,
+                })),
+                timestamp: new Date().toISOString(),
+            };
+
+            await this.publishAssignmentEventWithRetry(
+                'matched_queue.created',
+                this.KAFKA_TOPIC_OFFERS,
+                job.id,
+                'system', // no driver context
+                matchedQueuePayload
+            );
+
+            logger.info(
+                `Published matched queue for Job ${job.id} — ${matchedQueuePayload.totalDrivers} drivers in ${matchedQueuePayload.totalBuckets} buckets`
+            );
+        } catch (err: any) {
+            logger.error(`Failed to publish matched queue for Job ${job.id}: ${err.message}`);
+        }
+
+
         this.sendNextMatchedBucket(job.id, job).catch(error => {
             logger.error(`Error in matched driver flow for Job ${job.id}: ${error.message}`);
         });
     }
+
 
     private async sendNextMatchedBucket(jobId: string, job: Job): Promise<void> {
         const bucketsData = await redis.get(`job:${jobId}:matched_buckets`);
@@ -353,7 +403,7 @@ export class OfferManagementService {
                 bucketInfo: `${bucketIndex + 1}/${totalBuckets}`
             };
 
-            await redis.setex(`offer:${job.id}:${driverId}`, this.OFFER_EXPIRY_SECONDS, JSON.stringify(offerData));
+            await redis.setex(`offer:matched:${job.id}:${driverId}`, this.OFFER_EXPIRY_SECONDS, JSON.stringify(offerData));
             await this.saveJobNotification(job, driverObjectId, expiryTime);
 
             await this.publishAssignmentEventWithRetry(
@@ -413,14 +463,13 @@ export class OfferManagementService {
                     }
                 }
 
-                // Check if time expired - move to next bucket
+
                 if (elapsedTime >= maxWaitTime) {
                     resolved = true;
                     clearInterval(checker);
 
                     logger.info(`Matched bucket ${bucketIndex + 1}/${totalBuckets} expired for Job ${jobId} - Moving to next bucket`);
 
-                    // Clean up expired offers
                     for (const driverId of driverIds) {
                         await this.handleOfferExpired(jobId, driverId);
                     }
