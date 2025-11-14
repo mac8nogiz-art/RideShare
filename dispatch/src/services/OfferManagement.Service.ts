@@ -10,7 +10,7 @@ interface DistanceBucket {
 }
 
 export class OfferManagementService {
-    private readonly OFFER_EXPIRY_SECONDS = 15;
+    private readonly OFFER_EXPIRY_SECONDS = 17;
     private readonly KAFKA_TOPIC_OFFERS = 'driver-offers';
     private readonly KAFKA_TOPIC_ASSIGNMENTS = 'driver-assignments';
     private readonly MAX_KAFKA_RETRIES = 2;
@@ -59,7 +59,7 @@ export class OfferManagementService {
 
             logger.info(`Fetching matched driver buckets for Job ${job.id}`);
 
-            // ✅ Fetch buckets from Redis LIST
+            //  Fetch buckets from Redis LIST
             const bucketsKey = `job:${job.id}:matched_drivers_buckets`;
             const bucketStrings = await redis.lrange(bucketsKey, 0, -1);
 
@@ -71,7 +71,7 @@ export class OfferManagementService {
             // Parse each bucket from JSON
             const distanceBuckets: DistanceBucket[] = bucketStrings.map(str => JSON.parse(str));
 
-            logger.info(`✅ Fetched ${distanceBuckets.length} buckets from Redis LIST for Job ${job.id}`);
+            logger.info(`Fetched ${distanceBuckets.length} buckets from Redis LIST for Job ${job.id}`);
 
             // Send offers
             await this.sendMatchedDriverOffers(job, distanceBuckets);

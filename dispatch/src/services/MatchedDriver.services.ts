@@ -35,7 +35,7 @@ interface FlowData {
 }
 
 export class MatchedDriverService {
-    private readonly BATCH_TIME_INTERVAL = 45_000; // 45 seconds
+    private readonly BATCH_TIME_INTERVAL = 10000; // 10 seconds
     private readonly BUCKET_DISTANCE_STEP_METERS = 500;
     private readonly MAX_BATCH_SIZE = 5;
     private readonly MAX_DISTANCE_KM = 15;
