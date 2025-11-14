@@ -51,20 +51,18 @@ export class MatchedDriverService {
         try {
             logger.info(`Triggering MATCHED DRIVER FLOW for Job ${jobId}`);
 
-
             const alreadyActive = await redis.get(`job:${jobId}:matched_flow_active`);
-
             if (alreadyActive === '1') {
-                logger.info(` Matched flow already active for Job ${jobId} - skipping duplicate trigger`);
+                logger.info(`Matched flow already active for Job ${jobId} - skipping duplicate trigger`);
                 return;
             }
-
 
             if (!job.pickupLat || !job.pickupLng || !job.customerId) {
-                logger.error(` Invalid job data for ${jobId} - missing required fields`);
+                logger.error(`Invalid job data for ${jobId} - missing required fields`);
                 return;
             }
 
+            // Get distance buckets
             const distanceBuckets = await this.getMatchedDriversForJob(job, job.customerId);
 
             if (!distanceBuckets.length) {
@@ -74,11 +72,30 @@ export class MatchedDriverService {
 
             logger.info(`Found ${distanceBuckets.flatMap(b => b.drivers).length} drivers across ${distanceBuckets.length} buckets for Job ${jobId}`);
 
+            // ✅ Store buckets as Redis LIST (one bucket per list item)
+            const bucketsKey = `job:${jobId}:matched_drivers_buckets`;
 
+            // Delete old list if exists
+            await redis.del(bucketsKey);
+
+            // Push each bucket as a JSON string into the list
+            for (const bucket of distanceBuckets) {
+                await redis.rpush(bucketsKey, JSON.stringify(bucket));
+            }
+
+            // Set expiration on the list
+            await redis.expire(bucketsKey, 3600);
+
+            // Set matched flow flag
+            await redis.set(`job:${jobId}:matched_flow_active`, '1', 'EX', 3600);
+
+            logger.info(`✅ Stored ${distanceBuckets.length} buckets as Redis LIST for Job ${jobId}`);
+
+            // Start the batch flow
             await this.startEventBasedBatchFlow(job, distanceBuckets);
 
         } catch (error: any) {
-            logger.error(` Matched driver flow failed for Job ${jobId}: ${error.message}`);
+            logger.error(`Matched driver flow failed for Job ${jobId}: ${error.message}`);
             await this.cleanupMatchedFlow(jobId);
             throw error;
         }
@@ -87,8 +104,8 @@ export class MatchedDriverService {
     private async startEventBasedBatchFlow(job: Job, buckets: DistanceBucket[]): Promise<void> {
         if (!buckets.length) return;
 
-
-        await redis.setex(`job:${job.id}:matched_flow_active`, 360, '1');
+        //
+        // await redis.setex(`job:${job.id}:matched_flow_active`, 360, '1');
 
         const allDrivers = buckets.flatMap(bucket => bucket.drivers);
         logger.info(` Starting event-based batch flow for Job ${job.id}: ${allDrivers.length} drivers`);
