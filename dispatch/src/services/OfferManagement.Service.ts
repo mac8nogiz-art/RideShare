@@ -2,6 +2,14 @@ import { logger } from '../logger';
 import { Job } from '../types';
 import { producer, isKafkaConnected, reconnectKafka, checkProducerHealth } from '../infrastructure/kafka';
 import { redis } from '../infrastructure/redis';
+import {
+    scheduleMatchedBucketExpiry,
+    scheduleOfferExpiry,
+    cancelBucketExpiry,
+    cancelOfferExpiry,
+    cancelAllOffersForJob,
+    cancelAllBucketsForJob
+} from '../infrastructure/bullmq';
 
 interface DistanceBucket {
     rangeStart: number;
@@ -25,7 +33,6 @@ export class OfferManagementService {
             logger.info(` Offer Flow Started — Job ${job.id} (${flowType.toUpperCase()} FLOW)`);
 
             if (flowType === 'matched') {
-
                 const bucketsKey = `job:${job.id}:matched_drivers_buckets`;
                 const bucketStrings = await redis.lrange(bucketsKey, 0, -1);
 
@@ -57,15 +64,13 @@ export class OfferManagementService {
         }
     }
 
-
-
     async sendMatchedDriverOffers(job: Job, distanceBuckets: DistanceBucket[]): Promise<void> {
         if (!distanceBuckets.length) {
             logger.warn(`No matched driver buckets available for Job ${job.id}`);
             return;
         }
 
-        logger.info(`starting matched driver offers for Job ${job.id} - ${distanceBuckets.length} buckets`);
+        logger.info(`Starting matched driver offers for Job ${job.id} - ${distanceBuckets.length} buckets`);
 
         await redis.set(`job:${job.id}:current_bucket_index`, '0', 'EX', 3600);
 
@@ -101,12 +106,11 @@ export class OfferManagementService {
 
     async sendNextMatchedBucket(jobId: string, job: Job): Promise<void> {
         try {
-
             const bucketsKey = `job:${jobId}:matched_drivers_buckets`;
             const bucketStrings = await redis.lrange(bucketsKey, 0, -1);
 
             if (!bucketStrings || bucketStrings.length === 0) {
-                logger.warn(`⚠No matched buckets data found for Job ${jobId}`);
+                logger.warn(`⚠ No matched buckets data found for Job ${jobId}`);
                 return;
             }
 
@@ -115,9 +119,7 @@ export class OfferManagementService {
 
             if (currentIndex >= buckets.length) {
                 logger.warn(`All matched driver buckets exhausted for Job ${jobId}`);
-                await redis.del(`job:${jobId}:matched_flow_active`);
-                await redis.del(`job:${jobId}:matched_drivers_buckets`);
-                await redis.del(`job:${jobId}:current_bucket_index`);
+                await this.cleanupMatchedFlowData(jobId);
                 return;
             }
 
@@ -140,22 +142,79 @@ export class OfferManagementService {
 
             await redis.expire(bucketKey, this.OFFER_EXPIRY_SECONDS);
 
-            logger.info(` Bucket TTL set to ${this.OFFER_EXPIRY_SECONDS}s - will auto-trigger next bucket`);
+            // Schedule bucket expiry with BullMQ instead of setInterval
+            await scheduleMatchedBucketExpiry(jobId, currentIndex, this.OFFER_EXPIRY_SECONDS);
+
+            logger.info(` Bucket expiry scheduled via BullMQ for ${this.OFFER_EXPIRY_SECONDS}s`);
 
             const offerPromises = currentBucket.drivers.map(driverId =>
                 this.sendSingleMatchedOffer(job, driverId, currentIndex, buckets.length)
             );
+            console.log("offerprmosises", offerPromises)
 
             const results = await Promise.allSettled(offerPromises);
             const successful = results.filter(r => r.status === 'fulfilled').length;
 
             logger.info(` Sent ${successful}/${currentBucket.drivers.length} offers for Bucket ${currentIndex + 1}`);
 
-            // Monitor for acceptance
-            this.monitorMatchedBucket(jobId, job, currentBucket.drivers, currentIndex, buckets.length);
-
         } catch (error: any) {
             logger.error(` Error sending matched bucket: ${error.message}`);
+        }
+    }
+
+    /**
+     * Called by BullMQ worker when bucket expires
+     */
+    async handleMatchedBucketExpiry(jobId: string, bucketIndex: number): Promise<void> {
+        try {
+            logger.info(`🕐 Bucket ${bucketIndex + 1} expired for Job ${jobId}`);
+
+            // Check if job was already accepted
+            const jobData = await redis.hgetall(`job:${jobId}`);
+            if (jobData.status === 'accepted' || jobData.assignedDriver) {
+                logger.info(`Job ${jobId} already accepted, skipping bucket expiry`);
+                return;
+            }
+
+            // Get bucket data
+            const bucketKey = `job:${jobId}:matched_bucket`;
+            const bucketData = await redis.hgetall(bucketKey);
+
+            if (!bucketData || Object.keys(bucketData).length === 0) {
+                logger.warn(`No bucket data found for Job ${jobId}, Bucket ${bucketIndex}`);
+                return;
+            }
+
+            const drivers = JSON.parse(bucketData.drivers || '[]');
+
+            // Handle expired offers for all drivers in bucket
+            for (const driverId of drivers) {
+                await this.handleOfferExpired(jobId, driverId);
+            }
+
+            // Move to next bucket
+            const bucketsKey = `job:${jobId}:matched_drivers_buckets`;
+            const bucketStrings = await redis.lrange(bucketsKey, 0, -1);
+            const buckets: DistanceBucket[] = bucketStrings.map(str => JSON.parse(str));
+
+            const nextIndex = bucketIndex + 1;
+
+            if (nextIndex < buckets.length) {
+                logger.info(`Moving to next bucket ${nextIndex + 1}/${buckets.length} for Job ${jobId}`);
+                await redis.set(`job:${jobId}:current_bucket_index`, nextIndex.toString());
+
+                // Get job data to send next bucket
+                const job = await this.getJobData(jobId);
+                if (job) {
+                    await this.sendNextMatchedBucket(jobId, job);
+                }
+            } else {
+                logger.warn(`All matched driver buckets exhausted for Job ${jobId}`);
+                await this.cleanupMatchedFlowData(jobId);
+            }
+
+        } catch (error: any) {
+            logger.error(`Error handling matched bucket expiry: ${error.message}`);
         }
     }
 
@@ -205,88 +264,6 @@ export class OfferManagementService {
         }
     }
 
-    private monitorMatchedBucket(jobId: string, job: Job, driverIds: string[], bucketIndex: number, totalBuckets: number) {
-        const checkInterval = 1000;
-        const maxWaitTime = this.OFFER_EXPIRY_SECONDS * 1000;
-        let elapsedTime = 0;
-        let resolved = false;
-
-        logger.info(` Monitoring ${driverIds.length} offers for Bucket ${bucketIndex + 1}`);
-
-        const checker = setInterval(async () => {
-            if (resolved) {
-                clearInterval(checker);
-                return;
-            }
-
-            elapsedTime += checkInterval;
-
-            try {
-
-                for (const driverId of driverIds) {
-                    const responseKey = `offer:response:${jobId}:${driverId}`;
-                    const responseData = await redis.get(responseKey);
-
-                    if (responseData) {
-                        const response = JSON.parse(responseData);
-                        if (response.action === 'accept') {
-                            resolved = true;
-                            clearInterval(checker);
-
-                            logger.info(`Driver ${driverId} ACCEPTED Job ${jobId} from Bucket ${bucketIndex + 1}`);
-
-                            await redis.del(responseKey);
-                            await this.assignDriverToJob(jobId, driverId, job.customerId);
-
-                            // Cancel other offers in bucket
-                            await this.cancelMatchedBucketOffers(jobId, driverIds, driverId);
-
-                            // Stop entire matched flow
-                            await redis.del(`job:${jobId}:matched_flow_active`);
-                            await redis.del(`job:${jobId}:matched_drivers_buckets`);
-                            await redis.del(`job:${jobId}:current_bucket_index`);
-                            await redis.del(`job:${jobId}:matched_bucket`);
-
-                            return;
-                        }
-                    }
-                }
-
-                if (elapsedTime >= maxWaitTime) {
-                    resolved = true;
-                    clearInterval(checker);
-
-                    logger.info(` Bucket ${bucketIndex + 1} monitor timeout - Redis TTL will trigger next bucket`);
-
-                    for (const driverId of driverIds) {
-                        await this.handleOfferExpired(jobId, driverId);
-                    }
-
-                    return;
-                }
-
-            } catch (err: any) {
-                logger.error(` Monitor error: ${err.message}`);
-            }
-        }, checkInterval);
-    }
-
-    private async cancelMatchedBucketOffers(jobId: string, driverIds: string[], acceptedDriverId: string): Promise<void> {
-        const pipeline = redis.pipeline();
-
-        for (const driverId of driverIds) {
-            if (driverId !== acceptedDriverId) {
-                pipeline.del(`offer:${jobId}:${driverId}`);
-                pipeline.del(`offer:response:${jobId}:${driverId}`);
-                this.deleteJobNotification(driverId).catch(() => {});
-            }
-        }
-
-        await pipeline.exec();
-        logger.info(` Cancelled ${driverIds.length - 1} other matched offers for Job ${jobId}`);
-    }
-
-
     private async sendOfferToDriver(jobId: string, job: Job): Promise<boolean> {
         const driverQueueKey = `job:${jobId}:driver_queue`;
         const queueLength = await redis.llen(driverQueueKey);
@@ -300,7 +277,6 @@ export class OfferManagementService {
         if (!nextDriverId) {
             logger.info(`No more drivers in queue for Job ${jobId}`);
 
-            // Check if we should trigger matched drivers
             const shouldTriggerMatched = await redis.get(`job:${jobId}:trigger_matched_drivers`);
             if (shouldTriggerMatched === '1') {
                 logger.info(` Triggering matched driver flow for Job ${jobId}`);
@@ -313,7 +289,10 @@ export class OfferManagementService {
         try {
             await this.updateDriverQueueStatus(jobId, nextDriverId, "sent");
             await this.sendSingleOffer(job, nextDriverId);
-            this.monitorOfferStatus(jobId, nextDriverId, job);
+
+            // Schedule offer expiry with BullMQ instead of setInterval
+            await scheduleOfferExpiry(jobId, nextDriverId, this.OFFER_EXPIRY_SECONDS);
+
             return true;
         } catch (error: any) {
             logger.error(` Failed to send offer to driver ${nextDriverId}: ${error.message}`);
@@ -323,6 +302,76 @@ export class OfferManagementService {
         }
     }
 
+    async handleRegularOfferExpiry(jobId: string, driverId: string): Promise<void> {
+        try {
+            logger.info(`⏰ Regular offer expiry triggered - Job: ${jobId}, Driver: ${driverId}`);
+
+            // ✅ FIRST: Check if job is already assigned
+            const jobData = await redis.hgetall(`job:${jobId}`);
+            if (jobData.status === 'accepted' || jobData.assignedDriver) {
+                logger.info(`Job ${jobId} already accepted by ${jobData.assignedDriver}, skipping expiry`);
+                return;
+            }
+
+            // ✅ SECOND: Check if this was the last driver (BEFORE checking offer existence)
+            const wasLastDriver = await redis.get(`job:${jobId}:last_driver_triggered`);
+            const shouldTriggerMatched = wasLastDriver === '1';
+
+            // ✅ THIRD: Check if offer still exists
+            const offerKey = `offer:${jobId}:${driverId}`;
+            const exists = await redis.exists(offerKey);
+
+            if (!exists) {
+                logger.info(`Offer already expired/processed - Job: ${jobId}, Driver: ${driverId}`);
+
+                // ✅ Still trigger matched flow if this was the last driver
+                if (shouldTriggerMatched) {
+                    logger.info(`🚨 Last driver expired - Triggering matched driver flow for Job ${jobId}`);
+                    await redis.set(`job:${jobId}:trigger_matched_drivers`, '1', 'EX', 300);
+                    await redis.set(`job:${jobId}:queue_exhausted`, '1', 'EX', 300);
+                }
+                return;
+            }
+
+            // ✅ Check if already accepted (for offers that still exist)
+            const responseKey = `offer:response:${jobId}:${driverId}`;
+            const responseData = await redis.get(responseKey);
+
+            if (responseData) {
+                const response = JSON.parse(responseData);
+                if (response.action === 'accept') {
+                    logger.info(`Offer already accepted, skipping expiry: Job ${jobId}, Driver ${driverId}`);
+                    return;
+                }
+            }
+
+            logger.info(`❌ Offer expired — Job ${jobId}, Driver ${driverId}`);
+
+            // Handle the expired offer
+            await this.handleOfferExpired(jobId, driverId);
+
+            // Remove from queue
+            const driverQueueKey = `job:${jobId}:driver_queue`;
+            await redis.lpop(driverQueueKey);
+
+            // ✅ Trigger matched flow if last driver
+            if (shouldTriggerMatched) {
+                logger.info(`🚨 Last driver expired - Triggering matched driver flow for Job ${jobId}`);
+                await redis.set(`job:${jobId}:trigger_matched_drivers`, '1', 'EX', 300);
+                await redis.set(`job:${jobId}:queue_exhausted`, '1', 'EX', 300);
+                return;
+            }
+
+            // Send to next driver in queue
+            const job = await this.getJobData(jobId);
+            if (job) {
+                await this.sendOfferToDriver(jobId, job);
+            }
+
+        } catch (error: any) {
+            logger.error(`Error handling regular offer expiry: ${error.message}`);
+        }
+    }
     private async sendSingleOffer(job: Job, driverId: string): Promise<void> {
         const expiryTime = this.OFFER_EXPIRY_SECONDS + Math.floor(Math.random() * 3);
         const driverObjectId = driverId.startsWith('driver:') ? driverId.split(':')[1] : driverId;
@@ -362,98 +411,14 @@ export class OfferManagementService {
         logger.info(` Offer sent to driver ${driverId} for Job ${job.id}`);
     }
 
-    private monitorOfferStatus(jobId: string, driverId: string, job: Job) {
-        const offerKey = `offer:${jobId}:${driverId}`;
-        const responseKey = `offer:response:${jobId}:${driverId}`;
-        let resolved = false;
-
-        const checkInterval = 500;
-        const maxChecks = (this.OFFER_EXPIRY_SECONDS * 1000) / checkInterval + 10;
-        let checkCount = 0;
-
-        const checker = setInterval(async () => {
-            if (resolved) {
-                clearInterval(checker);
-                return;
-            }
-
-            checkCount++;
-
-            try {
-                const responseData = await redis.get(responseKey);
-                if (responseData) {
-                    const response = JSON.parse(responseData);
-                    if (response.action === 'accept') {
-                        resolved = true;
-                        clearInterval(checker);
-                        await redis.del(responseKey);
-                        logger.info(` Driver ${driverId} accepted Job ${jobId}`);
-
-                        await this.updateDriverQueueStatus(jobId, driverId, "accepted");
-                        await this.assignDriverToJob(jobId, driverId, job.customerId);
-
-                        await redis.del(`job:${jobId}:trigger_matched_drivers`);
-                        await redis.del(`job:${jobId}:last_driver_triggered`);
-                        await redis.del(`job:${jobId}:queue_exhausted`);
-
-                        return;
-                    }
-                }
-
-                const exists = await redis.exists(offerKey);
-                if (!exists) {
-                    resolved = true;
-                    clearInterval(checker);
-                    logger.info(`Offer expired — Job ${jobId}, Driver ${driverId}`);
-
-                    await this.handleOfferExpired(jobId, driverId);
-
-                    const driverQueueKey = `job:${jobId}:driver_queue`;
-                    await redis.lpop(driverQueueKey);
-
-                    // Check if this was the last driver
-                    const wasLastDriver = await redis.get(`job:${jobId}:last_driver_triggered`);
-                    if (wasLastDriver === '1') {
-                        logger.info(`Last driver expired - Triggering matched driver flow for Job ${jobId}`);
-                        await redis.set(`job:${jobId}:trigger_matched_drivers`, '1', 'EX', 300);
-                        await redis.set(`job:${jobId}:queue_exhausted`, '1', 'EX', 300);
-                        return;
-                    }
-
-                    await this.sendOfferToDriver(jobId, job);
-                    return;
-                }
-
-                if (checkCount >= maxChecks) {
-                    resolved = true;
-                    clearInterval(checker);
-                    logger.warn(` Timeout waiting for response — Job ${jobId}, Driver ${driverId}`);
-
-                    await this.handleOfferExpired(jobId, driverId);
-
-                    const driverQueueKey = `job:${jobId}:driver_queue`;
-                    await redis.lpop(driverQueueKey);
-
-                    const wasLastDriver = await redis.get(`job:${jobId}:last_driver_triggered`);
-                    if (wasLastDriver === '1') {
-                        logger.info(` Last driver timeout - Triggering matched driver flow for Job ${jobId}`);
-                        await redis.set(`job:${jobId}:trigger_matched_drivers`, '1', 'EX', 300);
-                        await redis.set(`job:${jobId}:queue_exhausted`, '1', 'EX', 300);
-                        return;
-                    }
-
-                    await this.sendOfferToDriver(jobId, job);
-                    return;
-                }
-
-            } catch (err: any) {
-                logger.error(` Error monitoring offer status: ${err.message}`);
-            }
-        }, checkInterval);
-    }
-
     async assignDriverToJob(jobId: string, driverId: string, customerId?: string): Promise<void> {
         logger.info(` Assigning Driver - JobId: ${jobId}, Driver: ${driverId}`);
+
+        // Cancel all pending offers and buckets for this job
+        await Promise.all([
+            cancelAllOffersForJob(jobId),
+            cancelAllBucketsForJob(jobId)
+        ]);
 
         const pipeline = redis.pipeline();
         pipeline.hset(`job:${jobId}`, {
@@ -475,6 +440,9 @@ export class OfferManagementService {
             logger.error(` Cancel Other Offers Error - JobId: ${jobId}, Error: ${err}`)
         );
 
+        // Cleanup matched flow if active
+        await this.cleanupMatchedFlowData(jobId);
+
         logger.info(` Job Assigned - JobId: ${jobId}, Driver: ${driverId}`);
     }
 
@@ -490,6 +458,9 @@ export class OfferManagementService {
                 if (driverId !== acceptedDriverId) {
                     pipeline.del(`offer:${jobId}:${driverId}`);
                     pipeline.srem(`driver:${driverId}:offers`, jobId);
+
+                    // Cancel BullMQ scheduled expiry
+                    await cancelOfferExpiry(jobId, driverId);
 
                     this.updateDriverQueueStatus(jobId, driverId, 'cancelled').catch(err =>
                         logger.error(` Update Queue Status Error - Driver: ${driverId}, Error: ${err}`)
@@ -514,6 +485,9 @@ export class OfferManagementService {
 
     async handleDriverRejection(jobId: string, customerId: string, driverId: string, reason?: string): Promise<void> {
         logger.info(` Driver Rejected - JobId: ${jobId}, Driver: ${driverId}, Reason: ${reason}`);
+
+        // Cancel scheduled offer expiry
+        await cancelOfferExpiry(jobId, driverId);
 
         const pipeline = redis.pipeline();
         pipeline.del(`offer:${jobId}:${driverId}`);
@@ -542,7 +516,6 @@ export class OfferManagementService {
         }
     }
 
-
     private async handleOfferExpired(jobId: string, driverId: string): Promise<void> {
         const offerKey = `offer:${jobId}:${driverId}`;
         if (this.processedOffers.has(offerKey)) return;
@@ -563,6 +536,35 @@ export class OfferManagementService {
             logger.error(`Error handling expired offer — Job ${jobId}, Driver ${driverId}`, err);
         } finally {
             setTimeout(() => this.processedOffers.delete(offerKey), 5000);
+        }
+    }
+
+    private async cleanupMatchedFlowData(jobId: string): Promise<void> {
+        try {
+            await redis.del(`job:${jobId}:matched_flow_active`);
+            await redis.del(`job:${jobId}:matched_drivers_buckets`);
+            await redis.del(`job:${jobId}:current_bucket_index`);
+            await redis.del(`job:${jobId}:matched_bucket`);
+            await redis.del(`job:${jobId}:trigger_matched_drivers`);
+            await redis.del(`job:${jobId}:last_driver_triggered`);
+            await redis.del(`job:${jobId}:queue_exhausted`);
+
+            logger.debug(`Cleaned up matched flow data for Job ${jobId}`);
+        } catch (error: any) {
+            logger.error(`Error cleaning up matched flow: ${error.message}`);
+        }
+    }
+
+    private async getJobData(jobId: string): Promise<Job | null> {
+        try {
+            const jobData = await redis.hgetall(`job:${jobId}`);
+            if (!jobData || Object.keys(jobData).length === 0) {
+                return null;
+            }
+            return jobData as any as Job;
+        } catch (error: any) {
+            logger.error(`Error fetching job data: ${error.message}`);
+            return null;
         }
     }
 
@@ -615,7 +617,6 @@ export class OfferManagementService {
             logger.error(` Delete Job Notification Error`, err);
         }
     }
-
 
     private async publishAssignmentEventWithRetry(eventType: string, topic: string, jobId: string, driverId: string, payload?: any): Promise<void> {
         for (let attempt = 1; attempt <= this.MAX_KAFKA_RETRIES; attempt++) {

@@ -7,6 +7,8 @@ import { kafkaRPC } from './commonkafkaintegration/kafkarpc';
 import { redis } from './infrastructure/redis';
 import { logger } from './logger';
 import { jobOrchestratorService } from './services/JobOrchestrator.Service';
+import { initializeWorkers, closeAllWorkers, areWorkersRunning } from './infrastructure/bullmqworkers';
+import { OfferManagementService } from './services/OfferManagement.Service';
 
 const orchestrator = jobOrchestratorService;
 
@@ -17,6 +19,9 @@ async function start() {
 
     await connectRedisSubscriber();
     setupRedisEventHandlers();
+
+    const offerService = new OfferManagementService();
+    initializeWorkers(offerService);
 
     await connectKafka();
     await consumer.subscribe({ topic: "newJob.request" });
@@ -132,6 +137,7 @@ const app = new Elysia()
         status: 'ok',
         redis: redisSubscriber.isConnected(),
         orchestrator: orchestrator.isReady(),
+        workers: areWorkersRunning(),
         timestamp: new Date().toISOString()
     }))
     .get('/metrics', async () => {
@@ -164,7 +170,8 @@ process.on('uncaughtException', (err: any) => {
 });
 
 process.on('SIGTERM', async () => {
-    logger.info(' SIGTERM received, shutting down gracefully...');
+    logger.info('SIGTERM received, shutting down gracefully...');
+    await closeAllWorkers(); // Add this
     orchestrator.stop();
     await redisSubscriber.disconnect();
     await consumer.disconnect();
@@ -173,6 +180,7 @@ process.on('SIGTERM', async () => {
 
 process.on('SIGINT', async () => {
     logger.info('SIGINT received, shutting down gracefully...');
+    await closeAllWorkers(); // Add this
     orchestrator.stop();
     await redisSubscriber.disconnect();
     await consumer.disconnect();
