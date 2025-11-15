@@ -320,12 +320,52 @@ export class JobOrchestratorService {
             };
         }
     }
-    async handleBatchTriggerExpiry(jobId: string, batchNumber: number): Promise<void> {
+
+
+    async handleMatchedBucketExpiry(jobId: string): Promise<void> {
         try {
-            logger.info(`Handling batch trigger expiry - Job: ${jobId}, Batch: ${batchNumber}`);
-            await this.matchedDriverService.handleBatchTriggerExpiry(jobId, batchNumber);
+            logger.info(` Matched bucket expired for Job ${jobId}`);
+
+            const status = await redis.get(`job:${jobId}:status`);
+            if (status === 'assigned' || status === 'cancelled') {
+                logger.info(` Job ${jobId} already ${status} - ignoring bucket expiry`);
+                await this.matchedDriverService.cleanupMatchedFlow(jobId);
+                return;
+            }
+
+            const flowActive = await redis.get(`job:${jobId}:matched_flow_active`);
+            if (flowActive !== '1') {
+                logger.info(`Matched flow not active for Job ${jobId}`);
+                return;
+            }
+
+            const bucketKey = `job:${jobId}:matched_bucket`;
+            const bucketData = await redis.hgetall(bucketKey);
+
+            if (bucketData && bucketData.isLastBucket === 'true') {
+                logger.info(` Last bucket expired for Job ${jobId}`);
+                await this.matchedDriverService.cleanupMatchedFlow(jobId);
+                return;
+            }
+
+            const currentIndex = parseInt(await redis.get(`job:${jobId}:current_bucket_index`) || '0');
+            const nextIndex = currentIndex + 1;
+
+            await redis.set(`job:${jobId}:current_bucket_index`, nextIndex.toString(), 'EX', 3600);
+
+            logger.info(`Moving to Bucket ${nextIndex + 1} for Job ${jobId}`);
+
+            const job = await this.getJobFromBooking(jobId);
+            if (job) {
+                await this.offerManagementService.sendNextMatchedBucket(jobId, job);
+            } else {
+                logger.error(` Could not find job data for ${jobId}`);
+                await this.matchedDriverService.cleanupMatchedFlow(jobId);
+            }
+
         } catch (error: any) {
-            logger.error(`Failed to handle batch trigger expiry: ${error.message}`);
+            logger.error(`Bucket expiry error: ${error.message}`);
+            await this.matchedDriverService.cleanupMatchedFlow(jobId);
         }
     }
 

@@ -1,4 +1,4 @@
-// index.ts - Enhanced with proper event handling
+// index.ts - Enhanced with bucket expiry handling
 
 import { Elysia } from 'elysia';
 import { connectKafka, consumer } from './infrastructure/kafka';
@@ -12,7 +12,6 @@ const orchestrator = jobOrchestratorService;
 
 async function start() {
     logger.info("Starting Dispatch Service...");
-
 
     await orchestrator.start();
 
@@ -29,24 +28,23 @@ async function start() {
                 const data = JSON.parse(message.value?.toString() || '{}');
                 await orchestrator.handleRPCRequest(data);
             } catch (err: any) {
-                logger.error(`Kafka message handling failed: ${err.message}`);
+                logger.error(` Kafka message handling failed: ${err.message}`);
             }
         },
     });
 
-    logger.info("Kafka consumer started successfully");
-
+    logger.info(" Kafka consumer started successfully");
 }
 
 function setupRedisEventHandlers() {
-    logger.info("️ Setting up Redis event handlers...");
+    logger.info(" Setting up Redis event handlers...");
 
     redisSubscriber.addExpiryHandler(async (expiredKey: string) => {
         try {
-            logger.debug(` Redis key expired: ${expiredKey}`);
+            logger.debug(`Redis key expired: ${expiredKey}`);
 
-            if (expiredKey.includes(':batch_trigger:')) {
-                await handleBatchTriggerExpiry(expiredKey);
+            if (expiredKey.includes(':matched_bucket')) {
+                await handleMatchedBucketExpiry(expiredKey);
                 return;
             }
 
@@ -55,43 +53,40 @@ function setupRedisEventHandlers() {
                 return;
             }
 
-
-            logger.debug(`Unhandled expiry event for key: ${expiredKey}`);
+            logger.debug(` Unhandled expiry event for key: ${expiredKey}`);
 
         } catch (err: any) {
-            logger.error(`Error handling expired key ${expiredKey}: ${err.message}`);
+            logger.error(` Error handling expired key ${expiredKey}: ${err.message}`);
         }
     });
 
     logger.info(' Redis event handlers configured');
 }
 
-async function handleBatchTriggerExpiry(expiredKey: string): Promise<void> {
+async function handleMatchedBucketExpiry(expiredKey: string): Promise<void> {
     try {
 
-        const match = expiredKey.match(/job:([^:]+):batch_trigger:(\d+)/);
+        const match = expiredKey.match(/job:([^:]+):matched_bucket/);
 
         if (!match) {
-            logger.warn(`Invalid batch trigger key format: ${expiredKey}`);
+            logger.warn(`Invalid matched bucket key format: ${expiredKey}`);
             return;
         }
 
-        const [, jobId, batchNumberStr] = match;
-        const batchNumber = parseInt(batchNumberStr, 10);
+        const jobId = match[1];
 
-        logger.info(` Batch trigger expired - Job: ${jobId}, Batch: ${batchNumber}`);
+        logger.info(`Matched bucket expired for Job: ${jobId}`);
 
 
-        await orchestrator.handleBatchTriggerExpiry(jobId, batchNumber);
+        await orchestrator.handleMatchedBucketExpiry(jobId);
 
     } catch (error: any) {
-        logger.error(`Error handling batch trigger expiry: ${error.message}`);
+        logger.error(` Error handling matched bucket expiry: ${error.message}`);
     }
 }
 
 async function handleOfferExpiry(expiredKey: string): Promise<void> {
     try {
-
         const parts = expiredKey.split(':');
 
         if (parts.length !== 3) {
@@ -100,14 +95,12 @@ async function handleOfferExpiry(expiredKey: string): Promise<void> {
         }
 
         const [, jobId, driverId] = parts;
-        logger.info(` Offer expired - Job: ${jobId}, Driver: ${driverId}`);
-
+        logger.info(`Offer expired - Job: ${jobId}, Driver: ${driverId}`);
 
     } catch (error: any) {
         logger.error(`Error handling offer expiry: ${error.message}`);
     }
 }
-
 
 const app = new Elysia()
     .use(
@@ -122,7 +115,7 @@ const app = new Elysia()
             batchSize: 100,
             topicDiscoveryInterval: 30000,
             onMessage: async (message: any, topic: string) => {
-                logger.info(`Received event from topic: ${topic}`);
+                logger.info(`received event from topic: ${topic}`);
                 return {
                     status: 'processed',
                     timestamp: Date.now(),
@@ -143,7 +136,6 @@ const app = new Elysia()
     }))
     .get('/metrics', async () => {
         try {
-            // Get some basic metrics
             const flowKeys = await redis.keys('job:*:matched_flow_active');
             const offerKeys = await redis.keys('offer:*');
 
@@ -161,8 +153,7 @@ const app = new Elysia()
     })
     .listen(4005);
 
-logger.info(` HTTP server running at http://localhost:4005`);
-
+logger.info(`HTTP server running at http://localhost:4005`);
 
 process.on('unhandledRejection', (reason: any) => {
     logger.error(` Unhandled Rejection: ${reason?.message || reason}`);
@@ -181,7 +172,7 @@ process.on('SIGTERM', async () => {
 });
 
 process.on('SIGINT', async () => {
-    logger.info(' SIGINT received, shutting down gracefully...');
+    logger.info('SIGINT received, shutting down gracefully...');
     orchestrator.stop();
     await redisSubscriber.disconnect();
     await consumer.disconnect();
