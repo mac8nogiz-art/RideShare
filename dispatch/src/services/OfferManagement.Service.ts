@@ -187,7 +187,7 @@ export class OfferManagementService {
                 bucketInfo: `${bucketIndex + 1}/${totalBuckets}`
             };
 
-            await redis.setex(`offer:${job.id}:${driverId}`, this.OFFER_EXPIRY_SECONDS, JSON.stringify(offerData));
+            await redis.setex(`offer:matched:${job.id}:${driverId}`, this.OFFER_EXPIRY_SECONDS, JSON.stringify(offerData));
             await this.saveJobNotification(job, driverObjectId, expiryTime);
 
             await this.publishAssignmentEventWithRetry(
