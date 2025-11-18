@@ -683,7 +683,7 @@ export class JobOrchestratorService {
 
         try {
 
-            await this.storeBookingData(jobId, customer._id, payload);
+            // await this.storeBookingData(jobId, customer._id, payload);
 
             if (drop) {
                 const tripEta = await this.mapboxService.getDistanceAndDuration(
@@ -838,16 +838,16 @@ export class JobOrchestratorService {
         }
     }
 
-    private async storeBookingData(jobId: string, customerId: string, payload: any): Promise<void> {
-        try {
-            const bookingKey = `booking:${jobId}-${customerId}-*`;
-            await redis.call('JSON.SET', bookingKey, '$', JSON.stringify(payload));
-            await redis.expire(bookingKey, 7200);
-            logger.debug(`Stored booking data for Job ${jobId}`);
-        } catch (error: any) {
-            logger.error(`Failed to store booking data for Job ${jobId}: ${error.message}`);
-        }
-    }
+    // private async storeBookingData(jobId: string, customerId: string, payload: any): Promise<void> {
+    //     try {
+    //         const bookingKey = `booking:${jobId}-${customerId}-*`;
+    //         await redis.call('JSON.SET', bookingKey, '$', JSON.stringify(payload));
+    //         await redis.expire(bookingKey, 7200);
+    //         logger.debug(`Stored booking data for Job ${jobId}`);
+    //     } catch (error: any) {
+    //         logger.error(`Failed to store booking data for Job ${jobId}: ${error.message}`);
+    //     }
+    // }
 }
 
 export const jobOrchestratorService = new JobOrchestratorService();

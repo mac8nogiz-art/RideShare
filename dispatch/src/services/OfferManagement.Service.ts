@@ -314,7 +314,7 @@ export class OfferManagementService {
             };
 
             await redis.set(`offer:matched:${job.id}:${driverId}`, JSON.stringify(offerData));
-            await this.saveJobNotification(job, driverObjectId, expiryTime);
+            await this.savematchJobNotification(job, driverObjectId, expiryTime);
 
             await this.publishAssignmentEventWithRetry(
                 'matched_job.offer_sent',
@@ -627,6 +627,35 @@ export class OfferManagementService {
     private async saveJobNotification(job: Job, driverId: string, expiryTime: number): Promise<void> {
         try {
             const notificationKey = `jobnotification:${driverId}`;
+            const expiryTimestamp = new Date();
+            expiryTimestamp.setSeconds(expiryTimestamp.getSeconds() + expiryTime);
+
+            const notificationData = {
+                _id: job.id,
+                tripAddress: job.tripAddress || [],
+                rideDetails: job.rideDetails || { estimatedTime: "", estimatedDistance: 0 },
+                askDriver: { expTime: expiryTimestamp.toISOString() },
+                driverEarning: job.fare || 0,
+                customer: {
+                    fullName: (job as any).customer?.fullName || "",
+                    avatar: (job as any).customer?.avatar || "",
+                    distance: (job as any).customer?.distance || 0,
+                    time: (job as any).customer?.time || "0 mins"
+                }
+            };
+
+            await redis.call('JSON.SET', notificationKey, '$', JSON.stringify(notificationData));
+            await redis.expire(notificationKey, this.OFFER_EXPIRY_SECONDS + 5);
+
+            logger.debug(`Job notification saved for driver ${driverId}`);
+        } catch (error: any) {
+            logger.error(`Save Job Notification Error: ${error.message}`, error);
+        }
+    }
+
+    private async savematchJobNotification(job: Job, driverId: string, expiryTime: number): Promise<void> {
+        try {
+            const notificationKey = `jobmatchnotification:${driverId}`;
             const expiryTimestamp = new Date();
             expiryTimestamp.setSeconds(expiryTimestamp.getSeconds() + expiryTime);
 
