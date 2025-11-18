@@ -10,6 +10,7 @@ import { jobOrchestratorService } from './services/JobOrchestrator.Service';
 import { initializeWorkers, closeAllWorkers, areWorkersRunning } from './infrastructure/bullmqworkers';
 import { OfferManagementService } from './services/OfferManagement.Service';
 
+
 const orchestrator = jobOrchestratorService;
 
 async function start() {
@@ -20,7 +21,11 @@ async function start() {
     await connectRedisSubscriber();
     setupRedisEventHandlers();
 
-    const offerService = new OfferManagementService();
+    const offerService = orchestrator.getOfferManagementService();
+    
+    // The matched driver trigger callback is already registered in the orchestrator's registerBullMQCallbacks method
+    // No need to register it again here
+    
     initializeWorkers(offerService);
 
     await connectKafka();
@@ -58,8 +63,6 @@ function setupRedisEventHandlers() {
                 return;
             }
 
-            logger.debug(` Unhandled expiry event for key: ${expiredKey}`);
-
         } catch (err: any) {
             logger.error(` Error handling expired key ${expiredKey}: ${err.message}`);
         }
@@ -93,11 +96,6 @@ async function handleMatchedBucketExpiry(expiredKey: string): Promise<void> {
 async function handleOfferExpiry(expiredKey: string): Promise<void> {
     try {
         const parts = expiredKey.split(':');
-
-        if (parts.length !== 3) {
-            logger.warn(`Invalid offer key format: ${expiredKey}`);
-            return;
-        }
 
         const [, jobId, driverId] = parts;
         logger.info(`Offer expired - Job: ${jobId}, Driver: ${driverId}`);

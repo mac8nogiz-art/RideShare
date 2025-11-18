@@ -28,7 +28,7 @@ export class MatchedDriverService {
     constructor(
         private readonly busyDriverService: BusyDriverService,
         private readonly freeDriverService: FreeDriverService,
-        private readonly offerManagementService: OfferManagementService,
+        public  offerManagementService: OfferManagementService,
         private readonly spatialService: SpatialService = new SpatialService()
     ) {}
 
@@ -93,6 +93,7 @@ export class MatchedDriverService {
                 job.pickupLat,
                 job.pickupLng
             );
+            console.log("enrichedDrivers", enrichedDrivers)
 
             if (!enrichedDrivers.length) {
                 logger.warn(` No drivers with valid locations for Job ${job.id}`);
@@ -146,6 +147,7 @@ export class MatchedDriverService {
         return results
             .filter((d): d is DriverWithDistance => d !== null)
             .sort((a, b) => a.distance - b.distance);
+
     }
 
     private createDistanceBuckets(drivers: DriverWithDistance[]): DistanceBucket[] {

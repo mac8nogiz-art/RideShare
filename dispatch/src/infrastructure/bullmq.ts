@@ -1,19 +1,17 @@
-// infrastructure/bullmq.ts
-import { Queue, QueueEvents, ConnectionOptions } from 'bullmq';
+import { Queue, QueueEvents, Worker, ConnectionOptions, Job } from 'bullmq';
 import { logger } from '../logger';
+import { redis } from './redis';
 
-// ===========================
-// QUEUE NAMES
-// ===========================
+
 export const QUEUE_NAMES = {
     MATCHED_BUCKET_EXPIRY: 'matched-bucket-expiry',
     OFFER_EXPIRY: 'offer-expiry',
     NEXT_BUCKET_TRIGGER: 'next-bucket-trigger',
+    DRIVER_QUEUE_PROCESSOR: 'driver-queue-processor',
+    MATCHED_DRIVER_TRIGGER: 'matched-driver-trigger',
 } as const;
 
-// ===========================
-// JOB DATA INTERFACES
-// ===========================
+
 export interface MatchedBucketExpiryJob {
     jobId: string;
     bucketIndex: number;
@@ -32,6 +30,21 @@ export interface NextBucketTriggerJob {
     timestamp: string;
 }
 
+export interface DriverQueueJob {
+    jobId: string;
+    driverId: string;
+    queuePosition: number;
+    jobData: any;
+    timestamp: string;
+}
+
+export interface MatchedDriverTriggerJob {
+    jobId: string;
+    jobData: any;
+    reason: 'queue_exhausted' | 'no_drivers_found' | 'fallback';
+    timestamp: string;
+}
+
 // ===========================
 // CONNECTION OPTIONS
 // ===========================
@@ -40,7 +53,7 @@ const connection: ConnectionOptions = {
     port: parseInt(process.env.REDIS_PORT || '6379'),
     password: process.env.REDIS_PASSWORD,
     db: parseInt(process.env.REDIS_DB || '0'),
-    maxRetriesPerRequest: null, // Required for BullMQ
+    maxRetriesPerRequest: null,
     enableReadyCheck: false,
 };
 
@@ -61,11 +74,11 @@ export const matchedBucketExpiryQueue = new Queue<MatchedBucketExpiryJob>(
         defaultJobOptions: {
             removeOnComplete: {
                 count: 100,
-                age: 3600, // 1 hour
+                age: 3600,
             },
             removeOnFail: {
                 count: 500,
-                age: 7200, // 2 hours
+                age: 7200,
             },
             attempts: 3,
             backoff: {
@@ -84,11 +97,11 @@ export const offerExpiryQueue = new Queue<OfferExpiryJob>(
         defaultJobOptions: {
             removeOnComplete: {
                 count: 1000,
-                age: 1800, // 30 minutes
+                age: 1800,
             },
             removeOnFail: {
                 count: 500,
-                age: 3600, // 1 hour
+                age: 3600,
             },
             attempts: 2,
             backoff: {
@@ -122,9 +135,50 @@ export const nextBucketTriggerQueue = new Queue<NextBucketTriggerJob>(
     }
 );
 
-// ===========================
-// QUEUE EVENTS (MONITORING)
-// ===========================
+export const driverQueueProcessorQueue = new Queue<DriverQueueJob>(
+    QUEUE_NAMES.DRIVER_QUEUE_PROCESSOR,
+    {
+        ...queueOptions,
+        defaultJobOptions: {
+            removeOnComplete: {
+                count: 500,
+                age: 1800,
+            },
+            removeOnFail: {
+                count: 300,
+                age: 3600,
+            },
+            attempts: 2,
+            backoff: {
+                type: 'exponential',
+                delay: 1000,
+            },
+        },
+    }
+);
+
+export const matchedDriverTriggerQueue = new Queue<MatchedDriverTriggerJob>(
+    QUEUE_NAMES.MATCHED_DRIVER_TRIGGER,
+    {
+        ...queueOptions,
+        defaultJobOptions: {
+            removeOnComplete: {
+                count: 100,
+                age: 3600,
+            },
+            removeOnFail: {
+                count: 200,
+                age: 7200,
+            },
+            attempts: 3,
+            backoff: {
+                type: 'exponential',
+                delay: 2000,
+            },
+        },
+    }
+);
+
 export const matchedBucketExpiryEvents = new QueueEvents(
     QUEUE_NAMES.MATCHED_BUCKET_EXPIRY,
     queueOptions
@@ -140,13 +194,223 @@ export const nextBucketTriggerEvents = new QueueEvents(
     queueOptions
 );
 
-// ===========================
-// HELPER FUNCTIONS
-// ===========================
+export const driverQueueProcessorEvents = new QueueEvents(
+    QUEUE_NAMES.DRIVER_QUEUE_PROCESSOR,
+    queueOptions
+);
+
+export const matchedDriverTriggerEvents = new QueueEvents(
+    QUEUE_NAMES.MATCHED_DRIVER_TRIGGER,
+    queueOptions
+);
+
+
+// Matched Driver Trigger Worker
+export const matchedDriverTriggerWorker = new Worker<MatchedDriverTriggerJob>(
+    QUEUE_NAMES.MATCHED_DRIVER_TRIGGER,
+    async (job: Job<MatchedDriverTriggerJob>) => {
+        const { jobId, jobData, reason } = job.data;
+
+        try {
+            logger.info(`[BullMQ] Processing matched driver trigger - Job: ${jobId}, Reason: ${reason}`);
+
+            if (matchedDriverTriggerCallback) {
+                await matchedDriverTriggerCallback(jobId, jobData, reason);
+                logger.info(`[BullMQ] Matched driver trigger processed successfully - Job: ${jobId}`);
+                return { success: true, jobId, reason };
+            } else {
+                logger.warn(`[BullMQ] No matched driver trigger callback registered`);
+                return { success: false, error: 'No callback registered' };
+            }
+        } catch (error: any) {
+            logger.error(`[BullMQ] Matched driver trigger failed - Job: ${jobId}, Error: ${error.message}`);
+            throw error;
+        }
+    },
+    {
+        connection,
+        concurrency: 5,
+        removeOnComplete: { count: 50 },
+        removeOnFail: { count: 100 },
+    }
+);
+
+export const offerExpiryWorker = new Worker<OfferExpiryJob>(
+    QUEUE_NAMES.OFFER_EXPIRY,
+    async (job: Job<OfferExpiryJob>) => {
+        const { jobId, driverId } = job.data;
+
+        try {
+            logger.info(`[BullMQ] Processing offer expiry - Job: ${jobId}, Driver: ${driverId}`);
+
+            // Check if job is already accepted
+            const jobData = await redis.hgetall(`job:${jobId}`);
+            if (jobData.status === 'accepted' || jobData.assignedDriver) {
+                logger.info(`[BullMQ] Job ${jobId} already accepted, skipping expiry`);
+                return { success: true, skipped: true, reason: 'job_already_accepted' };
+            }
+
+            // Check if offer still exists
+            const offerKey = `offer:${jobId}:${driverId}`;
+            const exists = await redis.exists(offerKey);
+            if (!exists) {
+                logger.info(`[BullMQ] Offer already processed - Job: ${jobId}, Driver: ${driverId}`);
+                return { success: true, skipped: true, reason: 'offer_already_processed' };
+            }
+
+            // Check if driver already responded
+            const responseKey = `offer:response:${jobId}:${driverId}`;
+            const responseData = await redis.get(responseKey);
+            if (responseData) {
+                const response = JSON.parse(responseData);
+                if (response.action === 'accept') {
+                    logger.info(`[BullMQ] Offer already accepted - Job: ${jobId}, Driver: ${driverId}`);
+                    return { success: true, skipped: true, reason: 'already_accepted' };
+                }
+            }
+
+            // Check queue status BEFORE expiring
+            const driverQueueKey = `job:${jobId}:driver_queue`;
+            const queueLength = await redis.llen(driverQueueKey);
+
+            logger.info(`[BullMQ] Queue check - Job: ${jobId}, Queue length: ${queueLength}`);
+
+            // Mark offer as expired
+            await redis.del(offerKey);
+            await redis.srem(`driver:${driverId}:offers`, jobId);
+            await redis.srem(`job:${jobId}:pending_drivers`, driverId);
+            await redis.sadd(`job:${jobId}:expired_drivers`, driverId);
+
+            // Update driver queue status
+            const driverHashKey = `job:${jobId}:driver:${driverId}`;
+            const driverExists = await redis.exists(driverHashKey);
+            if (driverExists) {
+                await redis.hset(driverHashKey, {
+                    status: 'expired',
+                    expiredAt: new Date().toISOString(),
+                });
+            }
+
+            // Delete job notification
+            await redis.del(`jobnotification:${driverId}`);
+
+            logger.info(`[BullMQ] Offer expired - Job: ${jobId}, Driver: ${driverId}`);
+
+            // Remove expired driver from queue
+            await redis.lrem(driverQueueKey, 1, driverId);
+
+            // Check remaining queue after removal
+            const remainingDrivers = await redis.llen(driverQueueKey);
+            logger.info(`[BullMQ] ${remainingDrivers} drivers remaining after expiry`);
+
+            // Check if we need to trigger matched driver flow
+            if (remainingDrivers === 0) {
+                logger.warn(`[BullMQ] Queue exhausted - Triggering matched driver flow for Job ${jobId}`);
+                await triggerMatchedDriverFlow(jobId, jobData, 'queue_exhausted');
+                return {
+                    success: true,
+                    expired: true,
+                    queueLength: remainingDrivers,
+                    matchedFlowTriggered: true
+                };
+            }
+
+            // Process next driver in queue
+            const nextDriverId = await redis.lindex(driverQueueKey, 0);
+            if (nextDriverId) {
+                logger.info(`[BullMQ] Processing next driver: ${nextDriverId} for Job ${jobId}`);
+                await processDriverQueue(jobId, [nextDriverId], jobData as any);
+            }
+
+            return {
+                success: true,
+                expired: true,
+                queueLength: remainingDrivers,
+                nextDriver: nextDriverId || null
+            };
+
+        } catch (error: any) {
+            logger.error(`[BullMQ] Offer expiry processing failed - Job: ${jobId}, Driver: ${driverId}, Error: ${error.message}`);
+            throw error;
+        }
+    },
+    {
+        connection,
+        concurrency: 10,
+        removeOnComplete: { count: 100 },
+        removeOnFail: { count: 100 },
+    }
+);
+
+// Callback storage
+let offerExpiryCallback: ((jobId: string, driverId: string, remainingDrivers: number) => Promise<void>) | null = null;
+let matchedBucketExpiryCallback: ((jobId: string, bucketIndex: number) => Promise<void>) | null = null;
+let matchedDriverTriggerCallback: ((jobId: string, jobData: any, reason: string) => Promise<void>) | null = null;
 
 /**
- * Schedule a matched bucket to expire after specified seconds
+ * Register callback for offer expiry events
  */
+export function registerOfferExpiryCallback(
+    callback: (jobId: string, driverId: string, remainingDrivers: number) => Promise<void>
+): void {
+    offerExpiryCallback = callback;
+    logger.info('Offer expiry callback registered');
+}
+
+/**
+ * Register callback for matched bucket expiry events
+ */
+export function registerMatchedBucketExpiryCallback(
+    callback: (jobId: string, bucketIndex: number) => Promise<void>
+): void {
+    matchedBucketExpiryCallback = callback;
+    logger.info('Matched bucket expiry callback registered');
+}
+
+/**
+ * Register callback for matched driver trigger events
+ */
+export function registerMatchedDriverTriggerCallback(
+    callback: (jobId: string, jobData: any, reason: string) => Promise<void>
+): void {
+    matchedDriverTriggerCallback = callback;
+    logger.info('Matched driver trigger callback registered');
+}
+
+/**
+ * Trigger matched driver flow via BullMQ
+ */
+export async function triggerMatchedDriverFlow(
+    jobId: string,
+    jobData: any,
+    reason: 'queue_exhausted' | 'no_drivers_found' | 'fallback'
+): Promise<void> {
+    try {
+        const jobKey = `matched-driver-trigger-${jobId}`;
+
+        await matchedDriverTriggerQueue.add(
+            'trigger-matched-drivers',
+            {
+                jobId,
+                jobData,
+                reason,
+                timestamp: new Date().toISOString(),
+            },
+            {
+                jobId: jobKey,
+                removeOnComplete: true,
+                removeOnFail: false,
+                priority: reason === 'queue_exhausted' ? 1 : 2,
+            }
+        );
+
+        logger.info(`[BullMQ] Triggered matched driver flow: Job ${jobId}, Reason: ${reason}`);
+    } catch (error: any) {
+        logger.error(`[BullMQ] Failed to trigger matched driver flow: ${error.message}`);
+        throw error;
+    }
+}
+
 export async function scheduleMatchedBucketExpiry(
     jobId: string,
     bucketIndex: number,
@@ -170,16 +434,14 @@ export async function scheduleMatchedBucketExpiry(
             }
         );
 
-        logger.info(`Scheduled bucket expiry: Job ${jobId}, Bucket ${bucketIndex}, Delay ${delaySeconds}s`);
+        logger.info(`[BullMQ] Scheduled bucket expiry: Job ${jobId}, Bucket ${bucketIndex}, Delay ${delaySeconds}s`);
     } catch (error: any) {
-        logger.error(`Failed to schedule bucket expiry: ${error.message}`);
+        logger.error(`[BullMQ] Failed to schedule bucket expiry: ${error.message}`);
         throw error;
     }
 }
 
-/**
- * Schedule an offer to expire after specified seconds
- */
+
 export async function scheduleOfferExpiry(
     jobId: string,
     driverId: string,
@@ -203,9 +465,80 @@ export async function scheduleOfferExpiry(
             }
         );
 
-        logger.debug(`Scheduled offer expiry: Job ${jobId}, Driver ${driverId}, Delay ${delaySeconds}s`);
+        logger.debug(`[BullMQ] Scheduled offer expiry: Job ${jobId}, Driver ${driverId}, Delay ${delaySeconds}s`);
     } catch (error: any) {
-        logger.error(`Failed to schedule offer expiry: ${error.message}`);
+        logger.error(`[BullMQ] Failed to schedule offer expiry: ${error.message}`);
+        throw error;
+    }
+}
+
+/**
+ * Add driver to processing queue
+ */
+export async function enqueueDriverOffer(
+    jobId: string,
+    driverId: string,
+    queuePosition: number,
+    jobData: any
+): Promise<void> {
+    try {
+        const jobKey = `driver-queue-${jobId}-${driverId}`;
+
+        await driverQueueProcessorQueue.add(
+            'process-driver-offer',
+            {
+                jobId,
+                driverId,
+                queuePosition,
+                jobData,
+                timestamp: new Date().toISOString(),
+            },
+            {
+                jobId: jobKey,
+                removeOnComplete: true,
+                removeOnFail: false,
+                priority: queuePosition,
+            }
+        );
+
+        logger.debug(`[BullMQ] Enqueued driver offer: Job ${jobId}, Driver ${driverId}, Position ${queuePosition}`);
+    } catch (error: any) {
+        logger.error(`[BullMQ] Failed to enqueue driver offer: ${error.message}`);
+        throw error;
+    }
+}
+
+/**
+ * Process entire driver queue for a job
+ */
+export async function processDriverQueue(
+    jobId: string,
+    driverIds: string[],
+    jobData: any
+): Promise<void> {
+    try {
+        const jobs = driverIds.map((driverId, index) => ({
+            name: 'process-driver-offer',
+            data: {
+                jobId,
+                driverId,
+                queuePosition: index,
+                jobData,
+                timestamp: new Date().toISOString(),
+            },
+            opts: {
+                jobId: `driver-queue-${jobId}-${driverId}`,
+                priority: index,
+                removeOnComplete: true,
+                removeOnFail: false,
+            },
+        }));
+
+        await driverQueueProcessorQueue.addBulk(jobs);
+
+        logger.info(`[BullMQ] Processed driver queue: Job ${jobId}, ${driverIds.length} drivers`);
+    } catch (error: any) {
+        logger.error(`[BullMQ] Failed to process driver queue: ${error.message}`);
         throw error;
     }
 }
@@ -220,10 +553,10 @@ export async function cancelBucketExpiry(jobId: string, bucketIndex: number): Pr
 
         if (job) {
             await job.remove();
-            logger.info(`Cancelled bucket expiry: Job ${jobId}, Bucket ${bucketIndex}`);
+            logger.info(`[BullMQ] Cancelled bucket expiry: Job ${jobId}, Bucket ${bucketIndex}`);
         }
     } catch (error: any) {
-        logger.error(`Failed to cancel bucket expiry: ${error.message}`);
+        logger.error(`[BullMQ] Failed to cancel bucket expiry: ${error.message}`);
     }
 }
 
@@ -237,10 +570,27 @@ export async function cancelOfferExpiry(jobId: string, driverId: string): Promis
 
         if (job) {
             await job.remove();
-            logger.debug(`Cancelled offer expiry: Job ${jobId}, Driver ${driverId}`);
+            logger.debug(`[BullMQ] Cancelled offer expiry: Job ${jobId}, Driver ${driverId}`);
         }
     } catch (error: any) {
-        logger.error(`Failed to cancel offer expiry: ${error.message}`);
+        logger.error(`[BullMQ] Failed to cancel offer expiry: ${error.message}`);
+    }
+}
+
+/**
+ * Cancel specific driver from queue
+ */
+export async function cancelDriverFromQueue(jobId: string, driverId: string): Promise<void> {
+    try {
+        const jobKey = `driver-queue-${jobId}-${driverId}`;
+        const job = await driverQueueProcessorQueue.getJob(jobKey);
+
+        if (job) {
+            await job.remove();
+            logger.debug(`[BullMQ] Cancelled driver from queue: Job ${jobId}, Driver ${driverId}`);
+        }
+    } catch (error: any) {
+        logger.error(`[BullMQ] Failed to cancel driver from queue: ${error.message}`);
     }
 }
 
@@ -250,13 +600,13 @@ export async function cancelOfferExpiry(jobId: string, driverId: string): Promis
 export async function cancelAllOffersForJob(jobId: string): Promise<void> {
     try {
         const jobs = await offerExpiryQueue.getJobs(['delayed', 'waiting']);
-        const jobsToRemove = jobs.filter(job => job.data.jobId === jobId);
+        const jobsToRemove = jobs.filter(j => j.data.jobId === jobId);
 
-        await Promise.all(jobsToRemove.map(job => job.remove()));
+        await Promise.all(jobsToRemove.map(j => j.remove()));
 
-        logger.info(`Cancelled ${jobsToRemove.length} offer expiries for Job ${jobId}`);
+        logger.info(`[BullMQ] Cancelled ${jobsToRemove.length} offer expiries for Job ${jobId}`);
     } catch (error: any) {
-        logger.error(`Failed to cancel offers for job: ${error.message}`);
+        logger.error(`[BullMQ] Failed to cancel offers for job: ${error.message}`);
     }
 }
 
@@ -266,33 +616,46 @@ export async function cancelAllOffersForJob(jobId: string): Promise<void> {
 export async function cancelAllBucketsForJob(jobId: string): Promise<void> {
     try {
         const jobs = await matchedBucketExpiryQueue.getJobs(['delayed', 'waiting']);
-        const jobsToRemove = jobs.filter(job => job.data.jobId === jobId);
+        const jobsToRemove = jobs.filter(j => j.data.jobId === jobId);
 
-        await Promise.all(jobsToRemove.map(job => job.remove()));
+        await Promise.all(jobsToRemove.map(j => j.remove()));
 
-        logger.info(`Cancelled ${jobsToRemove.length} bucket expiries for Job ${jobId}`);
+        logger.info(`[BullMQ] Cancelled ${jobsToRemove.length} bucket expiries for Job ${jobId}`);
     } catch (error: any) {
-        logger.error(`Failed to cancel buckets for job: ${error.message}`);
+        logger.error(`[BullMQ] Failed to cancel buckets for job: ${error.message}`);
     }
 }
 
-/**
- * Health check for BullMQ
- */
+export async function cancelAllDriversForJob(jobId: string): Promise<void> {
+    try {
+        const jobs = await driverQueueProcessorQueue.getJobs(['waiting', 'delayed', 'active']);
+        const jobsToRemove = jobs.filter(j => j.data.jobId === jobId);
+
+        await Promise.all(jobsToRemove.map(j => j.remove()));
+
+        logger.info(`[BullMQ] Cancelled ${jobsToRemove.length} drivers from queue for Job ${jobId}`);
+    } catch (error: any) {
+        logger.error(`[BullMQ] Failed to cancel driver queue for job: ${error.message}`);
+    }
+}
+
+
 export async function checkBullMQHealth(): Promise<boolean> {
     try {
         const client1 = await matchedBucketExpiryQueue.client;
         const client2 = await offerExpiryQueue.client;
         const client3 = await nextBucketTriggerQueue.client;
+        const client4 = await driverQueueProcessorQueue.client;
 
         await Promise.all([
             client1.ping(),
             client2.ping(),
             client3.ping(),
+            client4.ping(),
         ]);
         return true;
     } catch (error: any) {
-        logger.error(`BullMQ health check failed: ${error.message}`);
+        logger.error(`[BullMQ] Health check failed: ${error.message}`);
         return false;
     }
 }
@@ -306,20 +669,23 @@ export async function getBullMQMetrics() {
             matchedBucketCounts,
             offerExpiryCounts,
             nextBucketCounts,
+            driverQueueCounts,
         ] = await Promise.all([
             matchedBucketExpiryQueue.getJobCounts(),
             offerExpiryQueue.getJobCounts(),
             nextBucketTriggerQueue.getJobCounts(),
+            driverQueueProcessorQueue.getJobCounts(),
         ]);
 
         return {
             matchedBucketExpiry: matchedBucketCounts,
             offerExpiry: offerExpiryCounts,
             nextBucketTrigger: nextBucketCounts,
+            driverQueueProcessor: driverQueueCounts,
             timestamp: new Date().toISOString(),
         };
     } catch (error: any) {
-        logger.error(`Failed to get BullMQ metrics: ${error.message}`);
+        logger.error(`[BullMQ] Failed to get metrics: ${error.message}`);
         return null;
     }
 }
@@ -333,10 +699,11 @@ export async function pauseAllQueues(): Promise<void> {
             matchedBucketExpiryQueue.pause(),
             offerExpiryQueue.pause(),
             nextBucketTriggerQueue.pause(),
+            driverQueueProcessorQueue.pause(),
         ]);
-        logger.info('All queues paused');
+        logger.info('[BullMQ] All queues paused');
     } catch (error: any) {
-        logger.error(`Failed to pause queues: ${error.message}`);
+        logger.error(`[BullMQ] Failed to pause queues: ${error.message}`);
     }
 }
 
@@ -349,10 +716,11 @@ export async function resumeAllQueues(): Promise<void> {
             matchedBucketExpiryQueue.resume(),
             offerExpiryQueue.resume(),
             nextBucketTriggerQueue.resume(),
+            driverQueueProcessorQueue.resume(),
         ]);
-        logger.info('All queues resumed');
+        logger.info('[BullMQ] All queues resumed');
     } catch (error: any) {
-        logger.error(`Failed to resume queues: ${error.message}`);
+        logger.error(`[BullMQ] Failed to resume queues: ${error.message}`);
     }
 }
 
@@ -361,20 +729,26 @@ export async function resumeAllQueues(): Promise<void> {
  */
 export async function closeBullMQConnections(): Promise<void> {
     try {
-        logger.info('Closing BullMQ connections...');
+        logger.info('[BullMQ] Closing connections...');
 
         await Promise.all([
+            offerExpiryWorker.close(),
+            matchedDriverTriggerWorker.close(),
             matchedBucketExpiryQueue.close(),
             offerExpiryQueue.close(),
             nextBucketTriggerQueue.close(),
+            driverQueueProcessorQueue.close(),
+            matchedDriverTriggerQueue.close(),
             matchedBucketExpiryEvents.close(),
             offerExpiryEvents.close(),
             nextBucketTriggerEvents.close(),
+            driverQueueProcessorEvents.close(),
+            matchedDriverTriggerEvents.close(),
         ]);
 
-        logger.info('BullMQ connections closed successfully');
+        logger.info('[BullMQ] Connections closed successfully');
     } catch (error: any) {
-        logger.error(`Error closing BullMQ connections: ${error.message}`);
+        logger.error(`[BullMQ] Error closing connections: ${error.message}`);
         throw error;
     }
 }
@@ -383,43 +757,52 @@ export async function closeBullMQConnections(): Promise<void> {
 // EVENT LISTENERS
 // ===========================
 
-// Matched Bucket Expiry Events
 matchedBucketExpiryEvents.on('completed', ({ jobId }) => {
-    logger.debug(`Matched bucket expiry job completed: ${jobId}`);
+    logger.debug(`[BullMQ] Matched bucket expiry completed: ${jobId}`);
 });
 
 matchedBucketExpiryEvents.on('failed', ({ jobId, failedReason }) => {
-    logger.error(`Matched bucket expiry job failed: ${jobId} - ${failedReason}`);
+    logger.error(`[BullMQ] Matched bucket expiry failed: ${jobId} - ${failedReason}`);
 });
 
-matchedBucketExpiryEvents.on('active', ({ jobId }) => {
-    logger.debug(`Matched bucket expiry job active: ${jobId}`);
-});
-
-// Offer Expiry Events
 offerExpiryEvents.on('completed', ({ jobId }) => {
-    logger.debug(`Offer expiry job completed: ${jobId}`);
+    logger.debug(`[BullMQ] Offer expiry completed: ${jobId}`);
 });
 
 offerExpiryEvents.on('failed', ({ jobId, failedReason }) => {
-    logger.error(`Offer expiry job failed: ${jobId} - ${failedReason}`);
+    logger.error(`[BullMQ] Offer expiry failed: ${jobId} - ${failedReason}`);
 });
 
-offerExpiryEvents.on('active', ({ jobId }) => {
-    logger.debug(`Offer expiry job active: ${jobId}`);
-});
-
-// Next Bucket Trigger Events
 nextBucketTriggerEvents.on('completed', ({ jobId }) => {
-    logger.debug(`Next bucket trigger job completed: ${jobId}`);
+    logger.debug(`[BullMQ] Next bucket trigger completed: ${jobId}`);
 });
 
 nextBucketTriggerEvents.on('failed', ({ jobId, failedReason }) => {
-    logger.error(`Next bucket trigger job failed: ${jobId} - ${failedReason}`);
+    logger.error(`[BullMQ] Next bucket trigger failed: ${jobId} - ${failedReason}`);
 });
 
-nextBucketTriggerEvents.on('active', ({ jobId }) => {
-    logger.debug(`Next bucket trigger job active: ${jobId}`);
+driverQueueProcessorEvents.on('completed', ({ jobId }) => {
+    logger.debug(`[BullMQ] Driver queue completed: ${jobId}`);
 });
 
-logger.info('✓ BullMQ infrastructure initialized successfully');
+driverQueueProcessorEvents.on('failed', ({ jobId, failedReason }) => {
+    logger.error(`[BullMQ] Driver queue failed: ${jobId} - ${failedReason}`);
+});
+
+driverQueueProcessorEvents.on('active', ({ jobId }) => {
+    logger.debug(`[BullMQ] Driver queue active: ${jobId}`);
+});
+
+matchedDriverTriggerEvents.on('completed', ({ jobId }) => {
+    logger.debug(`[BullMQ] Matched driver trigger completed: ${jobId}`);
+});
+
+matchedDriverTriggerEvents.on('failed', ({ jobId, failedReason }) => {
+    logger.error(`[BullMQ] Matched driver trigger failed: ${jobId} - ${failedReason}`);
+});
+
+matchedDriverTriggerEvents.on('active', ({ jobId }) => {
+    logger.debug(`[BullMQ] Matched driver trigger active: ${jobId}`);
+});
+
+logger.info('[BullMQ] Infrastructure initialized successfully');

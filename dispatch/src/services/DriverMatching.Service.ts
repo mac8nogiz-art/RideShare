@@ -89,8 +89,16 @@
                     'ASC'
                 )) as any;
 
+                if (!result || result.length === 0) {
+                    return [];
+                }
+
                 const driverIds = result.map((item: any) => `driver:${item[0]}`);
                 const distances = result.map((item: any) => parseFloat(item[1]));
+
+                if (driverIds.length === 0) {
+                    return [];
+                }
 
                 const jsonStrings: any = await redis.call('JSON.MGET', ...driverIds, "$");
 
@@ -130,7 +138,6 @@
                         };
                     })
                     .filter((item: any) => item !== null);
-                console.log("drivers----->", drivers);
 
                 return drivers;
             } catch (error: any) {
@@ -276,7 +283,7 @@
                 );
 
                 driversWithMapboxDistance.sort((a, b) => a.dist - b.dist);
-                console.log("driversWithMapboxDistance----->", driversWithMapboxDistance);
+
 
                 allDrivers = [
                     ...driversWithMapboxDistance,
@@ -288,7 +295,6 @@
                 ];
             }
 
-            console.log("allDrivers----->", allDrivers);
 
             const driverQueueKey = `job:${jobId}:driver_queue`;
             const pipeline = redis.pipeline();

@@ -12,6 +12,12 @@ import {MapboxService} from './MapboxService'
 import {
     newJobEventSchema, driverResponseSchema, validateSchema
 } from './validation';
+import {
+    registerOfferExpiryCallback,
+    registerMatchedBucketExpiryCallback,
+    registerMatchedDriverTriggerCallback,
+    triggerMatchedDriverFlow
+} from '../infrastructure/bullmq';
 
 export class JobOrchestratorService {
     private driverLocationService: DriverLocationService;
@@ -23,7 +29,6 @@ export class JobOrchestratorService {
     private freeDriverService: FreeDriverService;
     private mapboxService: MapboxService;
     private isInitialized: boolean = false;
-    private queueMonitorInterval: NodeJS.Timeout | null = null;
 
     private metrics: ProcessingMetrics = {
         rpcRequests: 0,
@@ -44,9 +49,12 @@ export class JobOrchestratorService {
     constructor() {
         this.driverLocationService = new DriverLocationService();
         this.zoneService = new ZoneService();
-        this.driverMatchingService = new DriverMatchingService(this.driverLocationService, this.zoneService);
-        this.offerManagementService = new OfferManagementService();
         this.mapboxService = new MapboxService();
+
+        this.driverMatchingService = new DriverMatchingService(
+            this.driverLocationService,
+            this.zoneService
+        );
 
         this.busyDriverService = new BusyDriverService(
             this.driverLocationService,
@@ -58,21 +66,36 @@ export class JobOrchestratorService {
             this.zoneService
         );
 
+        // CHANGE THIS PART:
+        // Initialize matched driver service WITHOUT offerManagementService
         this.matchedDriverService = new MatchedDriverService(
             this.busyDriverService,
             this.freeDriverService,
-            this.offerManagementService
+            null as any  // Will be set after OfferManagementService is created
         );
+
+        // Initialize offer management service WITH matchedDriverService
+        this.offerManagementService = new OfferManagementService(this.matchedDriverService);
+
+        // Set the circular dependency
+        this.matchedDriverService.offerManagementService = this.offerManagementService;
+
+        logger.info('All services initialized with proper dependencies');
+    }
+
+
+    getOfferManagementService(): OfferManagementService {
+        return this.offerManagementService;
     }
 
     async start(): Promise<void> {
         if (this.isInitialized) {
-            logger.info('Job Orchestrator already running — skipping re-initialization');
+            logger.info('Job Orchestrator already running - skipping re-initialization');
             return;
         }
 
         if ((this as any)._starting) {
-            logger.info('Job Orchestrator is currently starting — please wait');
+            logger.info('Job Orchestrator is currently starting - please wait');
             return;
         }
 
@@ -80,6 +103,9 @@ export class JobOrchestratorService {
 
         try {
             logger.info('Starting Job Orchestrator...');
+
+            // Register BullMQ callbacks
+            this.registerBullMQCallbacks();
 
             if (!this.zoneService.isReady || !(await this.zoneService.isReady())) {
                 logger.info('Initializing ZoneService...');
@@ -114,8 +140,7 @@ export class JobOrchestratorService {
                 (this as any)._cacheIntervalSet = true;
             }
 
-            // Start monitoring for queue exhaustion
-            this.startQueueExhaustionMonitor();
+            // Queue exhaustion is now handled via BullMQ callbacks
 
             this.isInitialized = true;
             logger.info('Job Orchestrator started successfully');
@@ -128,46 +153,193 @@ export class JobOrchestratorService {
         }
     }
 
-    private startQueueExhaustionMonitor(): void {
-        if (this.queueMonitorInterval) {
-            logger.info('Queue exhaustion monitor already running');
-            return;
-        }
+    /**
+     * Register BullMQ callbacks for offer and bucket expiry tracking
+     */
+    private registerBullMQCallbacks(): void {
+        logger.info('Registering BullMQ callbacks...');
 
-        this.queueMonitorInterval = setInterval(async () => {
+        // Register offer expiry callback
+        registerOfferExpiryCallback(async (jobId: string, driverId: string, remainingDrivers: number) => {
             try {
-                const keys = await redis.keys('job:*:queue_exhausted');
+                logger.info(`Offer expired - Job: ${jobId}, Driver: ${driverId}, Remaining: ${remainingDrivers}`);
 
-                for (const key of keys) {
-                    const jobId = key.split(':')[1];
-                    const flag = await redis.get(key);
+                // Track offer expiry metrics
+                await this.trackOfferExpiry(jobId, driverId, remainingDrivers);
 
-                    if (flag === '1') {
-                        logger.info(`Queue Exhaustion Detected for Job ${jobId}`);
-                        await redis.del(key);
-
-                        const matchedFlowActive = await redis.get(`job:${jobId}:matched_flow_active`);
-                        if (matchedFlowActive === '1') {
-                            logger.debug(`Matched flow already active for Job ${jobId} - Skipping`);
-                            continue;
-                        }
-
-                        const job = await this.getJobFromBooking(jobId);
-
-                        if (job) {
-                            this.matchedDriverService.triggerMatchedDriverFlow(job, jobId).catch((error: any) => {
-                                logger.error(`Matched driver flow failed for Job ${jobId}: ${error.message}`);
-                            });
-                        }
-                    }
+                // If queue is exhausted, trigger matched driver flow via BullMQ
+                if (remainingDrivers === 0) {
+                    await this.handleQueueExhaustion(jobId);
+                } else {
+                    // Send offer to next driver in queue
+                    await this.sendNextQueuedOffer(jobId);
                 }
             } catch (error: any) {
-                logger.error(`Queue exhaustion monitor error: ${error.message}`);
+                logger.error(`Error handling offer expiry: ${error.message}`);
             }
-        }, 5000);
+        });
 
-        logger.info('Queue exhaustion monitor started');
+        // Register matched bucket expiry callback
+        registerMatchedBucketExpiryCallback(async (jobId: string, bucketIndex: number) => {
+            try {
+                logger.info(`Matched bucket expired - Job: ${jobId}, Bucket: ${bucketIndex}`);
+
+                // Track bucket expiry
+                await this.trackBucketExpiry(jobId, bucketIndex);
+
+                // Handle bucket expiry via MatchedDriverService
+                await this.handleMatchedBucketExpiry(jobId);
+            } catch (error: any) {
+                logger.error(`Error handling bucket expiry: ${error.message}`);
+            }
+        });
+
+        // Register matched driver trigger callback
+        registerMatchedDriverTriggerCallback(async (jobId: string, jobData: any, reason: string) => {
+            try {
+                logger.info(`Matched driver trigger - Job: ${jobId}, Reason: ${reason}`);
+
+                // Check if matched flow is already active
+                const matchedFlowActive = await redis.get(`job:${jobId}:matched_flow_active`);
+                if (matchedFlowActive === '1') {
+                    logger.debug(`Matched flow already active for Job ${jobId} - Skipping`);
+                    return;
+                }
+
+                // Get job data from booking if not provided
+                let job = jobData;
+                if (!job) {
+                    job = await this.getJobFromBooking(jobId);
+                }
+
+                if (job) {
+                    await this.matchedDriverService.triggerMatchedDriverFlow(job, jobId);
+                    logger.info(`Successfully triggered matched driver flow for Job ${jobId}`);
+                } else {
+                    logger.error(`Could not find job data for ${jobId}`);
+                }
+            } catch (error: any) {
+                logger.error(`Error handling matched driver trigger: ${error.message}`);
+            }
+        });
+
+        logger.info('BullMQ callbacks registered successfully');
     }
+
+    /**
+     * Track offer expiry metrics and update Redis
+     */
+    private async trackOfferExpiry(jobId: string, driverId: string, remainingDrivers: number): Promise<void> {
+        try {
+            const trackingKey = `job:${jobId}:offer_expiry_tracking`;
+            const timestamp = new Date().toISOString();
+
+            await redis.hset(trackingKey, {
+                lastExpiredDriver: driverId,
+                lastExpiryTime: timestamp,
+                remainingDrivers: remainingDrivers.toString(),
+                totalExpiries: (await redis.hincrby(trackingKey, 'totalExpiries', 1)).toString()
+            });
+
+            await redis.expire(trackingKey, 3600);
+
+            // Store expiry event in a list for analytics
+            const expiryEvent = JSON.stringify({
+                driverId,
+                timestamp,
+                remainingDrivers,
+                jobId
+            });
+
+            await redis.lpush(`job:${jobId}:expiry_events`, expiryEvent);
+            await redis.ltrim(`job:${jobId}:expiry_events`, 0, 99); // Keep last 100 events
+            await redis.expire(`job:${jobId}:expiry_events`, 3600);
+
+            logger.debug(`Tracked offer expiry - Job: ${jobId}, Driver: ${driverId}`);
+        } catch (error: any) {
+            logger.error(`Error tracking offer expiry: ${error.message}`);
+        }
+    }
+
+    /**
+     * Track matched bucket expiry
+     */
+    private async trackBucketExpiry(jobId: string, bucketIndex: number): Promise<void> {
+        try {
+            const trackingKey = `job:${jobId}:bucket_expiry_tracking`;
+            const timestamp = new Date().toISOString();
+
+            await redis.hset(trackingKey, {
+                lastExpiredBucket: bucketIndex.toString(),
+                lastBucketExpiryTime: timestamp,
+                totalBucketExpiries: (await redis.hincrby(trackingKey, 'totalBucketExpiries', 1)).toString()
+            });
+
+            await redis.expire(trackingKey, 3600);
+
+            logger.debug(`Tracked bucket expiry - Job: ${jobId}, Bucket: ${bucketIndex}`);
+        } catch (error: any) {
+            logger.error(`Error tracking bucket expiry: ${error.message}`);
+        }
+    }
+
+    /**
+     * Handle queue exhaustion by triggering matched driver flow
+     */
+    private async handleQueueExhaustion(jobId: string): Promise<void> {
+        try {
+            logger.info(`Handling queue exhaustion for Job ${jobId}`);
+
+            const matchedFlowActive = await redis.get(`job:${jobId}:matched_flow_active`);
+            if (matchedFlowActive === '1') {
+                logger.debug(`Matched flow already active for Job ${jobId} - Skipping`);
+                return;
+            }
+
+            const job = await this.getJobFromBooking(jobId);
+            if (!job) {
+                logger.error(`[Orchestrator] Could not find job data for ${jobId}`);
+                return;
+            }
+
+            // Trigger matched driver flow
+            await this.matchedDriverService.triggerMatchedDriverFlow(job, jobId);
+
+            logger.info(`Successfully triggered matched driver flow for Job ${jobId}`);
+        } catch (error: any) {
+            logger.error(`Error handling queue exhaustion: ${error.message}`);
+        }
+    }
+
+    /**
+     * Send offer to the next driver in the queue
+     */
+    private async sendNextQueuedOffer(jobId: string): Promise<void> {
+        try {
+            const driverQueueKey = `job:${jobId}:driver_queue`;
+            const nextDriverId = await redis.lindex(driverQueueKey, 0);
+
+            if (!nextDriverId) {
+                logger.warn(`No next driver available for Job ${jobId}`);
+                return;
+            }
+
+            const job = await this.getJobFromBooking(jobId);
+            if (!job) {
+                logger.error(`[Orchestrator] Could not find job data for ${jobId}`);
+                return;
+            }
+
+            logger.info(`Sending offer to next driver: ${nextDriverId} for Job ${jobId}`);
+
+            // OfferManagementService will handle the actual sending
+            await this.offerManagementService.sendOfferToNextDriver(jobId, job);
+
+        } catch (error: any) {
+            logger.error(`Error sending next queued offer: ${error.message}`);
+        }
+    }
+
 
 
     private buildJobFromPayload(payload: any, jobId?: string): Job | null {
@@ -210,10 +382,8 @@ export class JobOrchestratorService {
         }
     }
 
-
     private async getJobFromBooking(jobId: string): Promise<Job | null> {
         try {
-
             const patterns = [
                 `booking:${jobId}-*`,
                 `booking:${jobId}`,
@@ -241,7 +411,6 @@ export class JobOrchestratorService {
                 ? JSON.parse(bookingDataJson)
                 : bookingDataJson;
 
-            // REUSE the same builder function!
             return this.buildJobFromPayload(payload, jobId);
         } catch (error: any) {
             logger.error(`Failed to get job from booking for ${jobId}: ${error.message}`);
@@ -251,15 +420,7 @@ export class JobOrchestratorService {
 
     stop(): void {
         this.isInitialized = false;
-
-        if (this.queueMonitorInterval) {
-            clearInterval(this.queueMonitorInterval);
-            this.queueMonitorInterval = null;
-            logger.info('Queue exhaustion monitor stopped');
-        }
-
-        // this.matchedDriverService.cleanupMatchedFlow();
-        // logger.info('Job Orchestrator stopped');
+        logger.info('Job Orchestrator stopped');
     }
 
     isReady(): boolean {
@@ -321,14 +482,13 @@ export class JobOrchestratorService {
         }
     }
 
-
     async handleMatchedBucketExpiry(jobId: string): Promise<void> {
         try {
-            logger.info(` Matched bucket expired for Job ${jobId}`);
+            logger.info(`Matched bucket expired for Job ${jobId}`);
 
             const status = await redis.get(`job:${jobId}:status`);
             if (status === 'assigned' || status === 'cancelled') {
-                logger.info(` Job ${jobId} already ${status} - ignoring bucket expiry`);
+                logger.info(`Job ${jobId} already ${status} - ignoring bucket expiry`);
                 await this.matchedDriverService.cleanupMatchedFlow(jobId);
                 return;
             }
@@ -343,7 +503,7 @@ export class JobOrchestratorService {
             const bucketData = await redis.hgetall(bucketKey);
 
             if (bucketData && bucketData.isLastBucket === 'true') {
-                logger.info(` Last bucket expired for Job ${jobId}`);
+                logger.info(`Last bucket expired for Job ${jobId}`);
                 await this.matchedDriverService.cleanupMatchedFlow(jobId);
                 return;
             }
@@ -359,7 +519,7 @@ export class JobOrchestratorService {
             if (job) {
                 await this.offerManagementService.sendNextMatchedBucket(jobId, job);
             } else {
-                logger.error(` Could not find job data for ${jobId}`);
+                logger.error(`Could not find job data for ${jobId}`);
                 await this.matchedDriverService.cleanupMatchedFlow(jobId);
             }
 
@@ -371,12 +531,10 @@ export class JobOrchestratorService {
 
     async handleDriverResponse(data: any): Promise<any> {
         const {driverId, jobId, action, reason} = data;
-        logger.info(`Driver Response - Driver: ${driverId}, Job: ${jobId}, Action: ${action}, Reason: ${reason || 'N/A'}`);
+        logger.info(`Driver Response - Driver: ${driverId}, Job: ${jobId}, Action: ${action}`);
 
         try {
             if (action === 'accept') {
-                // this.matchedDriverService.stopBatchProcessing(jobId);
-
                 const bookingPattern = `booking:${jobId}-*`;
                 const bookingKeys = await redis.keys(bookingPattern);
 
@@ -509,7 +667,7 @@ export class JobOrchestratorService {
 
         const customer = payload.customer;
         if (!customer?._id) {
-            logger.error(`Invalid customer data — Job ${jobId}`);
+            logger.error(`Invalid customer data for Job ${jobId}`);
             return {success: false, error: 'Invalid customer data', jobId};
         }
 
@@ -563,8 +721,7 @@ export class JobOrchestratorService {
             ] : [];
 
             if (matchedDrivers.length === 0) {
-                logger.warn(`No drivers found for Job ${job.id} - Triggering matched flow`);
-
+                logger.warn(`No drivers found for Job ${job.id}`);
 
                 job.customer = {
                     fullName: customer.fullName || 'Unknown',
@@ -573,18 +730,16 @@ export class JobOrchestratorService {
                     time: 'Calculating...',
                 };
 
-
-                this.matchedDriverService.triggerMatchedDriverFlow(job, job.id).catch((error: any) => {
-                    logger.error(`Matched flow trigger failed: ${error.message}`);
-                });
+                // Set flag to trigger matched drivers when queue exhausts
+                await redis.set(`job:${job.id}:trigger_matched_on_exhaustion`, '1', 'EX', 3600);
+                await triggerMatchedDriverFlow(job.id, job, 'no_drivers_found');
 
                 return {
-                    success: true,
-                    message: 'No drivers - matched flow triggered',
+                    success: false,
+                    message: 'No drivers found',
                     jobId: job.id,
                     orderNo: payload.orderNo,
                     driversFound: 0,
-                    flowType: 'matched',
                     searchTimeMs: searchTime,
                     timestamp: new Date().toISOString(),
                 };
@@ -653,9 +808,8 @@ export class JobOrchestratorService {
                     time: 'Calculating...',
                 };
 
-                this.matchedDriverService.triggerMatchedDriverFlow(job, job.id).catch((err: any) => {
-                    logger.error(`Matched flow fallback failed: ${err.message}`);
-                });
+                // Trigger matched driver flow via BullMQ as fallback
+                await triggerMatchedDriverFlow(job.id, job, 'fallback');
 
                 return {
                     success: true,
@@ -691,7 +845,7 @@ export class JobOrchestratorService {
             const bookingKey = `booking:${jobId}-${customerId}-*`;
             await redis.call('JSON.SET', bookingKey, '$', JSON.stringify(payload));
             await redis.expire(bookingKey, 7200);
-            logger.info(`Stored booking data for Job ${jobId} at key: ${bookingKey}`);
+            logger.debug(`Stored booking data for Job ${jobId}`);
         } catch (error: any) {
             logger.error(`Failed to store booking data for Job ${jobId}: ${error.message}`);
         }
