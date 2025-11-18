@@ -66,19 +66,17 @@ export class JobOrchestratorService {
             this.zoneService
         );
 
-        // CHANGE THIS PART:
-        // Initialize matched driver service WITHOUT offerManagementService
+        // Initialize services without circular dependencies
+        this.offerManagementService = new OfferManagementService();
+        
         this.matchedDriverService = new MatchedDriverService(
             this.busyDriverService,
             this.freeDriverService,
-            null as any  // Will be set after OfferManagementService is created
+            this.offerManagementService
         );
-
-        // Initialize offer management service WITH matchedDriverService
-        this.offerManagementService = new OfferManagementService(this.matchedDriverService);
-
-        // Set the circular dependency
-        this.matchedDriverService.offerManagementService = this.offerManagementService;
+        
+        // Inject matchedDriverService into offerManagementService
+        this.offerManagementService.setMatchedDriverService(this.matchedDriverService);
 
         logger.info('All services initialized with proper dependencies');
     }

@@ -1,5 +1,3 @@
-// index.ts - Enhanced with bucket expiry handling
-
 import { Elysia } from 'elysia';
 import { connectKafka, consumer } from './infrastructure/kafka';
 import { connectRedisSubscriber, redisSubscriber } from './redisConnection/subscriber';
@@ -22,9 +20,7 @@ async function start() {
     setupRedisEventHandlers();
 
     const offerService = orchestrator.getOfferManagementService();
-    
-    // The matched driver trigger callback is already registered in the orchestrator's registerBullMQCallbacks method
-    // No need to register it again here
+
     
     initializeWorkers(offerService);
 

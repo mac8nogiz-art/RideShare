@@ -62,11 +62,6 @@ const queueOptions = {
     prefix: 'bullmq',
 };
 
-// ===========================
-// QUEUE INSTANCES
-// ===========================
-
-// Matched Bucket Expiry Queue
 export const matchedBucketExpiryQueue = new Queue<MatchedBucketExpiryJob>(
     QUEUE_NAMES.MATCHED_BUCKET_EXPIRY,
     {
@@ -472,45 +467,6 @@ export async function scheduleOfferExpiry(
     }
 }
 
-/**
- * Add driver to processing queue
- */
-export async function enqueueDriverOffer(
-    jobId: string,
-    driverId: string,
-    queuePosition: number,
-    jobData: any
-): Promise<void> {
-    try {
-        const jobKey = `driver-queue-${jobId}-${driverId}`;
-
-        await driverQueueProcessorQueue.add(
-            'process-driver-offer',
-            {
-                jobId,
-                driverId,
-                queuePosition,
-                jobData,
-                timestamp: new Date().toISOString(),
-            },
-            {
-                jobId: jobKey,
-                removeOnComplete: true,
-                removeOnFail: false,
-                priority: queuePosition,
-            }
-        );
-
-        logger.debug(`[BullMQ] Enqueued driver offer: Job ${jobId}, Driver ${driverId}, Position ${queuePosition}`);
-    } catch (error: any) {
-        logger.error(`[BullMQ] Failed to enqueue driver offer: ${error.message}`);
-        throw error;
-    }
-}
-
-/**
- * Process entire driver queue for a job
- */
 export async function processDriverQueue(
     jobId: string,
     driverIds: string[],
@@ -543,9 +499,6 @@ export async function processDriverQueue(
     }
 }
 
-/**
- * Cancel a scheduled bucket expiry
- */
 export async function cancelBucketExpiry(jobId: string, bucketIndex: number): Promise<void> {
     try {
         const jobKey = `bucket-expiry-${jobId}-${bucketIndex}`;
@@ -560,9 +513,7 @@ export async function cancelBucketExpiry(jobId: string, bucketIndex: number): Pr
     }
 }
 
-/**
- * Cancel a scheduled offer expiry
- */
+
 export async function cancelOfferExpiry(jobId: string, driverId: string): Promise<void> {
     try {
         const jobKey = `offer-expiry-${jobId}-${driverId}`;
@@ -577,26 +528,6 @@ export async function cancelOfferExpiry(jobId: string, driverId: string): Promis
     }
 }
 
-/**
- * Cancel specific driver from queue
- */
-export async function cancelDriverFromQueue(jobId: string, driverId: string): Promise<void> {
-    try {
-        const jobKey = `driver-queue-${jobId}-${driverId}`;
-        const job = await driverQueueProcessorQueue.getJob(jobKey);
-
-        if (job) {
-            await job.remove();
-            logger.debug(`[BullMQ] Cancelled driver from queue: Job ${jobId}, Driver ${driverId}`);
-        }
-    } catch (error: any) {
-        logger.error(`[BullMQ] Failed to cancel driver from queue: ${error.message}`);
-    }
-}
-
-/**
- * Cancel all offers for a job
- */
 export async function cancelAllOffersForJob(jobId: string): Promise<void> {
     try {
         const jobs = await offerExpiryQueue.getJobs(['delayed', 'waiting']);
@@ -610,9 +541,7 @@ export async function cancelAllOffersForJob(jobId: string): Promise<void> {
     }
 }
 
-/**
- * Cancel all buckets for a job
- */
+
 export async function cancelAllBucketsForJob(jobId: string): Promise<void> {
     try {
         const jobs = await matchedBucketExpiryQueue.getJobs(['delayed', 'waiting']);
@@ -640,59 +569,7 @@ export async function cancelAllDriversForJob(jobId: string): Promise<void> {
 }
 
 
-export async function checkBullMQHealth(): Promise<boolean> {
-    try {
-        const client1 = await matchedBucketExpiryQueue.client;
-        const client2 = await offerExpiryQueue.client;
-        const client3 = await nextBucketTriggerQueue.client;
-        const client4 = await driverQueueProcessorQueue.client;
 
-        await Promise.all([
-            client1.ping(),
-            client2.ping(),
-            client3.ping(),
-            client4.ping(),
-        ]);
-        return true;
-    } catch (error: any) {
-        logger.error(`[BullMQ] Health check failed: ${error.message}`);
-        return false;
-    }
-}
-
-/**
- * Get queue metrics
- */
-export async function getBullMQMetrics() {
-    try {
-        const [
-            matchedBucketCounts,
-            offerExpiryCounts,
-            nextBucketCounts,
-            driverQueueCounts,
-        ] = await Promise.all([
-            matchedBucketExpiryQueue.getJobCounts(),
-            offerExpiryQueue.getJobCounts(),
-            nextBucketTriggerQueue.getJobCounts(),
-            driverQueueProcessorQueue.getJobCounts(),
-        ]);
-
-        return {
-            matchedBucketExpiry: matchedBucketCounts,
-            offerExpiry: offerExpiryCounts,
-            nextBucketTrigger: nextBucketCounts,
-            driverQueueProcessor: driverQueueCounts,
-            timestamp: new Date().toISOString(),
-        };
-    } catch (error: any) {
-        logger.error(`[BullMQ] Failed to get metrics: ${error.message}`);
-        return null;
-    }
-}
-
-/**
- * Pause all queues
- */
 export async function pauseAllQueues(): Promise<void> {
     try {
         await Promise.all([
@@ -707,9 +584,6 @@ export async function pauseAllQueues(): Promise<void> {
     }
 }
 
-/**
- * Resume all queues
- */
 export async function resumeAllQueues(): Promise<void> {
     try {
         await Promise.all([
@@ -724,9 +598,6 @@ export async function resumeAllQueues(): Promise<void> {
     }
 }
 
-/**
- * Graceful shutdown
- */
 export async function closeBullMQConnections(): Promise<void> {
     try {
         logger.info('[BullMQ] Closing connections...');

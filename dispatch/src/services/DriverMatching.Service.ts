@@ -108,6 +108,11 @@
                         console.log(driverData, "------>driverdata")
                         if (!driverData) return null;
 
+                        if(driverData.iAmBusy === true ) {
+                            logger.info("we cant have this driver as this is busy in sequentail flow")
+                            return null;
+                        }
+
                         const driverApprovedZones = Array.isArray(driverData.approved_zones)
                             ? driverData.approved_zones.map(String): [];
 

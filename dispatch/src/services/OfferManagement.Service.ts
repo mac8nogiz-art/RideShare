@@ -20,7 +20,8 @@ interface DistanceBucket {
 }
 
 export class OfferManagementService {
-    private readonly OFFER_EXPIRY_SECONDS = 17;
+    private readonly MATCHED_BUCKET_EXPIRY = 10
+    private readonly OFFER_EXPIRY_SECONDS = 15;
     private readonly KAFKA_TOPIC_OFFERS = 'driver-offers';
     private readonly KAFKA_TOPIC_ASSIGNMENTS = 'driver-assignments';
     private readonly MAX_KAFKA_RETRIES = 2;
@@ -28,19 +29,24 @@ export class OfferManagementService {
 
     private matchedDriverService: any;
 
-    constructor(matchedDriverService?: any) {
+    // constructor() {
+    //     // matchedDriverService will be injected via setter
+    // }
+
+    setMatchedDriverService(matchedDriverService: any): void {
         this.matchedDriverService = matchedDriverService;
     }
 
     async sendOffers(job: Job, driverIds: string[]) {
         try {
-            const isMatchedFlow = await redis.get(`job:${job.id}:matched_flow_active`);
+            const sanitizedJobId = this.sanitizeJobId(job.id);
+            const isMatchedFlow = await redis.get(`job:${sanitizedJobId}:matched_flow_active`);
             const flowType = isMatchedFlow === '1' ? 'matched' : 'regular';
 
             logger.info(`Offer Flow Started — Job ${job.id} (${flowType.toUpperCase()} FLOW)`);
 
             if (flowType === 'matched') {
-                const bucketsKey = `job:${job.id}:matched_drivers_buckets`;
+                const bucketsKey = `job:${sanitizedJobId}:matched_drivers_buckets`;
                 const bucketStrings = await redis.lrange(bucketsKey, 0, -1);
 
                 if (!bucketStrings || bucketStrings.length === 0) {
@@ -53,7 +59,7 @@ export class OfferManagementService {
                 return;
             }
 
-            const driverQueueKey = `job:${job.id}:driver_queue`;
+            const driverQueueKey = `job:${sanitizedJobId}:driver_queue`;
             const queueLength = await redis.llen(driverQueueKey);
 
             if (queueLength === 0) {
@@ -78,13 +84,14 @@ export class OfferManagementService {
     }
 
     private async sendOfferToDriver(jobId: string, job: Job): Promise<boolean> {
-        const driverQueueKey = `job:${jobId}:driver_queue`;
+        const sanitizedJobId = this.sanitizeJobId(jobId);
+        const driverQueueKey = `job:${sanitizedJobId}:driver_queue`;
         const queueLength = await redis.llen(driverQueueKey);
         const nextDriverId = await redis.lindex(driverQueueKey, 0);
 
         if (queueLength === 1 && nextDriverId) {
             logger.info(`Last driver in queue for Job ${jobId} - Will trigger matched drivers if offer fails`);
-            await redis.set(`job:${jobId}:last_driver_triggered`, '1', 'EX', 300);
+            await redis.set(`job:${sanitizedJobId}:last_driver_triggered`, '1', 'EX', 300);
         }
 
         if (!nextDriverId) {
@@ -100,7 +107,8 @@ export class OfferManagementService {
         try {
             logger.info(`Processing driver ${driverId} for Job ${jobId}`);
 
-            const jobStatus = await redis.hget(`job:${jobId}`, 'status');
+            const sanitizedJobId = this.sanitizeJobId(jobId);
+            const jobStatus = await redis.hget(`job:${sanitizedJobId}`, 'status');
             if (jobStatus === 'accepted' || jobStatus === 'cancelled') {
                 logger.info(`Job ${jobId} already ${jobStatus}, skipping driver ${driverId}`);
                 return { success: false, reason: `job_${jobStatus}` };
@@ -131,7 +139,8 @@ export class OfferManagementService {
 
         logger.info(`Starting matched driver offers for Job ${job.id} - ${distanceBuckets.length} buckets`);
 
-        await redis.set(`job:${job.id}:current_bucket_index`, '0', 'EX', 3600);
+        const sanitizedJobId = this.sanitizeJobId(job.id);
+        await redis.set(`job:${sanitizedJobId}:current_bucket_index`, '0', 'EX', 3600);
 
         try {
             const matchedQueuePayload = {
@@ -165,7 +174,8 @@ export class OfferManagementService {
 
     async sendNextMatchedBucket(jobId: string, job: Job): Promise<void> {
         try {
-            const bucketsKey = `job:${jobId}:matched_drivers_buckets`;
+            const sanitizedJobId = this.sanitizeJobId(jobId);
+            const bucketsKey = `job:${sanitizedJobId}:matched_drivers_buckets`;
             const bucketStrings = await redis.lrange(bucketsKey, 0, -1);
 
             if (!bucketStrings || bucketStrings.length === 0) {
@@ -174,7 +184,7 @@ export class OfferManagementService {
             }
 
             const buckets: DistanceBucket[] = bucketStrings.map(str => JSON.parse(str));
-            const currentIndex = parseInt(await redis.get(`job:${jobId}:current_bucket_index`) || '0');
+            const currentIndex = parseInt(await redis.get(`job:${sanitizedJobId}:current_bucket_index`) || '0');
 
             if (currentIndex >= buckets.length) {
                 logger.warn(`All matched driver buckets exhausted for Job ${jobId}`);
@@ -185,9 +195,9 @@ export class OfferManagementService {
             const currentBucket = buckets[currentIndex];
             const isLastBucket = currentIndex === buckets.length - 1;
 
-            logger.info(`📤 Sending Bucket ${currentIndex + 1}/${buckets.length} (${currentBucket.rangeStart}-${currentBucket.rangeEnd}m) - ${currentBucket.drivers.length} drivers for Job ${jobId}`);
+            logger.info(`Sending Bucket ${currentIndex + 1}/${buckets.length} (${currentBucket.rangeStart}-${currentBucket.rangeEnd}m) - ${currentBucket.drivers.length} drivers for Job ${jobId}`);
 
-            const bucketKey = `job:${jobId}:matched_bucket`;
+            const bucketKey = `job:${sanitizedJobId}:matched_bucket`;
 
             await redis.hset(bucketKey, {
                 bucketIndex: currentIndex,
@@ -199,10 +209,10 @@ export class OfferManagementService {
                 sentAt: new Date().toISOString()
             });
 
-            await redis.expire(bucketKey, this.OFFER_EXPIRY_SECONDS);
-            await scheduleMatchedBucketExpiry(jobId, currentIndex, this.OFFER_EXPIRY_SECONDS);
+            await redis.expire(bucketKey, this.MATCHED_BUCKET_EXPIRY);
+            await scheduleMatchedBucketExpiry(jobId, currentIndex, this.MATCHED_BUCKET_EXPIRY);
 
-            logger.info(`Bucket expiry scheduled via BullMQ for ${this.OFFER_EXPIRY_SECONDS}s`);
+            logger.info(`Bucket expiry scheduled via BullMQ for ${this.MATCHED_BUCKET_EXPIRY}s`);
 
             const offerPromises = currentBucket.drivers.map(driverId =>
                 this.sendSingleMatchedOffer(job, driverId, currentIndex, buckets.length)
@@ -211,7 +221,7 @@ export class OfferManagementService {
             const results = await Promise.allSettled(offerPromises);
             const successful = results.filter(r => r.status === 'fulfilled').length;
 
-            logger.info(`✅ Sent ${successful}/${currentBucket.drivers.length} offers for Bucket ${currentIndex + 1}`);
+            logger.info(`Sent ${successful}/${currentBucket.drivers.length} offers for Bucket ${currentIndex + 1}`);
 
         } catch (error: any) {
             logger.error(`Error sending matched bucket: ${error.message}`);
@@ -245,15 +255,14 @@ export class OfferManagementService {
                     }
                 }
 
-                logger.info(`[OfferService] ❌ Offer expired — Job ${jobId}, Driver: ${driverId}`);
+                logger.info(`[OfferService] Offer expired — Job ${jobId}, Driver: ${driverId}`);
                 await this.handleOfferExpired(jobId, driverId);
             }
 
-            // Remove the expired driver from the queue
+
             const driverQueueKey = `job:${jobId}:driver_queue`;
             await redis.lrem(driverQueueKey, 1, driverId);
 
-            // Check remaining queue after removal
             const queueLength = await redis.llen(driverQueueKey);
             logger.info(`[OfferService] ${queueLength} drivers remaining in queue for Job ${jobId}`);
 
@@ -265,7 +274,7 @@ export class OfferManagementService {
                 if (job) {
                     logger.info(`[OfferService] Sending matched driver offers for Job ${jobId}`);
 
-                    await this.regenerateMatchedDrivers(jobId, job);
+                    await this.MatchedServiceDrivers(jobId, job);
                 } else {
                     logger.error(`[OfferService] Could not get job data for ${jobId}`);
                 }
@@ -304,7 +313,7 @@ export class OfferManagementService {
                 bucketInfo: `${bucketIndex + 1}/${totalBuckets}`
             };
 
-            await redis.setex(`offer:matched:${job.id}:${driverId}`, this.OFFER_EXPIRY_SECONDS, JSON.stringify(offerData));
+            await redis.set(`offer:matched:${job.id}:${driverId}`, JSON.stringify(offerData));
             await this.saveJobNotification(job, driverObjectId, expiryTime);
 
             await this.publishAssignmentEventWithRetry(
@@ -315,9 +324,9 @@ export class OfferManagementService {
                 offerData
             );
 
-            logger.debug(`✅ Matched offer sent to ${driverId}`);
+            logger.debug(`Matched offer sent to ${driverId}`);
         } catch (error: any) {
-            logger.error(`❌ Failed to send matched offer to ${driverId}: ${error.message}`);
+            logger.error(`Failed to send matched offer to ${driverId}: ${error.message}`);
             throw error;
         }
     }
@@ -358,11 +367,11 @@ export class OfferManagementService {
             offerData
         );
 
-        logger.info(`✅ Offer sent to driver ${driverId} for Job ${job.id}`);
+        logger.info(`Offer sent to driver ${driverId} for Job ${job.id}`);
     }
 
     async assignDriverToJob(jobId: string, driverId: string, customerId?: string): Promise<void> {
-        logger.info(`🎯 Assigning Driver - JobId: ${jobId}, Driver: ${driverId}`);
+        logger.info(`Assigning Driver - JobId: ${jobId}, Driver: ${driverId}`);
 
         await Promise.all([
             cancelAllOffersForJob(jobId),
@@ -388,11 +397,11 @@ export class OfferManagementService {
 
         await this.cleanupMatchedFlowData(jobId);
 
-        logger.info(`✅ Job Assigned - JobId: ${jobId}, Driver: ${driverId}`);
+        logger.info(`Job Assigned - JobId: ${jobId}, Driver: ${driverId}`);
     }
 
     async handleDriverRejection(jobId: string, customerId: string, driverId: string, reason?: string): Promise<void> {
-        logger.info(`❌ Driver Rejected - JobId: ${jobId}, Driver: ${driverId}, Reason: ${reason}`);
+        logger.info(`Driver Rejected - JobId: ${jobId}, Driver: ${driverId}, Reason: ${reason}`);
 
         await cancelOfferExpiry(jobId, driverId);
 
@@ -406,7 +415,7 @@ export class OfferManagementService {
         await this.updateDriverQueueStatus(jobId, driverId, 'rejected');
         await this.deleteJobNotification(driverId);
 
-        logger.info(`✅ Driver rejection processed - Next driver will be handled by BullMQ for Job ${jobId}`);
+        logger.info(`Driver rejection processed - Next driver will be handled by BullMQ for Job ${jobId}`);
     }
 
     async findAlternativeDrivers(jobId: string, nearbyDrivers: string[]): Promise<string[]> {
@@ -428,7 +437,7 @@ export class OfferManagementService {
         this.processedOffers.add(offerKey);
 
         try {
-            logger.info(`⏱️ Handling expired offer — Job ${jobId}, Driver ${driverId}`);
+            logger.info(`Handling expired offer — Job ${jobId}, Driver ${driverId}`);
 
             await redis.del(offerKey);
             await redis.srem(`driver:${driverId}:offers`, jobId);
@@ -437,28 +446,28 @@ export class OfferManagementService {
             await this.updateDriverQueueStatus(jobId, driverId, 'expired');
             await this.deleteJobNotification(driverId);
 
-            logger.debug(`✅ Expired offer processed — Job ${jobId}, Driver ${driverId}`);
+            logger.debug(`Expired offer processed — Job ${jobId}, Driver ${driverId}`);
         } catch (err) {
-            logger.error(`❌ Error handling expired offer — Job ${jobId}, Driver ${driverId}`, err);
+            logger.error(`Error handling expired offer — Job ${jobId}, Driver ${driverId}`, err);
         } finally {
             setTimeout(() => this.processedOffers.delete(offerKey), 5000);
         }
     }
 
 
-    private async regenerateMatchedDrivers(jobId: string, job: Job): Promise<void> {
+    private async MatchedServiceDrivers(jobId: string, job: Job): Promise<void> {
         try {
             if (!this.matchedDriverService) {
                 logger.error(`[OfferService] MatchedDriverService not initialized for Job ${jobId}`);
                 return;
             }
 
-            logger.info(`[OfferService] 🔍 Finding fresh matched drivers for Job ${jobId}`);
+            logger.info(`[OfferService] Finding fresh matched drivers for Job ${jobId}`);
 
             const distanceBuckets = await this.matchedDriverService.getMatchedDriversForJob(job, job.customerId);
 
             if (!distanceBuckets || distanceBuckets.length === 0) {
-                logger.warn(`[OfferService] ⚠️ No matched drivers found for Job ${jobId}`);
+                logger.warn(`[OfferService] No matched drivers found for Job ${jobId}`);
                 await this.cleanupMatchedFlowData(jobId);
                 return;
             }
@@ -478,7 +487,7 @@ export class OfferManagementService {
             await redis.set(`job:${jobId}:matched_flow_active`, '1', 'EX', 3600);
             await redis.set(`job:${jobId}:current_bucket_index`, '0', 'EX', 3600);
 
-            logger.info(`[OfferService] ✅ Stored ${distanceBuckets.length} buckets for Job ${jobId}`);
+            logger.info(`[OfferService] Stored ${distanceBuckets.length} buckets for Job ${jobId}`);
 
             // Send matched driver offers
             await this.sendMatchedDriverOffers(job, distanceBuckets);
@@ -497,19 +506,36 @@ export class OfferManagementService {
             await redis.del(`job:${jobId}:matched_bucket`);
             await redis.del(`job:${jobId}:last_driver_triggered`);
 
-            logger.debug(`🧹 Cleaned up matched flow data for Job ${jobId}`);
+            logger.debug(`Cleaned up matched flow data for Job ${jobId}`);
         } catch (error: any) {
-            logger.error(`❌ Error cleaning up matched flow: ${error.message}`);
+            logger.error(`Error cleaning up matched flow: ${error.message}`);
         }
+    }
+
+    private validateJobId(jobId: string): boolean {
+        // Allow only alphanumeric characters, hyphens, and underscores
+        const validPattern = /^[a-zA-Z0-9_-]+$/;
+        return validPattern.test(jobId) && jobId.length <= 100;
+    }
+
+    private sanitizeJobId(jobId: string): string {
+        // Remove any characters that aren't alphanumeric, hyphens, or underscores
+        return jobId.replace(/[^a-zA-Z0-9_-]/g, '').substring(0, 100);
     }
 
     async getJobData(jobId: string): Promise<Job | null> {
         try {
+            if (!this.validateJobId(jobId)) {
+                logger.error(`Invalid jobId format: ${jobId}`);
+                return null;
+            }
+
+            const sanitizedJobId = this.sanitizeJobId(jobId);
             const patterns = [
-                `booking:${jobId}-*`,
-                `booking:${jobId}`,
-                `booking-${jobId}*`,
-                `job:${jobId}`
+                `booking:${sanitizedJobId}-*`,
+                `booking:${sanitizedJobId}`,
+                `booking-${sanitizedJobId}*`,
+                `job:${sanitizedJobId}`
             ];
 
             let bookingKey: string | null = null;
@@ -536,7 +562,7 @@ export class OfferManagementService {
                 ? JSON.parse(bookingDataJson)
                 : bookingDataJson;
 
-            return this.buildJobFromPayload(payload, jobId);
+            return this.buildJobFromPayload(payload, sanitizedJobId);
         } catch (error: any) {
             logger.error(`Error fetching job data: ${error.message}`);
             return null;
@@ -597,6 +623,7 @@ export class OfferManagementService {
         }
     }
 
+
     private async saveJobNotification(job: Job, driverId: string, expiryTime: number): Promise<void> {
         try {
             const notificationKey = `jobnotification:${driverId}`;
@@ -617,10 +644,12 @@ export class OfferManagementService {
                 }
             };
 
-            await redis.call('JSON.SET', notificationKey, JSON.stringify(notificationData));
+            await redis.call('JSON.SET', notificationKey, '$', JSON.stringify(notificationData));
             await redis.expire(notificationKey, this.OFFER_EXPIRY_SECONDS + 5);
-        } catch (error) {
-            logger.error(`Save Job Notification Error`, error);
+
+            logger.debug(`Job notification saved for driver ${driverId}`);
+        } catch (error: any) {
+            logger.error(`Save Job Notification Error: ${error.message}`, error);
         }
     }
 

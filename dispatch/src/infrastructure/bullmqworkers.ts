@@ -34,7 +34,7 @@ export function initializeWorkers(serviceInstance: any) {
         async (job: Job<MatchedBucketExpiryJob>) => {
             const { jobId, bucketIndex, timestamp } = job.data;
 
-            logger.info(`🔄 Processing bucket expiry: Job ${jobId}, Bucket ${bucketIndex}`);
+            logger.info(`Processing bucket expiry: Job ${jobId}, Bucket ${bucketIndex}`);
 
             try {
                 if (!offerManagementService) {
@@ -43,10 +43,10 @@ export function initializeWorkers(serviceInstance: any) {
 
                 await offerManagementService.handleMatchedBucketExpiry(jobId, bucketIndex);
 
-                logger.info(`✅ Bucket expiry processed: Job ${jobId}, Bucket ${bucketIndex}`);
+                logger.info(`Bucket expiry processed: Job ${jobId}, Bucket ${bucketIndex}`);
                 return { success: true, jobId, bucketIndex };
             } catch (error: any) {
-                logger.error(`❌ Bucket expiry processing failed: ${error.message}`);
+                logger.error(`Bucket expiry processing failed: ${error.message}`);
                 throw error;
             }
         },
@@ -67,7 +67,7 @@ export function initializeWorkers(serviceInstance: any) {
         async (job: Job<OfferExpiryJob>) => {
             const { jobId, driverId, timestamp } = job.data;
 
-            logger.info(`🔄 Processing offer expiry: Job ${jobId}, Driver ${driverId}`);
+            logger.info(`Processing offer expiry: Job ${jobId}, Driver ${driverId}`);
 
             try {
                 if (!offerManagementService) {
@@ -80,10 +80,10 @@ export function initializeWorkers(serviceInstance: any) {
 
                 // Queue exhaustion is now handled in the service method
 
-                logger.info(`✅ Offer expiry processed: Job ${jobId}, Driver ${driverId}`);
+                logger.info(`Offer expiry processed: Job ${jobId}, Driver ${driverId}`);
                 return { success: true, jobId, driverId };
             } catch (error: any) {
-                logger.error(`❌ Offer expiry processing failed: ${error.message}`);
+                logger.error(` Offer expiry processing failed: ${error.message}`);
                 throw error;
             }
         },
@@ -104,7 +104,7 @@ export function initializeWorkers(serviceInstance: any) {
         async (job: Job<NextBucketTriggerJob>) => {
             const { jobId, nextBucketIndex, timestamp } = job.data;
 
-            logger.info(`🔄 Processing next bucket trigger: Job ${jobId}, Bucket ${nextBucketIndex}`);
+            logger.info(`Processing next bucket trigger: Job ${jobId}, Bucket ${nextBucketIndex}`);
 
             try {
                 if (!offerManagementService) {
@@ -118,10 +118,10 @@ export function initializeWorkers(serviceInstance: any) {
 
                 await offerManagementService.sendNextMatchedBucket(jobId, jobData);
 
-                logger.info(`✅ Next bucket triggered: Job ${jobId}, Bucket ${nextBucketIndex}`);
+                logger.info(`Next bucket triggered: Job ${jobId}, Bucket ${nextBucketIndex}`);
                 return { success: true, jobId, nextBucketIndex };
             } catch (error: any) {
-                logger.error(`❌ Next bucket trigger failed: ${error.message}`);
+                logger.error(` Next bucket trigger failed: ${error.message}`);
                 throw error;
             }
         },
@@ -142,7 +142,7 @@ export function initializeWorkers(serviceInstance: any) {
         async (job: Job<DriverQueueJob>) => {
             const { jobId, driverId, queuePosition, jobData } = job.data;
 
-            logger.info(`🚗 Processing driver queue: Job ${jobId}, Driver ${driverId}, Position ${queuePosition}`);
+            logger.info(`Processing driver queue: Job ${jobId}, Driver ${driverId}, Position ${queuePosition}`);
 
             try {
                 if (!offerManagementService) {
@@ -154,14 +154,14 @@ export function initializeWorkers(serviceInstance: any) {
                 console.log(result, " sheer")
 
                 if (result.success) {
-                    logger.info(`✅ Driver offer processed: Job ${jobId}, Driver ${driverId}`);
+                    logger.info(`Driver offer processed: Job ${jobId}, Driver ${driverId}`);
                 } else {
-                    logger.warn(`⚠️ Driver offer skipped: Job ${jobId}, Driver ${driverId} - ${result.reason}`);
+                    logger.warn(`Driver offer skipped: Job ${jobId}, Driver ${driverId} - ${result.reason}`);
                 }
 
                 return { success: true, jobId, driverId, queuePosition, ...result };
             } catch (error: any) {
-                logger.error(`❌ Driver queue processing failed: ${error.message}`);
+                logger.error(`Driver queue processing failed: ${error.message}`);
                 throw error;
             }
         },
@@ -177,7 +177,7 @@ export function initializeWorkers(serviceInstance: any) {
     );
 
     setupWorkerEventListeners();
-    logger.info('✅ All BullMQ workers initialized successfully');
+    logger.info('All BullMQ workers initialized successfully');
 }
 
 
@@ -338,7 +338,7 @@ export async function getWorkerMetrics() {
 
 export async function closeAllWorkers(): Promise<void> {
     try {
-        logger.info('🔄 Closing all workers...');
+        logger.info('Closing all workers...');
 
         await Promise.all([
             matchedBucketExpiryWorker?.close(),
@@ -347,7 +347,7 @@ export async function closeAllWorkers(): Promise<void> {
             driverQueueProcessorWorker?.close(),
         ]);
 
-        logger.info('✅ All workers closed successfully');
+        logger.info('All workers closed successfully');
     } catch (error: any) {
         logger.error(`Error closing workers: ${error.message}`);
         throw error;

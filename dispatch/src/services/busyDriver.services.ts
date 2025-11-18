@@ -24,7 +24,7 @@ export class BusyDriverService {
     private zoneService: ZoneService;
     private spatialService: SpatialService;
     private mapboxService: MapboxService;
-    private readonly DROP_TO_PICKUP_RADIUS = 5; // 5 km between current drop and new pickup
+    private readonly DROP_TO_PICKUP_RADIUS = 15; // 5 km between current drop and new pickup
     private readonly DRIVER_TO_DROP_THRESHOLD = 2; // 2 km - driver should be near their drop point
 
     constructor(driverLocationService: DriverLocationService, zoneService: ZoneService) {

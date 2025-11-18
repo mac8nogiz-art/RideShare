@@ -117,7 +117,8 @@ export class MatchedDriverService {
         ]);
 
         const allDrivers = [...(freeDrivers || []), ...(busyDrivers || [])];
-        logger.info(` Found ${freeDrivers?.length || 0} free + ${busyDrivers?.length || 0} busy = ${allDrivers.length} total drivers`);
+
+        logger.info(` Found ${freeDrivers?.length || 0} free + ${busyDrivers?.length } busy = ${allDrivers.length} total drivers`);
 
         return allDrivers;
     }
