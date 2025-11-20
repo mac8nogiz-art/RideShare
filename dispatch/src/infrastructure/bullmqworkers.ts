@@ -28,7 +28,7 @@ let offerManagementService: any = null;
 
 export function initializeWorkers(serviceInstance: any) {
     offerManagementService = serviceInstance;
-    // ✅ ADD: Offer Expiry Worker
+
     offerExpiryWorker = new Worker<OfferExpiryJob>(
         QUEUE_NAMES.OFFER_EXPIRY,
         async (job: Job<OfferExpiryJob>) => {
