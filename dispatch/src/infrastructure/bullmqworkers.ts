@@ -1,6 +1,7 @@
 // infrastructure/workers.ts
 import { Worker, Job } from 'bullmq';
 import { logger } from '../logger';
+import { redis } from './redis';
 import {
     QUEUE_NAMES,
     MatchedBucketExpiryJob,
@@ -19,14 +20,47 @@ const connection = {
 };
 
 let matchedBucketExpiryWorker: Worker | null = null;
-let offerExpiryWorker: Worker | null = null;
 let nextBucketTriggerWorker: Worker | null = null;
 let driverQueueProcessorWorker: Worker | null = null;
+let offerExpiryWorker: Worker | null = null;
 
 let offerManagementService: any = null;
 
 export function initializeWorkers(serviceInstance: any) {
     offerManagementService = serviceInstance;
+    // ✅ ADD: Offer Expiry Worker
+    offerExpiryWorker = new Worker<OfferExpiryJob>(
+        QUEUE_NAMES.OFFER_EXPIRY,
+        async (job: Job<OfferExpiryJob>) => {
+            const { jobId, driverId } = job.data;
+
+            logger.info(`[Worker] Processing offer expiry - Job: ${jobId}, Driver: ${driverId}`);
+
+            try {
+                if (!offerManagementService) {
+                    throw new Error('OfferManagementService not initialized');
+                }
+
+                // Call the service method directly
+                await offerManagementService.handleRegularOfferExpiry(jobId, driverId);
+
+                logger.info(`[Worker] Offer expiry processed: Job ${jobId}, Driver ${driverId}`);
+                return { success: true, jobId, driverId };
+            } catch (error: any) {
+                logger.error(`[Worker] Offer expiry processing failed: ${error.message}`);
+                throw error;
+            }
+        },
+        {
+            connection,
+            prefix: 'bullmq',
+            concurrency: 1, // Sequential processing
+            limiter: {
+                max: 10,
+                duration: 1000,
+            },
+        }
+    );
 
     // Matched Bucket Expiry Worker
     matchedBucketExpiryWorker = new Worker<MatchedBucketExpiryJob>(
@@ -56,43 +90,6 @@ export function initializeWorkers(serviceInstance: any) {
             concurrency: 1000,
             limiter: {
                 max: 50,
-                duration: 1000,
-            },
-        }
-    );
-
-    // Offer Expiry Worker
-    offerExpiryWorker = new Worker<OfferExpiryJob>(
-        QUEUE_NAMES.OFFER_EXPIRY,
-        async (job: Job<OfferExpiryJob>) => {
-            const { jobId, driverId, timestamp } = job.data;
-
-            logger.info(`Processing offer expiry: Job ${jobId}, Driver ${driverId}`);
-
-            try {
-                if (!offerManagementService) {
-                    throw new Error('OfferManagementService not initialized');
-                }
-
-                await offerManagementService.handleRegularOfferExpiry(jobId, driverId);
-                
-                logger.info(`[BullMQ] Regular offer expiry completed - Job: ${jobId}, Driver: ${driverId}`);
-
-                // Queue exhaustion is now handled in the service method
-
-                logger.info(`Offer expiry processed: Job ${jobId}, Driver ${driverId}`);
-                return { success: true, jobId, driverId };
-            } catch (error: any) {
-                logger.error(` Offer expiry processing failed: ${error.message}`);
-                throw error;
-            }
-        },
-        {
-            connection,
-            prefix: 'bullmq',
-            concurrency: 20,
-            limiter: {
-                max: 100,
                 duration: 1000,
             },
         }
@@ -136,41 +133,48 @@ export function initializeWorkers(serviceInstance: any) {
         }
     );
 
-    // NEW: Driver Queue Processor Worker
+    // Driver Queue Processor Worker - Process first driver in queue only
     driverQueueProcessorWorker = new Worker<DriverQueueJob>(
         QUEUE_NAMES.DRIVER_QUEUE_PROCESSOR,
         async (job: Job<DriverQueueJob>) => {
             const { jobId, driverId, queuePosition, jobData } = job.data;
 
-            logger.info(`Processing driver queue: Job ${jobId}, Driver ${driverId}, Position ${queuePosition}`);
+            logger.info(`Processing driver: Job ${jobId}, Driver ${driverId}, Position ${queuePosition}`);
 
             try {
                 if (!offerManagementService) {
                     throw new Error('OfferManagementService not initialized');
                 }
 
-                // Process the driver offer
-                const result = await offerManagementService.processDriverOffer(jobId, driverId, jobData);
-                console.log(result, " sheer")
+                // Only process first driver in queue
+                const driverQueueKey = `job:${jobId}:driver_queue`;
+                const firstDriverId = await redis.lindex(driverQueueKey, 0);
 
-                if (result.success) {
-                    logger.info(`Driver offer processed: Job ${jobId}, Driver ${driverId}`);
-                } else {
-                    logger.warn(`Driver offer skipped: Job ${jobId}, Driver ${driverId} - ${result.reason}`);
+                if (firstDriverId !== driverId) {
+                    logger.info(`Driver ${driverId} not first in queue, skipping`);
+                    return { success: false, reason: 'not_first_in_queue' };
                 }
 
-                return { success: true, jobId, driverId, queuePosition, ...result };
+                const result = await offerManagementService.processDriverOffer(jobId, driverId, jobData);
+
+                if (result.success) {
+                    logger.info(`Offer sent: Job ${jobId}, Driver ${driverId}`);
+                } else {
+                    logger.warn(`Offer skipped: Job ${jobId}, Driver ${driverId} - ${result.reason}`);
+                }
+
+                return { success: true, ...result };
             } catch (error: any) {
-                logger.error(`Driver queue processing failed: ${error.message}`);
+                logger.error(`Driver processing failed: ${error.message}`);
                 throw error;
             }
         },
         {
             connection,
             prefix: 'bullmq',
-            concurrency: 10, // Process up to 10 driver offers simultaneously
+            concurrency: 1,
             limiter: {
-                max: 50, // Max 50 offers per second
+                max: 10,
                 duration: 1000,
             },
         }
@@ -202,22 +206,25 @@ function setupWorkerEventListeners() {
         });
     }
 
-    // Offer Expiry Worker Events
     if (offerExpiryWorker) {
         offerExpiryWorker.on('completed', (job) => {
-            logger.debug(`Offer expiry job completed: ${job.id}`);
+            logger.debug(`[Worker] Offer expiry completed: ${job.id}`);
         });
 
         offerExpiryWorker.on('failed', (job, err) => {
-            logger.error(`Offer expiry job failed: ${job?.id} - ${err.message}`);
+            logger.error(`[Worker] Offer expiry failed: ${job?.id} - ${err.message}`);
         });
 
         offerExpiryWorker.on('error', (err) => {
-            logger.error(` Offer expiry worker error: ${err.message}`);
+            logger.error(`[Worker] Offer expiry worker error: ${err.message}`);
         });
 
         offerExpiryWorker.on('stalled', (jobId) => {
-            logger.warn(` Offer expiry job stalled: ${jobId}`);
+            logger.warn(`[Worker] Offer expiry job stalled: ${jobId}`);
+        });
+
+        offerExpiryWorker.on('active', (job) => {
+            logger.debug(`[Worker] Offer expiry job active: ${job.id}`);
         });
     }
 
@@ -271,7 +278,6 @@ function setupWorkerEventListeners() {
 export function areWorkersRunning(): boolean {
     return !!(
         matchedBucketExpiryWorker?.isRunning() &&
-        offerExpiryWorker?.isRunning() &&
         nextBucketTriggerWorker?.isRunning() &&
         driverQueueProcessorWorker?.isRunning()
     );
@@ -281,7 +287,6 @@ export async function pauseAllWorkers(): Promise<void> {
     try {
         await Promise.all([
             matchedBucketExpiryWorker?.pause(),
-            offerExpiryWorker?.pause(),
             nextBucketTriggerWorker?.pause(),
             driverQueueProcessorWorker?.pause(),
         ]);
@@ -296,7 +301,6 @@ export async function resumeAllWorkers(): Promise<void> {
     try {
         await Promise.all([
             matchedBucketExpiryWorker?.resume(),
-            offerExpiryWorker?.resume(),
             nextBucketTriggerWorker?.resume(),
             driverQueueProcessorWorker?.resume(),
         ]);
@@ -313,10 +317,6 @@ export async function getWorkerMetrics() {
             matchedBucketExpiry: {
                 isRunning: matchedBucketExpiryWorker?.isRunning() || false,
                 isPaused: matchedBucketExpiryWorker?.isPaused() || false,
-            },
-            offerExpiry: {
-                isRunning: offerExpiryWorker?.isRunning() || false,
-                isPaused: offerExpiryWorker?.isPaused() || false,
             },
             nextBucketTrigger: {
                 isRunning: nextBucketTriggerWorker?.isRunning() || false,
@@ -342,7 +342,6 @@ export async function closeAllWorkers(): Promise<void> {
 
         await Promise.all([
             matchedBucketExpiryWorker?.close(),
-            offerExpiryWorker?.close(),
             nextBucketTriggerWorker?.close(),
             driverQueueProcessorWorker?.close(),
         ]);
@@ -356,7 +355,6 @@ export async function closeAllWorkers(): Promise<void> {
 
 export {
     matchedBucketExpiryWorker,
-    offerExpiryWorker,
     nextBucketTriggerWorker,
     driverQueueProcessorWorker,
 };

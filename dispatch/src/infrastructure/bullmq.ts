@@ -230,6 +230,7 @@ export const matchedDriverTriggerWorker = new Worker<MatchedDriverTriggerJob>(
     }
 );
 
+// Offer Expiry Worker - Sequential processing
 export const offerExpiryWorker = new Worker<OfferExpiryJob>(
     QUEUE_NAMES.OFFER_EXPIRY,
     async (job: Job<OfferExpiryJob>) => {
@@ -238,100 +239,22 @@ export const offerExpiryWorker = new Worker<OfferExpiryJob>(
         try {
             logger.info(`[BullMQ] Processing offer expiry - Job: ${jobId}, Driver: ${driverId}`);
 
-            // Check if job is already accepted
-            const jobData = await redis.hgetall(`job:${jobId}`);
-            if (jobData.status === 'accepted' || jobData.assignedDriver) {
-                logger.info(`[BullMQ] Job ${jobId} already accepted, skipping expiry`);
-                return { success: true, skipped: true, reason: 'job_already_accepted' };
+            if (offerExpiryCallback) {
+                await offerExpiryCallback(jobId, driverId, 0);
+                logger.info(`[BullMQ] Offer expiry callback executed - Job: ${jobId}, Driver: ${driverId}`);
+                return { success: true, jobId, driverId };
+            } else {
+                logger.warn(`[BullMQ] No offer expiry callback registered`);
+                return { success: false, error: 'No callback registered' };
             }
-
-            // Check if offer still exists
-            const offerKey = `offer:${jobId}:${driverId}`;
-            const exists = await redis.exists(offerKey);
-            if (!exists) {
-                logger.info(`[BullMQ] Offer already processed - Job: ${jobId}, Driver: ${driverId}`);
-                return { success: true, skipped: true, reason: 'offer_already_processed' };
-            }
-
-            // Check if driver already responded
-            const responseKey = `offer:response:${jobId}:${driverId}`;
-            const responseData = await redis.get(responseKey);
-            if (responseData) {
-                const response = JSON.parse(responseData);
-                if (response.action === 'accept') {
-                    logger.info(`[BullMQ] Offer already accepted - Job: ${jobId}, Driver: ${driverId}`);
-                    return { success: true, skipped: true, reason: 'already_accepted' };
-                }
-            }
-
-            // Check queue status BEFORE expiring
-            const driverQueueKey = `job:${jobId}:driver_queue`;
-            const queueLength = await redis.llen(driverQueueKey);
-
-            logger.info(`[BullMQ] Queue check - Job: ${jobId}, Queue length: ${queueLength}`);
-
-            // Mark offer as expired
-            await redis.del(offerKey);
-            await redis.srem(`driver:${driverId}:offers`, jobId);
-            await redis.srem(`job:${jobId}:pending_drivers`, driverId);
-            await redis.sadd(`job:${jobId}:expired_drivers`, driverId);
-
-            // Update driver queue status
-            const driverHashKey = `job:${jobId}:driver:${driverId}`;
-            const driverExists = await redis.exists(driverHashKey);
-            if (driverExists) {
-                await redis.hset(driverHashKey, {
-                    status: 'expired',
-                    expiredAt: new Date().toISOString(),
-                });
-            }
-
-            // Delete job notification
-            await redis.del(`jobnotification:${driverId}`);
-
-            logger.info(`[BullMQ] Offer expired - Job: ${jobId}, Driver: ${driverId}`);
-
-            // Remove expired driver from queue
-            await redis.lrem(driverQueueKey, 1, driverId);
-
-            // Check remaining queue after removal
-            const remainingDrivers = await redis.llen(driverQueueKey);
-            logger.info(`[BullMQ] ${remainingDrivers} drivers remaining after expiry`);
-
-            // Check if we need to trigger matched driver flow
-            if (remainingDrivers === 0) {
-                logger.warn(`[BullMQ] Queue exhausted - Triggering matched driver flow for Job ${jobId}`);
-                await triggerMatchedDriverFlow(jobId, jobData, 'queue_exhausted');
-                return {
-                    success: true,
-                    expired: true,
-                    queueLength: remainingDrivers,
-                    matchedFlowTriggered: true
-                };
-            }
-
-            // Process next driver in queue
-            const nextDriverId = await redis.lindex(driverQueueKey, 0);
-            if (nextDriverId) {
-                logger.info(`[BullMQ] Processing next driver: ${nextDriverId} for Job ${jobId}`);
-                await processDriverQueue(jobId, [nextDriverId], jobData as any);
-            }
-
-            return {
-                success: true,
-                expired: true,
-                queueLength: remainingDrivers,
-                nextDriver: nextDriverId || null
-            };
-
         } catch (error: any) {
-            logger.error(`[BullMQ] Offer expiry processing failed - Job: ${jobId}, Driver: ${driverId}, Error: ${error.message}`);
+            logger.error(`[BullMQ] Offer expiry failed - Job: ${jobId}, Driver: ${driverId}, Error: ${error.message}`);
             throw error;
         }
     },
     {
         connection,
-        concurrency: 10,
+        concurrency: 1, // CRITICAL: Process one offer expiry at a time for sequential flow
         removeOnComplete: { count: 100 },
         removeOnFail: { count: 100 },
     }

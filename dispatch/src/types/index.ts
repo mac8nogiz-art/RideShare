@@ -28,6 +28,7 @@ export interface Driver {
 export interface DriverWithDistance extends Driver {
     distance: number;
     priority: number;
+    level:number;
 }
 export interface Customer {
 

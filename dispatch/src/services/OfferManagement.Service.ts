@@ -259,25 +259,36 @@ export class OfferManagementService {
                 await this.handleOfferExpired(jobId, driverId);
             }
 
-
+            // Remove expired driver from queue
             const driverQueueKey = `job:${jobId}:driver_queue`;
             await redis.lrem(driverQueueKey, 1, driverId);
-
+            
             const queueLength = await redis.llen(driverQueueKey);
             logger.info(`[OfferService] ${queueLength} drivers remaining in queue for Job ${jobId}`);
 
             if (queueLength === 0) {
-                logger.warn(`[OfferService] Queue exhausted for Job ${jobId} - Sending matched offers directly`);
+                // Queue exhausted - ALWAYS trigger matched driver flow
+                logger.warn(`[OfferService] Queue exhausted for Job ${jobId} - Triggering matched driver flow`);
 
                 const job = await this.getJobData(jobId);
 
-                if (job) {
-                    logger.info(`[OfferService] Sending matched driver offers for Job ${jobId}`);
-
-                    await this.MatchedServiceDrivers(jobId, job);
-                } else {
+                if (!job) {
                     logger.error(`[OfferService] Could not get job data for ${jobId}`);
+                    return;
                 }
+
+                if (!this.matchedDriverService) {
+                    logger.error(`[OfferService] MatchedDriverService not initialized`);
+                    return;
+                }
+                
+                logger.info(`[OfferService] Triggering matched driver flow for Job ${jobId}`);
+                await this.matchedDriverService.triggerMatchedDriverFlow(job, jobId);
+                
+            } else {
+                // Process next driver in queue
+                logger.info(`[OfferService] Processing next driver in queue for Job ${jobId}`);
+                // BullMQ will automatically process the next driver via driverQueueProcessorWorker
             }
 
         } catch (error: any) {
@@ -455,48 +466,7 @@ export class OfferManagementService {
     }
 
 
-    private async MatchedServiceDrivers(jobId: string, job: Job): Promise<void> {
-        try {
-            if (!this.matchedDriverService) {
-                logger.error(`[OfferService] MatchedDriverService not initialized for Job ${jobId}`);
-                return;
-            }
 
-            logger.info(`[OfferService] Finding fresh matched drivers for Job ${jobId}`);
-
-            const distanceBuckets = await this.matchedDriverService.getMatchedDriversForJob(job, job.customerId);
-
-            if (!distanceBuckets || distanceBuckets.length === 0) {
-                logger.warn(`[OfferService] No matched drivers found for Job ${jobId}`);
-                await this.cleanupMatchedFlowData(jobId);
-                return;
-            }
-
-            logger.info(`[OfferService] Found ${distanceBuckets.flatMap((b: any) => b.drivers).length} drivers across ${distanceBuckets.length} buckets for Job ${jobId}`);
-
-            // Store buckets in Redis
-            const bucketsKey = `job:${jobId}:matched_drivers_buckets`;
-            await redis.del(bucketsKey);
-
-            for (const bucket of distanceBuckets) {
-                await redis.rpush(bucketsKey, JSON.stringify(bucket));
-            }
-            await redis.expire(bucketsKey, 3600);
-
-            // Set matched flow as active
-            await redis.set(`job:${jobId}:matched_flow_active`, '1', 'EX', 3600);
-            await redis.set(`job:${jobId}:current_bucket_index`, '0', 'EX', 3600);
-
-            logger.info(`[OfferService] Stored ${distanceBuckets.length} buckets for Job ${jobId}`);
-
-            // Send matched driver offers
-            await this.sendMatchedDriverOffers(job, distanceBuckets);
-
-        } catch (error: any) {
-            logger.error(`[OfferService] Error regenerating matched drivers: ${error.message}`);
-            await this.cleanupMatchedFlowData(jobId);
-        }
-    }
 
     private async cleanupMatchedFlowData(jobId: string): Promise<void> {
         try {
